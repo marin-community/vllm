@@ -3,6 +3,8 @@
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+import torch
+
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -25,6 +27,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -168,6 +171,7 @@ class BlockPool:
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+        self.cached_prompt_logprobs: dict[BlockHash, LogprobsTensors] = {}
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -374,6 +378,10 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        content_hash = get_block_hash(block_hash)
+        if self.cached_block_hash_to_block.get_one_block(block_hash) is None:
+            self.cached_prompt_logprobs.pop(content_hash, None)
+
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -461,6 +469,7 @@ class BlockPool:
 
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self.cached_prompt_logprobs.clear()
 
         # Remove all hashes from all blocks.
         for block in self.blocks:
@@ -475,6 +484,84 @@ class BlockPool:
             self.kv_event_queue.append(AllBlocksCleared())
 
         return True
+
+    def store_prompt_logprobs(
+        self,
+        request: Request,
+        prompt_logprobs: LogprobsTensors,
+        num_cached_blocks: int,
+        block_size: int,
+    ) -> None:
+        """Store prompt-logprob payloads for cached prefix blocks."""
+        if num_cached_blocks <= 0:
+            return
+
+        if block_size == self.hash_block_size:
+            block_hashes: BlockHashList = request.block_hashes
+        else:
+            assert block_size % self.hash_block_size == 0
+            block_hashes = BlockHashListWithBlockSize(
+                request.block_hashes, self.hash_block_size, block_size
+            )
+
+        num_positions = prompt_logprobs.logprobs.shape[0]
+        for block_idx in range(min(num_cached_blocks, len(block_hashes))):
+            start_idx = block_idx * block_size
+            end_idx = min(start_idx + block_size, num_positions)
+            if end_idx <= start_idx:
+                break
+
+            self.cached_prompt_logprobs[block_hashes[block_idx]] = LogprobsTensors(
+                logprob_token_ids=prompt_logprobs.logprob_token_ids[
+                    start_idx:end_idx
+                ].clone(),
+                logprobs=prompt_logprobs.logprobs[start_idx:end_idx].clone(),
+                selected_token_ranks=prompt_logprobs.selected_token_ranks[
+                    start_idx:end_idx
+                ].clone(),
+            )
+
+    def get_prompt_logprobs(
+        self,
+        request: Request,
+        num_cached_tokens: int,
+        block_size: int,
+    ) -> LogprobsTensors | None:
+        """Return cached prompt-logprob payloads for a prefix cache hit."""
+        num_cached_blocks = num_cached_tokens // block_size
+        if num_cached_blocks <= 0:
+            return None
+
+        if block_size == self.hash_block_size:
+            block_hashes: BlockHashList = request.block_hashes
+        else:
+            assert block_size % self.hash_block_size == 0
+            block_hashes = BlockHashListWithBlockSize(
+                request.block_hashes, self.hash_block_size, block_size
+            )
+
+        cached_blocks: list[LogprobsTensors] = []
+        for block_hash in block_hashes[:num_cached_blocks]:
+            block_prompt_logprobs = self.cached_prompt_logprobs.get(block_hash)
+            if block_prompt_logprobs is None:
+                return None
+            cached_blocks.append(block_prompt_logprobs)
+
+        if not cached_blocks:
+            return None
+
+        if len(cached_blocks) == 1:
+            return cached_blocks[0]
+
+        return LogprobsTensors(
+            logprob_token_ids=torch.cat(
+                [block.logprob_token_ids for block in cached_blocks]
+            ),
+            logprobs=torch.cat([block.logprobs for block in cached_blocks]),
+            selected_token_ranks=torch.cat(
+                [block.selected_token_ranks for block in cached_blocks]
+            ),
+        )
 
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.

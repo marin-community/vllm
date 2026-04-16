@@ -295,6 +295,18 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+    def _supports_prompt_logprobs_apc(self, request: Request) -> bool:
+        sampling_params = request.sampling_params
+        return (
+            self.cache_config.enable_prefix_caching
+            and self.cache_config.enable_prefix_caching_with_prompt_logprobs
+            and not self.is_encoder_decoder
+            and len(self.kv_cache_config.kv_cache_groups) == 1
+            and request.prompt_token_ids is not None
+            and sampling_params is not None
+            and sampling_params.prompt_logprobs == 1
+        )
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -1449,6 +1461,13 @@ class Scheduler(SchedulerInterface):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if (
+                prompt_logprobs_tensors is not None
+                and self._supports_prompt_logprobs_apc(request)
+            ):
+                self.kv_cache_manager.store_prompt_logprobs(
+                    request, prompt_logprobs_tensors
+                )
+            if (
                 new_token_ids
                 or pooler_output is not None
                 or kv_transfer_params
@@ -1747,6 +1766,8 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            if self._supports_prompt_logprobs_apc(request):
+                request.skip_reading_prefix_cache = False
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:
