@@ -105,6 +105,27 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
         assert scheduler.running[i] == request
 
 
+@pytest.mark.parametrize(
+    "enable_prefix_caching_with_prompt_logprobs, expected_skip",
+    [
+        (False, True),
+        (True, False),
+    ],
+)
+def test_prompt_logprobs_apc_flag_overrides_skip_reading_prefix_cache(
+    enable_prefix_caching_with_prompt_logprobs: bool, expected_skip: bool
+):
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        enable_prefix_caching_with_prompt_logprobs=enable_prefix_caching_with_prompt_logprobs,
+    )
+    (request,) = create_requests(num_requests=1, prompt_logprobs=1)
+
+    scheduler.add_request(request)
+
+    assert request.skip_reading_prefix_cache is expected_skip
+
+
 def test_schedule_multimodal_requests():
     scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
     mm_positions = [[PlaceholderRange(offset=i, length=100)] for i in range(10)]

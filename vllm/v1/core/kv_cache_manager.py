@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -211,6 +212,19 @@ class KVCacheManager:
                 num_tokens=request.num_tokens,
                 num_hits=num_new_computed_tokens,
                 preempted=request.num_preemptions > 0,
+            )
+
+        request.cached_prompt_logprobs = None
+        if (
+            num_new_computed_tokens > 0
+            and request.sampling_params is not None
+            and request.sampling_params.prompt_logprobs == 1
+            and len(self.kv_cache_config.kv_cache_groups) == 1
+        ):
+            request.cached_prompt_logprobs = (
+                self.coordinator.single_type_managers[0].get_prompt_logprobs(
+                    request, num_new_computed_tokens
+                )
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
@@ -533,6 +547,15 @@ class KVCacheManager:
         """
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
+
+    def store_prompt_logprobs(
+        self, request: Request, prompt_logprobs: LogprobsTensors
+    ) -> None:
+        if not self.enable_caching or len(self.kv_cache_config.kv_cache_groups) != 1:
+            return
+        self.coordinator.single_type_managers[0].store_prompt_logprobs(
+            request, prompt_logprobs
+        )
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
