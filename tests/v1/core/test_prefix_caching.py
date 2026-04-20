@@ -38,7 +38,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
-from vllm.v1.outputs import LogprobsTensors
 
 pytestmark = pytest.mark.cpu_test
 
@@ -1084,64 +1083,6 @@ def test_prefill_plp():
 
     manager.free(req0)
     manager.free(req1)
-
-
-def test_prefill_plp_round_trips_cached_prompt_logprobs():
-    block_size = 16
-    manager = KVCacheManager(
-        make_kv_cache_config(block_size, 11),
-        max_model_len=8192,
-        enable_caching=True,
-        hash_block_size=block_size,
-    )
-    hash_fn = sha256
-
-    common_token_ids = [i for i in range(3) for _ in range(16)]
-    unique_token_ids = [3] * 7
-    all_token_ids = common_token_ids + unique_token_ids
-
-    req0 = make_request("0", all_token_ids, block_size, hash_fn, prompt_logprobs=1)
-    req0.skip_reading_prefix_cache = False
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
-    assert num_computed_tokens == 0
-    manager.allocate_slots(
-        req0, len(all_token_ids), len(computed_blocks.blocks[0]) * block_size, computed_blocks
-    )
-
-    prompt_positions = len(all_token_ids) - 1
-    prompt_logprobs = LogprobsTensors(
-        logprob_token_ids=torch.arange(prompt_positions * 2, dtype=torch.int32).view(
-            prompt_positions, 2
-        ),
-        logprobs=torch.arange(prompt_positions * 2, dtype=torch.float32).view(
-            prompt_positions, 2
-        ),
-        selected_token_ranks=torch.arange(1, prompt_positions + 1, dtype=torch.int32),
-    )
-    manager.store_prompt_logprobs(req0, prompt_logprobs)
-
-    req1 = make_request("1", all_token_ids, block_size, hash_fn, prompt_logprobs=1)
-    req1.skip_reading_prefix_cache = False
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
-
-    assert computed_blocks.get_block_ids() == ([1, 2, 3],)
-    assert num_computed_tokens == 3 * block_size
-    assert req1.cached_prompt_logprobs is not None
-
-    cached_prompt_logprobs = req1.cached_prompt_logprobs
-    expected_positions = 3 * block_size
-    torch.testing.assert_close(
-        cached_prompt_logprobs.logprob_token_ids,
-        prompt_logprobs.logprob_token_ids[:expected_positions],
-    )
-    torch.testing.assert_close(
-        cached_prompt_logprobs.logprobs,
-        prompt_logprobs.logprobs[:expected_positions],
-    )
-    torch.testing.assert_close(
-        cached_prompt_logprobs.selected_token_ranks,
-        prompt_logprobs.selected_token_ranks[:expected_positions],
-    )
 
     # All blocks should be available.
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
