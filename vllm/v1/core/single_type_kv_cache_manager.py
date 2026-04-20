@@ -6,7 +6,6 @@ from collections import defaultdict
 from collections.abc import Sequence
 
 from vllm.utils.math_utils import cdiv
-from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
@@ -290,27 +289,6 @@ class SingleTypeKVCacheManager(ABC):
 
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
-
-    def get_prompt_logprobs(
-        self, request: Request, num_cached_tokens: int
-    ) -> LogprobsTensors | None:
-        num_cached_blocks = num_cached_tokens // self.block_size
-        return self.block_pool.get_prompt_logprobs(
-            request=request,
-            num_cached_tokens=num_cached_blocks * self.block_size,
-            block_size=self.block_size,
-        )
-
-    def store_prompt_logprobs(
-        self, request: Request, prompt_logprobs: LogprobsTensors
-    ) -> None:
-        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
-        self.block_pool.store_prompt_logprobs(
-            request=request,
-            prompt_logprobs=prompt_logprobs,
-            num_cached_blocks=num_cached_blocks,
-            block_size=self.block_size,
-        )
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:

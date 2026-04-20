@@ -26,7 +26,6 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
-    from vllm.v1.outputs import LogprobsTensors
 
 
 @dataclass
@@ -171,7 +170,6 @@ class Request:
         self.update_block_hashes()
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
-        self.cached_prompt_logprobs: "LogprobsTensors | None" = None
 
         # Used for streaming
         self.resumable = resumable
