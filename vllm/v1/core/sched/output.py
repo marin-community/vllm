@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.outputs import LogprobsTensors
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
@@ -24,6 +25,7 @@ else:
     MultiModalFeatureSpec = object
     PoolingParams = object
     SamplingParams = object
+    LogprobsTensors = object
     Request = object
 
 
@@ -38,6 +40,7 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    cached_prompt_logprobs: "LogprobsTensors | None" = None
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -59,6 +62,7 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            cached_prompt_logprobs=request.cached_prompt_logprobs,
             prefill_token_ids=prefill_token_ids,
         )
 
@@ -77,6 +81,7 @@ class NewRequestData:
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
+            f"cached_prompt_logprobs={'set' if self.cached_prompt_logprobs is not None else None}"
             ")"
         )
 
@@ -102,6 +107,7 @@ class NewRequestData:
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
+            f"cached_prompt_logprobs={'set' if self.cached_prompt_logprobs is not None else None}"
             ")"
         )
 

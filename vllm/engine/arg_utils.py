@@ -460,6 +460,9 @@ class EngineArgs:
     )
     block_size: int | None = None
     enable_prefix_caching: bool | None = None
+    enable_prefix_caching_with_prompt_logprobs: bool = (
+        CacheConfig.enable_prefix_caching_with_prompt_logprobs
+    )
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -1630,6 +1633,9 @@ class EngineArgs:
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
+            enable_prefix_caching_with_prompt_logprobs=(
+                self.enable_prefix_caching_with_prompt_logprobs
+            ),
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,

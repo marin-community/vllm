@@ -345,6 +345,18 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _supports_prompt_logprobs_apc(self, request: Request) -> bool:
+        sampling_params = request.sampling_params
+        return (
+            self.cache_config.enable_prefix_caching
+            and self.cache_config.enable_prefix_caching_with_prompt_logprobs
+            and not self.is_encoder_decoder
+            and len(self.kv_cache_config.kv_cache_groups) == 1
+            and request.prompt_token_ids is not None
+            and sampling_params is not None
+            and sampling_params.prompt_logprobs == 1
+        )
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1455,6 +1467,13 @@ class Scheduler(SchedulerInterface):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if (
+                prompt_logprobs_tensors is not None
+                and self._supports_prompt_logprobs_apc(request)
+            ):
+                self.kv_cache_manager.store_prompt_logprobs(
+                    request, prompt_logprobs_tensors
+                )
+            if (
                 new_token_ids
                 or pooler_output is not None
                 or kv_transfer_params
@@ -1735,6 +1754,8 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        if self._supports_prompt_logprobs_apc(request):
+            request.skip_reading_prefix_cache = False
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
