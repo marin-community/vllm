@@ -1164,6 +1164,7 @@ class GPUModelRunner(
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
+                cached_prompt_logprobs=new_req_data.cached_prompt_logprobs,
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
@@ -1478,6 +1479,7 @@ class GPUModelRunner(
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.block_ids = new_req_data.block_ids
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
+        req_state.cached_prompt_logprobs = new_req_data.cached_prompt_logprobs
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )

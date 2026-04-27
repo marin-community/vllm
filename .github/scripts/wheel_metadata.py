@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import argparse
 import pathlib
 import sys
@@ -40,9 +43,10 @@ def main() -> int:
     violations: list[str] = []
 
     with zipfile.ZipFile(wheel) as zf:
-      metadata_name = next(
-          name for name in zf.namelist() if name.endswith("METADATA"))
-      metadata = zf.read(metadata_name).decode()
+        metadata_name = next(
+            name for name in zf.namelist() if name.endswith("METADATA")
+        )
+        metadata = zf.read(metadata_name).decode()
 
     for line in metadata.splitlines():
         if not line.startswith("Requires-Dist: "):
@@ -59,7 +63,9 @@ def main() -> int:
 
         requirements.append(requirement)
 
-    requirements_out.write_text("\n".join(requirements) + ("\n" if requirements else ""))
+    requirements_out.write_text(
+        "\n".join(requirements) + ("\n" if requirements else "")
+    )
 
     if violations and args.error_on_forbidden:
         print("Forbidden wheel requirements detected:", file=sys.stderr)
