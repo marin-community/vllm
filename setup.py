@@ -997,7 +997,13 @@ if _is_cuda() or _is_hip():
     # copying the relevant .py files from the source repository.
     ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
 
-ext_modules.append(CMakeExtension(name="vllm.spinloop"))
+# Marin fork patch: skip the pure-CXX spinloop CMake extension on TPU builds.
+# TPU wheels are built on runners without CUDA toolkit; appending this
+# extension forces cmake to run, which loads torch's Caffe2Config and errors
+# out when CUDA is missing. Spinloop is a CPU-side optimization that the TPU
+# wheel does not need.
+if not _is_tpu():
+    ext_modules.append(CMakeExtension(name="vllm.spinloop"))
 
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
