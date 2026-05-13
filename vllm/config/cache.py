@@ -78,13 +78,6 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
-    enable_prefix_caching_with_prompt_logprobs: bool = False
-    """Whether to allow prefix caching for ``prompt_logprobs == 1`` requests.
-
-    When enabled, vLLM stores the per-position prompt logprob payload needed
-    to reconstruct prompt logprobs for cached prefix blocks. This is currently
-    intended for the narrow ``prompt_logprobs == 1`` case.
-    """
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -188,7 +181,6 @@ class CacheConfig:
             "is_attention_free",
             "num_gpu_blocks_override",
             "enable_prefix_caching",
-            "enable_prefix_caching_with_prompt_logprobs",
             "prefix_caching_hash_algo",
             "mamba_page_size_padded",
             "user_specified_block_size",

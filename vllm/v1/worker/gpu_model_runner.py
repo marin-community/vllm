@@ -1164,7 +1164,6 @@ class GPUModelRunner(
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
-                cached_prompt_logprobs=new_req_data.cached_prompt_logprobs,
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
@@ -1479,7 +1478,6 @@ class GPUModelRunner(
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.block_ids = new_req_data.block_ids
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
-        req_state.cached_prompt_logprobs = new_req_data.cached_prompt_logprobs
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
@@ -5067,19 +5065,6 @@ class GPUModelRunner(
                 logprobs_tensors = LogprobsTensors.empty_cpu(
                     num_prompt_tokens - 1, num_prompt_logprobs + 1
                 )
-                cached_prompt_logprobs = request.cached_prompt_logprobs
-                if cached_prompt_logprobs is not None:
-                    cached_positions = cached_prompt_logprobs.logprobs.shape[0]
-                    if cached_positions > 0:
-                        logprobs_tensors.logprob_token_ids[:cached_positions].copy_(
-                            cached_prompt_logprobs.logprob_token_ids
-                        )
-                        logprobs_tensors.logprobs[:cached_positions].copy_(
-                            cached_prompt_logprobs.logprobs
-                        )
-                        logprobs_tensors.selected_token_ranks[:cached_positions].copy_(
-                            cached_prompt_logprobs.selected_token_ranks
-                        )
                 in_progress_dict[req_id] = logprobs_tensors
 
             # Determine number of logits to retrieve.
