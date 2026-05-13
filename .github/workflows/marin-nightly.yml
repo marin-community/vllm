@@ -56,6 +56,14 @@ jobs:
             "marin-validate-dist" \
             validated
 
+      - name: Extract upstream sync metadata
+        run: |
+          jq '.upstream_sync // {
+            "status": "missing",
+            "fork_repo": .repo,
+            "message": "No upstream sync metadata was present in marin-build.json."
+          }' validated/marin-build.json > validated/marin-upstream-sync.json
+
       - name: Publish immutable nightly release
         id: immutable
         run: |
@@ -69,6 +77,8 @@ jobs:
           Auto-published nightly release for \`$SHA\`.
 
           This release reuses the exact wheel produced by the latest successful \`marin-validate.yml\` run on \`main\`.
+
+          $(bash .github/scripts/marin_upstream_sync_notes.sh validated/marin-upstream-sync.json "MERGED WITH UPSTREAM vLLM MAIN")
           EOF
 
           bash .github/scripts/marin_release.sh upsert-release \
@@ -79,12 +89,15 @@ jobs:
             "$TITLE" \
             /tmp/marin-nightly-notes.md \
             validated/*.whl \
-            validated/marin-build.json
+            validated/marin-build.json \
+            validated/marin-upstream-sync.json
 
-          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "SHA=${SHA}" >> "$GITHUB_OUTPUT"
-          echo "DATE=${DATE}" >> "$GITHUB_OUTPUT"
-          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          {
+            echo "TAG=${TAG}"
+            echo "SHA=${SHA}"
+            echo "DATE=${DATE}"
+            echo "SHORT_SHA=${SHORT_SHA}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Update nightly alias
         run: |
@@ -93,6 +106,8 @@ jobs:
 
           Current immutable release: \`${{ steps.immutable.outputs.TAG }}\`
           Commit: \`${{ steps.immutable.outputs.SHA }}\`
+
+          $(bash .github/scripts/marin_upstream_sync_notes.sh validated/marin-upstream-sync.json "MERGED WITH UPSTREAM vLLM MAIN")
           EOF
 
           bash .github/scripts/marin_release.sh move-tag \
@@ -108,4 +123,5 @@ jobs:
             "Marin nightly (latest)" \
             /tmp/marin-nightly-alias-notes.md \
             validated/*.whl \
-            validated/marin-build.json
+            validated/marin-build.json \
+            validated/marin-upstream-sync.json
