@@ -3,10 +3,10 @@
   "fork_repo": "marin-community/vllm",
   "upstream_repo": "vllm-project/vllm",
   "upstream_branch": "main",
-  "upstream_sha": "873910d608b4f6296eabd2f0c2cfc1d7d89b9aa8",
-  "upstream_short_sha": "873910d608b4",
-  "fork_base_sha": "4666770fda9e25ea04dff33ae35e0d77d2aba33c",
-  "synced_at_utc": "2026-05-13T20:36:41Z",
-  "sync_workflow": "Manual sync via Claude Code",
+  "upstream_sha": "d4004455d2357985830af10e432709b42c820455",
+  "upstream_short_sha": "d4004455d235",
+  "fork_base_sha": "e6e3b6b1064ddea3f77086566135fc757ada90b1",
+  "synced_at_utc": "2026-05-25T17:04:01Z",
+  "sync_workflow": "Marin Upstream Sync PR",
   "sync_issue_url": "https://github.com/marin-community/marin/issues/5551"
 }
