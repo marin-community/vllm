@@ -48,6 +48,7 @@ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_
 
 [tool.setuptools_scm]
 tag_regex = "^(?:v)?(?P<version>\\d+\\.\\d+\\.\\d+(?:rc\\d+)?)$"
+git_describe_command = "git describe --dirty --tags --long --match v[0-9]*"
 
 [tool.setuptools.packages.find]
 where = ["."]
