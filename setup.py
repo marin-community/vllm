@@ -38,8 +38,13 @@ logger = logging.getLogger(__name__)
 envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
+# Keep these in sync with [tool.setuptools_scm] in pyproject.toml. setup.py
+# calls setuptools-scm directly below when adding device-specific version
+# suffixes, so it cannot rely solely on pyproject metadata.
+SCM_TAG_REGEX = r"^(?:v)?(?P<version>\d+\.\d+\.\d+(?:rc\d+)?)$"
+SCM_GIT_DESCRIBE_COMMAND = "git describe --dirty --tags --long --match v[0-9]*"
 
-if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
+if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE not in ("cpu", "tpu"):
     logger.warning("VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
     VLLM_TARGET_DEVICE = "cpu"
 elif not (sys.platform.startswith("linux") or sys.platform.startswith("darwin")):
@@ -901,9 +906,17 @@ def get_vllm_version() -> str:
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py")
+        return get_version(
+            write_to="vllm/_version.py",
+            tag_regex=SCM_TAG_REGEX,
+            git_describe_command=SCM_GIT_DESCRIBE_COMMAND,
+        )
 
-    version = get_version(write_to="vllm/_version.py")
+    version = get_version(
+        write_to="vllm/_version.py",
+        tag_regex=SCM_TAG_REGEX,
+        git_describe_command=SCM_GIT_DESCRIBE_COMMAND,
+    )
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():

@@ -47,7 +47,11 @@ lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:regi
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
 
 [tool.setuptools_scm]
-# no extra settings needed, presence enables setuptools-scm
+# Only derive package versions from upstream-style release tags, e.g. v0.20.0
+# or 0.20.0rc1. The Marin fork also has release bookkeeping tags that should
+# not drive setuptools-scm version selection.
+tag_regex = "^(?:v)?(?P<version>\\d+\\.\\d+\\.\\d+(?:rc\\d+)?)$"
+git_describe_command = "git describe --dirty --tags --long --match v[0-9]*"
 
 [tool.setuptools.packages.find]
 where = ["."]
