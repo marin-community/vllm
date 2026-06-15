@@ -260,42 +260,48 @@ class Scheduler(SchedulerInterface):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
+        self._request_routed_experts: dict[str, list[np.ndarray]] = defaultdict(list)
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
                 "enable_return_routed_experts does not support context parallelism "
                 "(dcp_world_size > 1 or pcp_world_size > 1)"
             )
 
-            self.routed_experts_reader = RoutedExpertsReader.create()
+            self.routed_experts_reader = None
+            if self.vllm_config.device_config.device_type != "tpu":
+                self.routed_experts_reader = RoutedExpertsReader.create()
 
-            assert len(kv_cache_config.kv_cache_groups) > 0, (
-                "enable_return_routed_experts requires at least one kv cache group"
-            )
-            # Find the attention group for routed experts indexing.
-            self.routed_experts_attn_gid = 0
-            for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-                if isinstance(group.kv_cache_spec, AttentionSpec):
-                    self.routed_experts_attn_gid = gid
-                    break
-            min_block_size = min(
-                [
-                    group.kv_cache_spec.block_size
-                    for group in kv_cache_config.kv_cache_groups
-                ]
-            )
-            num_groups = len(kv_cache_config.kv_cache_groups)
-            self.max_num_kv_tokens = (
-                kv_cache_config.num_blocks // num_groups
-            ) * min_block_size
-            dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
-            pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
-            if pcp_size * dcp_size > 1:
-                self.max_num_kv_tokens *= pcp_size * dcp_size
+                assert len(kv_cache_config.kv_cache_groups) > 0, (
+                    "enable_return_routed_experts requires at least one kv cache group"
+                )
+                # Find the attention group for routed experts indexing.
+                self.routed_experts_attn_gid = 0
+                for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+                    if isinstance(group.kv_cache_spec, AttentionSpec):
+                        self.routed_experts_attn_gid = gid
+                        break
+                min_block_size = min(
+                    [
+                        group.kv_cache_spec.block_size
+                        for group in kv_cache_config.kv_cache_groups
+                    ]
+                )
+                num_groups = len(kv_cache_config.kv_cache_groups)
+                self.max_num_kv_tokens = (
+                    kv_cache_config.num_blocks // num_groups
+                ) * min_block_size
+                dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+                pcp_size = (
+                    self.vllm_config.parallel_config.prefill_context_parallel_size
+                )
+                if pcp_size * dcp_size > 1:
+                    self.max_num_kv_tokens *= pcp_size * dcp_size
 
-            self.routed_experts_reader.attach_buffer(
-                max_num_kv_tokens=self.max_num_kv_tokens,
-                vllm_config=self.vllm_config,
-            )
+                self.routed_experts_reader.attach_buffer(
+                    max_num_kv_tokens=self.max_num_kv_tokens,
+                    vllm_config=self.vllm_config,
+                )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
@@ -1296,6 +1302,7 @@ class Scheduler(SchedulerInterface):
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        expert_indices = model_runner_output.expert_indices
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
@@ -1330,8 +1337,12 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        current_expert_token_offset = 0
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
+            expert_start_idx = current_expert_token_offset
+            expert_end_idx = expert_start_idx + num_tokens_scheduled
+            current_expert_token_offset = expert_end_idx
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
@@ -1345,6 +1356,13 @@ class Scheduler(SchedulerInterface):
                 # be set to None (in order to finish async KV transfer).
                 # In this case, we use is_finished() to check.
                 continue
+
+            self._update_request_routed_experts(
+                request,
+                expert_indices,
+                expert_start_idx,
+                expert_end_idx,
+            )
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
@@ -1550,6 +1568,37 @@ class Scheduler(SchedulerInterface):
 
         return engine_core_outputs
 
+    def _update_request_routed_experts(
+        self,
+        request: Request,
+        expert_indices: np.ndarray | None,
+        start_idx: int,
+        end_idx: int,
+    ) -> None:
+        if (
+            not self.vllm_config.model_config.enable_return_routed_experts
+            or expert_indices is None
+        ):
+            return
+
+        if expert_indices.ndim != 3:
+            raise ValueError(
+                "ModelRunnerOutput.expert_indices must have shape "
+                "[num_layers, num_scheduled_tokens, top_k], got "
+                f"{expert_indices.shape}"
+            )
+        if expert_indices.shape[1] < end_idx:
+            raise ValueError(
+                "ModelRunnerOutput.expert_indices has too few scheduled tokens: "
+                f"need {end_idx}, got {expert_indices.shape[1]}"
+            )
+
+        request_experts = expert_indices[:, start_idx:end_idx, :].transpose(1, 0, 2)
+        routed_experts = getattr(self, "_request_routed_experts", None)
+        if routed_experts is None:
+            routed_experts = self._request_routed_experts = defaultdict(list)
+        routed_experts[request.request_id].append(request_experts)
+
     @staticmethod
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:
         return status in (
@@ -1596,6 +1645,16 @@ class Scheduler(SchedulerInterface):
 
     def _get_routed_experts(self, request: Request) -> np.ndarray | None:
         if not self.vllm_config.model_config.enable_return_routed_experts:
+            return None
+
+        routed_experts = getattr(self, "_request_routed_experts", None)
+        if routed_experts:
+            request_experts = routed_experts.pop(request.request_id, None)
+            if request_experts:
+                num_tokens = max(request.num_tokens - 1, 0)
+                return np.concatenate(request_experts, axis=0)[:num_tokens]
+
+        if getattr(self, "routed_experts_reader", None) is None:
             return None
 
         kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
