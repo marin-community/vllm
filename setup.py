@@ -185,6 +185,32 @@ def bundle_tcmalloc(build_lib: str) -> None:
     logger.info("Bundled tcmalloc into wheel: %s", bundle_path)
 
 
+def _cmake_cache_has_missing_tool_path(cmake_cache: str) -> bool:
+    cached_tool_paths = {
+        "CMAKE_AR",
+        "CMAKE_C_COMPILER",
+        "CMAKE_CXX_COMPILER",
+        "CMAKE_CUDA_COMPILER",
+        "CMAKE_HIP_COMPILER",
+        "CMAKE_LINKER",
+        "CMAKE_MAKE_PROGRAM",
+        "CMAKE_RANLIB",
+        "ROCM_PATH",
+    }
+    with open(cmake_cache, encoding="utf-8") as f:
+        for line in f:
+            key_type, _, value = line.strip().partition("=")
+            key, _, cache_type = key_type.partition(":")
+            if cache_type not in ("FILEPATH", "PATH"):
+                continue
+            if key not in cached_tool_paths:
+                continue
+            if os.path.isabs(value) and not os.path.exists(value):
+                logger.info("Dropping stale CMake cache entry: %s=%s", key, value)
+                return True
+    return False
+
+
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
         super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
@@ -335,6 +361,18 @@ class cmake_build_ext(build_ext):
         # Create build directory if it does not exist.
         if not os.path.exists(self.build_temp):
             os.makedirs(self.build_temp)
+        else:
+            # CMake caches absolute paths to tools from uv's ephemeral build
+            # environment. Drop stale configure state only when those cached
+            # paths no longer exist in the fresh build env.
+            cmake_cache = os.path.join(self.build_temp, "CMakeCache.txt")
+            cmake_files = os.path.join(self.build_temp, "CMakeFiles")
+            if os.path.exists(cmake_cache) and _cmake_cache_has_missing_tool_path(
+                cmake_cache
+            ):
+                os.remove(cmake_cache)
+                if os.path.exists(cmake_files):
+                    shutil.rmtree(cmake_files)
 
         targets = []
 
