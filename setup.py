@@ -14,13 +14,19 @@ import sysconfig
 from pathlib import Path
 from shutil import which
 
-import torch
 from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from setuptools_rust.build import build_rust
 from setuptools_scm import get_version
-from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
+
+try:
+    import torch
+    from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
+except ModuleNotFoundError:
+    torch = None
+    CUDA_HOME = None
+    ROCM_HOME = None
 
 
 def load_module_from_path(module_name, path):
@@ -90,13 +96,13 @@ elif not (sys.platform.startswith("linux") or sys.platform.startswith("darwin"))
     )
     VLLM_TARGET_DEVICE = "empty"
 elif sys.platform.startswith("linux") and os.getenv("VLLM_TARGET_DEVICE") is None:
-    if torch.version.hip is not None:
+    if torch is not None and torch.version.hip is not None:
         VLLM_TARGET_DEVICE = "rocm"
         logger.info("Auto-detected ROCm")
-    elif torch.version.xpu is not None:
+    elif torch is not None and torch.version.xpu is not None:
         VLLM_TARGET_DEVICE = "xpu"
         logger.info("Auto-detected XPU")
-    elif torch.version.cuda is not None:
+    elif torch is not None and torch.version.cuda is not None:
         VLLM_TARGET_DEVICE = "cuda"
         logger.info("Auto-detected CUDA")
     else:
@@ -978,14 +984,19 @@ def _no_device() -> bool:
 
 
 def _is_cuda() -> bool:
-    has_cuda = torch.version.cuda is not None
-    return VLLM_TARGET_DEVICE == "cuda" and has_cuda and not _is_tpu()
+    if VLLM_TARGET_DEVICE != "cuda":
+        return False
+    if torch is None:
+        raise RuntimeError("Torch is required to build vLLM for CUDA")
+    return torch.version.cuda is not None and not _is_tpu()
 
 
 def _is_hip() -> bool:
-    return (
-        VLLM_TARGET_DEVICE == "cuda" or VLLM_TARGET_DEVICE == "rocm"
-    ) and torch.version.hip is not None
+    if VLLM_TARGET_DEVICE not in ("cuda", "rocm"):
+        return False
+    if torch is None:
+        raise RuntimeError("Torch is required to build vLLM for ROCm")
+    return torch.version.hip is not None
 
 
 def _is_tpu() -> bool:
