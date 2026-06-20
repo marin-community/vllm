@@ -997,7 +997,19 @@ def get_vllm_version() -> str:
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(write_to="vllm/_version.py")
 
-    version = get_version(write_to="vllm/_version.py")
+    try:
+        version = get_version(write_to="vllm/_version.py")
+    except Exception as exc:
+        git_sha = subprocess.check_output(
+            ["git", "rev-parse", "--short=9", "HEAD"], text=True
+        ).strip()
+        version = f"0.20.1rc1.dev0+g{git_sha}"
+        print(
+            "Falling back to "
+            f"{version} because setuptools-scm could not parse this checkout: {exc!r}"
+        )
+        os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = version
+        version = get_version(write_to="vllm/_version.py")
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
