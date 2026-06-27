@@ -59,13 +59,6 @@ MISTRAL_CONFIG_NAME = "params.json"
 
 logger = init_logger(__name__)
 
-if Version(version("transformers")) < Version("5.0.0"):
-    raise ImportError(
-        "Support for Transformers v4 is deprecated and was removed in vLLM v0.24.0. "
-        "Please upgrade to Transformers v5: pip install --upgrade transformers"
-    )
-
-
 class LazyConfigDict(dict):
     def __getitem__(self, key):
         if isinstance(value := super().__getitem__(key), type):
