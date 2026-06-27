@@ -1801,7 +1801,10 @@ class Scheduler(SchedulerInterface):
         # whose routing was just D2H'd into model_runner_output.
         routing_data = None
         routing_offsets: dict[str, int] = {}
-        if model_runner_output.routed_experts is not None:
+        if (
+            self.enable_return_routed_experts
+            and model_runner_output.routed_experts is not None
+        ):
             re = model_runner_output.routed_experts
             self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
             routing_data = re.routing_data.astype(
