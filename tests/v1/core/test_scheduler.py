@@ -4,6 +4,7 @@ import dataclasses
 from concurrent.futures import Future
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -38,7 +39,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+    RoutedExpertsLists,
+)
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 
@@ -3282,6 +3288,35 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     assert engine_core_output.request_id == request.request_id
     assert engine_core_output.new_token_ids == [123]
     assert engine_core_output.finish_reason == FinishReason.ERROR
+
+
+def test_runner_routed_experts_ignored_when_feature_disabled():
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1, max_tokens=1)[0]
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[123]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        routed_experts=RoutedExpertsLists(
+            routing_data=np.zeros((num_scheduled_tokens, 1, 2), dtype=np.uint8),
+            slot_mapping=np.arange(num_scheduled_tokens, dtype=np.int32),
+        ),
+    )
+
+    engine_core_outputs = scheduler.update_from_output(
+        scheduler_output, model_runner_output
+    )
+
+    assert not hasattr(scheduler, "routed_experts_mgr")
+    assert len(engine_core_outputs[0].outputs) == 1
+    assert engine_core_outputs[0].outputs[0].routed_experts is None
 
 
 @pytest.mark.parametrize("use_v2_model_runner", [False, True])
