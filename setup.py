@@ -88,7 +88,11 @@ def is_metadata_only_build() -> bool:
     return bool({"egg_info", "dist_info"}.intersection(sys.argv[1:]))
 
 
-if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
+if (
+    sys.platform.startswith("darwin")
+    and os.getenv("VLLM_TARGET_DEVICE") is None
+    and VLLM_TARGET_DEVICE != "cpu"
+):
     logger.warning("VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
     VLLM_TARGET_DEVICE = "cpu"
 elif not (sys.platform.startswith("linux") or sys.platform.startswith("darwin")):
