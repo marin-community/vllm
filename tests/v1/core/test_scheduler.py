@@ -200,6 +200,68 @@ def test_scheduler_stats_route_to_existing_output_client():
     assert len(engine_core_outputs[1].outputs) == 1
 
 
+def test_schedule_held_running_request_skips_and_resumes():
+    scheduler = create_scheduler()
+    requests = create_requests(num_requests=2, num_tokens=4, req_ids=["held", "live"])
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert len(output.scheduled_new_reqs) == 2
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id for request in requests],
+            req_id_to_index={
+                request.request_id: i for i, request in enumerate(requests)
+            },
+            sampled_token_ids=[[10], [20]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    held_request, live_request = requests
+    held_computed_tokens = held_request.num_computed_tokens
+    held_output_tokens = list(held_request.output_token_ids)
+    assert len(scheduler.running) == 2
+
+    scheduler.held_request_ids = {held_request.request_id}
+    output = scheduler.schedule()
+
+    assert held_request.request_id not in output.num_scheduled_tokens
+    assert output.num_scheduled_tokens[live_request.request_id] == 1
+    assert output.scheduled_cached_reqs.num_reqs == 1
+    assert output.scheduled_cached_reqs.req_ids == [live_request.request_id]
+    assert held_request in scheduler.running
+    assert held_request.num_computed_tokens == held_computed_tokens
+
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[live_request.request_id],
+            req_id_to_index={live_request.request_id: 0},
+            sampled_token_ids=[[21]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert list(held_request.output_token_ids) == held_output_tokens
+    assert held_request in scheduler.running
+
+    scheduler.held_request_ids = set()
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[held_request.request_id] == 1
+    assert output.scheduled_cached_reqs.num_reqs == 2
+    assert held_request.request_id in output.scheduled_cached_reqs.req_ids
+    assert held_request.request_id not in output.scheduled_cached_reqs.resumed_req_ids
+    assert len(output.scheduled_new_reqs) == 0
+    assert len(scheduler.waiting) == 0
+
+
 def test_schedule_multimodal_requests():
     scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
     mm_positions = [[PlaceholderRange(offset=i, length=100)] for i in range(10)]
