@@ -1560,8 +1560,11 @@ if (
 
 # Rust artifacts, built via setuptools-rust and installed into the package
 # directory alongside the Python modules.
-rust_extensions = rust_build.rust_extensions(
-    optional=not should_require_rust_frontend()
+require_rust_frontend = should_require_rust_frontend()
+rust_extensions = (
+    rust_build.rust_extensions(optional=not require_rust_frontend)
+    if not _is_tpu() or require_rust_frontend
+    else []
 )
 
 setup(
