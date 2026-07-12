@@ -89,6 +89,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     k3_dspark="K3DSparkConfig",
     funaudiochat="FunAudioChatConfig",
     granite4_vision="Granite4VisionConfig",
+    grug_moe="GrugMoeConfig",
     hyperclovax="HyperCLOVAXConfig",
     hy_v3="HYV3Config",
     hy_v4="HYV4Config",

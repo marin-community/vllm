@@ -130,6 +130,7 @@ _TEXT_GENERATION_MODELS = {
     "GraniteMoeSharedForCausalLM": ("granitemoeshared", "GraniteMoeSharedForCausalLM"),
     "GraniteMoeSWAForCausalLM": ("granitemoeshared", "GraniteMoeSharedForCausalLM"),
     "GraniteSWAForCausalLM": ("granite", "GraniteForCausalLM"),
+    "GrugMoeForCausalLM": ("grugmoe", "GrugMoeForCausalLM"),
     "HrmTextForCausalLM": ("hrm_text", "HrmTextForCausalLM"),
     "HYV3ForCausalLM": ("hy_v3", "HYV3ForCausalLM"),
     "HYV4ForCausalLM": ("vllm.models.hy_v4", "HYV4ForCausalLM"),
