@@ -130,6 +130,7 @@ _TEXT_GENERATION_MODELS = {
     "GraniteMoeSWAForCausalLM": ("granitemoeshared", "GraniteMoeSharedForCausalLM"),
     "GraniteSWAForCausalLM": ("granite", "GraniteForCausalLM"),
     "GritLM": ("gritlm", "GritLM"),
+    "GrugMoeForCausalLM": ("grugmoe", "GrugMoeForCausalLM"),
     "HrmTextForCausalLM": ("hrm_text", "HrmTextForCausalLM"),
     "HunYuanMoEV1ForCausalLM": ("hunyuan_v1", "HunYuanMoEV1ForCausalLM"),
     "HunYuanDenseV1ForCausalLM": ("hunyuan_v1", "HunYuanDenseV1ForCausalLM"),
