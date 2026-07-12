@@ -321,6 +321,9 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         "sapientinc/HRM-Text-1B",
         min_transformers_version="5.9.0",
     ),
+    "GrugMoeForCausalLM": _HfExamplesInfo(
+        "marin-community/grug-moe", is_available_online=False
+    ),
     "HunYuanDenseV1ForCausalLM": _HfExamplesInfo("tencent/Hunyuan-7B-Instruct"),
     "HunYuanMoEV1ForCausalLM": _HfExamplesInfo(
         "tencent/Hunyuan-A13B-Instruct", trust_remote_code=True
