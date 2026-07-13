@@ -853,7 +853,30 @@ class VllmConfig:
         self.try_verify_and_update_config()
 
         if self.model_config is not None:
-            self.model_config.verify_with_parallel_config(self.parallel_config)
+            effective_tp_size = None
+            from vllm.platforms import current_platform
+
+            if current_platform.is_tpu() and isinstance(self.additional_config, dict):
+                sharding_strategy = self.additional_config.get("sharding", {}).get(
+                    "sharding_strategy", {}
+                )
+                attn_dp_size = sharding_strategy.get("attn_dp_size")
+                if (
+                    sharding_strategy.get("enable_dp_attention")
+                    and attn_dp_size is not None
+                ):
+                    launcher_tp_size = self.parallel_config.tensor_parallel_size
+                    if attn_dp_size <= 0 or launcher_tp_size % attn_dp_size != 0:
+                        raise ValueError(
+                            f"TPU attention DP size ({attn_dp_size}) must be a "
+                            "positive divisor "
+                            f"of tensor parallel size ({launcher_tp_size})."
+                        )
+                    effective_tp_size = launcher_tp_size // attn_dp_size
+            self.model_config.verify_with_parallel_config(
+                self.parallel_config,
+                effective_tensor_parallel_size=effective_tp_size,
+            )
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
 
             self.parallel_config.is_moe_model = self.model_config.is_moe

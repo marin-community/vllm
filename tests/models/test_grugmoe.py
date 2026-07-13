@@ -327,6 +327,20 @@ def test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads():
         ModelConfig.verify_with_parallel_config(generic_model_config, parallel_config)
 
 
+def test_grug_moe_parallel_config_accepts_effective_attention_dp_tp():
+    parallel_config = ParallelConfig(tensor_parallel_size=8)
+    grug_model_config = _minimal_model_config_for_parallel_check(
+        ["GrugMoeForCausalLM"],
+        "grug_moe",
+    )
+
+    ModelConfig.verify_with_parallel_config(
+        grug_model_config,
+        parallel_config,
+        effective_tensor_parallel_size=1,
+    )
+
+
 def test_grug_moe_rejects_replicated_tensor_parallel_core_layers(monkeypatch):
     fake_pp_group = SimpleNamespace(world_size=1)
     fake_config = SimpleNamespace(

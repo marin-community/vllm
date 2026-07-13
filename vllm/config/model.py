@@ -1180,9 +1180,15 @@ class ModelConfig:
     def verify_with_parallel_config(
         self,
         parallel_config: ParallelConfig,
+        *,
+        effective_tensor_parallel_size: int | None = None,
     ) -> None:
         total_num_attention_heads = self.model_arch_config.total_num_attention_heads
-        tensor_parallel_size = parallel_config.tensor_parallel_size
+        tensor_parallel_size = (
+            effective_tensor_parallel_size
+            if effective_tensor_parallel_size is not None
+            else parallel_config.tensor_parallel_size
+        )
         if total_num_attention_heads % tensor_parallel_size != 0:
             raise ValueError(
                 f"Total number of attention heads ({total_num_attention_heads})"
