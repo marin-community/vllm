@@ -7,7 +7,7 @@
     "recorded_at": null,
     "recorded_from": null,
     "commit": null,
-    "hardware": "coreweave H100x1 via iris cluster cw-us-east-02a",
+    "hardware": "H100x1, submitted to the iris marin cluster and federated to CoreWeave",
     "note": "NOT yet recorded from a real run: no H100 was available when this gate was written, so the floors are conservative a-priori bounds rather than measured ones. Qwen3-0.6B answering 5 short prompts sequentially on one H100 should clear them by a wide margin; they exist to catch a catastrophic regression (a model that serves garbage, or a serving path that falls back to something an order of magnitude slower). Tighten them by running the nightly with --record, which halves the observed values and fills in this block."
   }
 }

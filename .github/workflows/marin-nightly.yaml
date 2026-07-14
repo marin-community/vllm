@@ -3,117 +3,113 @@ name: Marin Nightly
 # Marin fork only. Upstream's workflows are untouched and this does not invoke them.
 #
 # The real end-to-end test for this fork: build vLLM from the commit under test on one
-# CoreWeave H100, serve Qwen/Qwen3-0.6B through the OpenAI server, send a prompt set,
-# and gate the answers and decode throughput against infra/nightly/specs/. It also runs
-# the Marin delta's own tests on that GPU -- tests/models/test_grugmoe.py has a
-# CUDA-gated case that no CPU runner can reach, and the scheduler test covers the
-# held-request skip.
+# H100, run the Marin delta's own tests there (tests/models/test_grugmoe.py has a
+# CUDA-gated case no CPU runner can reach, and the scheduler test covers the
+# held-request skip), then serve Qwen/Qwen3-0.6B through the OpenAI server and gate the
+# answers and decode throughput. infra/nightly/run_h100.sh is what actually runs on the
+# GPU; this workflow provisions it and tears it down.
 #
-# The GPU comes from Iris. The runner installs only the Iris CLI, reaches the CoreWeave
-# controller through a kubectl port-forward (hence CW_KUBECONFIG), and submits a job;
-# the job itself clones this fork, installs it with VLLM_USE_PRECOMPILED=1 (the fork
-# adds no kernels, so upstream's prebuilt ones are the right ones), and runs the smoke.
-# We never start, stop, or roll the shared cluster -- we only submit to it.
+# Auth is keyless via Workload Identity Federation: the job's GitHub OIDC token
+# (permissions.id-token: write) is exchanged to impersonate github-iris@hai-gcp-models --
+# no stored service-account key, and no cluster credentials on the runner. CoreWeave's
+# Iris controllers are IP-locked to the Marin egress and a hosted runner cannot reach
+# them, so the job is submitted to the `marin` cluster and federated to CoreWeave with
+# --target-cluster, which is the supported route from CI.
 #
-# Teardown is belt and braces, because a leaked H100 is expensive: `iris job run` blocks
-# and terminates the job when it exits, `--timeout` makes the job self-kill, and the
-# always() step below stops it by name if the runner was hard-killed.
+# A leaked H100 is expensive, so teardown is threefold: `iris job run` blocks and stops
+# its job when it exits, --timeout is a server-side backstop, and the always() step below
+# stops the job by name if the runner was hard-killed.
 
 on:
   schedule:
-    - cron: "0 10 * * *"   # 10:00 UTC
+    - cron: "0 10 * * *"   # 10:00 UTC, staggered off the other Marin nightlies
   workflow_dispatch:
     inputs:
       model:
         description: "HF model id to serve"
         default: Qwen/Qwen3-0.6B
-      gpu:
-        description: "Iris GPU spec, as variant by count (e.g. H100x1)"
-        default: H100x1
+      target_cluster:
+        description: "Iris cluster to federate the job to"
+        default: cw-rno2a
 
 concurrency:
   group: marin-nightly
-  cancel-in-progress: false   # never interrupt a run holding a GPU
-
-env:
-  IRIS_CLUSTER_CONFIG: marin/lib/iris/config/cw-us-east-02a.yaml
-  JOB_NAME: vllm-nightly-serve-smoke
-  MODEL: ${{ inputs.model || 'Qwen/Qwen3-0.6B' }}
-  GPU: ${{ inputs.gpu || 'H100x1' }}
+  cancel-in-progress: false   # never interrupt a run holding an H100
 
 jobs:
   serve-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write   # mint the OIDC token that WIF exchanges for github-iris
+    env:
+      JOB_NAME: vllm-nightly-serve-smoke
+      TARGET_CLUSTER: ${{ github.event.inputs.target_cluster || 'cw-rno2a' }}
+      MODEL: ${{ github.event.inputs.model || 'Qwen/Qwen3-0.6B' }}
     steps:
-      - name: Check out marin (for the Iris cluster config)
-        uses: actions/checkout@v4
-        with:
-          repository: marin-community/marin
-          path: marin
-          fetch-depth: 1
-          sparse-checkout: lib/iris/config
+      - uses: actions/checkout@v4
+
+      - name: Trim the Iris bundle
+        # Iris bundles the working directory by enumerating `git ls-files` and caps the zip
+        # at 25MB; this repo's tracked tree is ~98MB. The job needs nothing from the bundle
+        # but the script it runs -- it clones the fork itself, because the build needs a
+        # real git repo (see run_h100.sh) -- so the index is reduced to exactly that file.
+        # The checkout is throwaway, so this never touches anything real.
+        run: |
+          git rm -r --cached --quiet .
+          git add -f infra/nightly/run_h100.sh
 
       - uses: astral-sh/setup-uv@v6
 
-      - name: Install the Iris CLI
-        # The controller extra pulls in the kubernetes client, which is what opens the
-        # port-forward to the CoreWeave controller.
-        run: uv tool install --prerelease allow "marin-iris[controller]"
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: hai-gcp-models
+          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
+          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
 
-      - name: Write the CoreWeave kubeconfig
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: hai-gcp-models
+
+      - name: Install the Iris client
+        # marin-core depends on marin-iris, but uv only symlinks the named package's own
+        # scripts, so the tool's bin dir goes on PATH to make `iris` resolve. The floor is
+        # the first build carrying the WIF/IAP auth fix (marin#7144).
         run: |
-          mkdir -p ~/.kube
-          printf '%s' "${{ secrets.CW_KUBECONFIG }}" > ~/.kube/coreweave-iris
-          chmod 600 ~/.kube/coreweave-iris
+          uv tool install --prerelease allow "marin-core>=0.2.46.dev202607131620"
+          echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
 
       - name: Serve and gate on one H100
-        # Iris bundles the working directory as the job's workspace and caps it at 25MB;
-        # this fork's tracked tree is ~98MB, so submit from an empty scratch workspace and
-        # let the job clone the fork instead. --no-sync skips the workspace `uv sync` that
-        # the empty workspace has nothing to sync.
-        #
-        # The clone checks the commit out on a real branch: VLLM_USE_PRECOMPILED resolves
-        # its wheel from `git merge-base upstream/main <current branch>`, and a detached
-        # HEAD makes that fall back to upstream's nightly kernels, which are not the ones
-        # this fork's base was built against.
+        # --gpu is gated behind --enable-extra-resources by iris. --no-sync stops iris from
+        # trying to `uv sync` the trimmed workspace, which has no project in it. `iris job
+        # run` blocks, streams the job's logs, and exits non-zero unless the job succeeded,
+        # so the gate's exit code inside the job is this step's exit code.
         run: |
-          mkdir -p /tmp/iris-workspace && cd /tmp/iris-workspace
-          git init -q
-          echo "Scratch workspace; the job clones the fork itself." > README.md
-          git add README.md
-          # The job's script is single-quoted on purpose: $VLLM_COMMIT and $MODEL are
-          # passed in with `-e` and must expand on the GPU, not here on the runner.
-          # shellcheck disable=SC2016
-          iris --config "$GITHUB_WORKSPACE/$IRIS_CLUSTER_CONFIG" job run \
+          iris --cluster marin job run \
+            --target-cluster "$TARGET_CLUSTER" \
             --job-name "$JOB_NAME" \
-            --gpu "$GPU" --enable-extra-resources \
+            --gpu H100x1 --enable-extra-resources \
             --cpu 8 --memory 64GB --disk 200GB \
             --no-sync \
-            --timeout 3600 \
+            --timeout 4800 \
             -e VLLM_COMMIT "$VLLM_COMMIT" \
-            -e SMOKE_HARDWARE "coreweave $GPU via iris cw-us-east-02a" \
             -e MODEL "$MODEL" \
-            -- bash -lc '
-              set -euo pipefail
-              cd "${IRIS_WORKDIR:-/tmp}"
-              git clone https://github.com/marin-community/vllm.git vllm
-              cd vllm
-              git checkout -B nightly "$VLLM_COMMIT"
-              uv venv --python 3.12
-              VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-              uv pip install pytest tblib
-              .venv/bin/python -m pytest tests/models/test_grugmoe.py -v
-              .venv/bin/python -m pytest tests/v1/core/test_scheduler.py -v
-              .venv/bin/python infra/nightly/gpu_serve_smoke.py \
-                --model "$MODEL" \
-                --spec infra/nightly/specs/qwen3-0.6b-h100.json
-            '
+            -e SMOKE_HARDWARE "H100x1 on $TARGET_CLUSTER via iris" \
+            -- bash infra/nightly/run_h100.sh 2>&1 | tee nightly.log
         env:
           VLLM_COMMIT: ${{ github.sha }}
 
-      - name: Stop the Iris job
+      - name: Stop any Iris job the run left behind
         if: always()
-        # Covers a hard-killed runner, where the submit step never got to terminate it.
-        run: |
-          iris --config "$GITHUB_WORKSPACE/$IRIS_CLUSTER_CONFIG" job stop "$JOB_NAME" || true
+        # Only matters if the runner was hard-killed. --cluster is a top-level flag.
+        run: iris --cluster marin job stop "$JOB_NAME" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-run-log
+          path: nightly.log
+          if-no-files-found: ignore
