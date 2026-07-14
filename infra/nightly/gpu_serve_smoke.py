@@ -1,0 +1,274 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Serve a model with this fork's OpenAI server and gate the result.
+
+Runs *inside* the nightly's Iris GPU job (see .github/workflows/marin-nightly.yaml),
+against a vLLM built from the fork commit under test. Boots `vllm serve`, waits for
+the server to report ready, sends a fixed prompt set, and compares the run against a
+checked-in spec: every prompt must come back with a non-empty answer of at least
+`min_completion_tokens`, and decode throughput must clear the spec's floor.
+
+Deliberately stdlib-only and it never imports vllm: it talks to the server over HTTP,
+so a broken import in the model code surfaces as a serve failure rather than as a
+crash in the harness.
+
+    python infra/nightly/gpu_serve_smoke.py --spec <spec.json>
+    python infra/nightly/gpu_serve_smoke.py --spec <spec.json> --record
+"""
+
+import argparse
+import contextlib
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+logger = logging.getLogger("gpu_serve_smoke")
+
+# Held fixed: the spec's throughput floor is only comparable across runs that ask
+# the model for the same work.
+PROMPTS = (
+    "In one sentence, what is a large language model?",
+    "Write a Python function that reverses a string.",
+    "What is 17 + 25? Answer with the number only.",
+    "Name three primary colors.",
+    "Summarize why matrix multiplication is central to transformers.",
+)
+MAX_TOKENS = 64
+TEMPERATURE = 0.0
+REQUEST_TIMEOUT = 120.0
+READY_POLL_INTERVAL = 5.0
+
+
+@dataclass(frozen=True)
+class GateSpec:
+    """The gate a nightly run must clear."""
+
+    model: str
+    expected_prompts: int
+    min_completion_tokens: int
+    min_output_tokens_per_second: float
+
+    @classmethod
+    def load(cls, path: Path) -> "GateSpec":
+        raw = json.loads(path.read_text())
+        fields = {f: raw[f] for f in cls.__dataclass_fields__}
+        return cls(**fields)
+
+
+@dataclass(frozen=True)
+class SmokeResult:
+    """What a run actually produced."""
+
+    completions: int
+    min_completion_tokens: int
+    output_tokens_per_second: float
+
+
+def post_json(url: str, payload: dict, timeout: float) -> dict:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
+@contextlib.contextmanager
+def serve(model: str, port: int, startup_timeout: float) -> Iterator[str]:
+    """Run `vllm serve` for the duration of the block, yielding its base URL.
+
+    Args:
+        model: HF model id to serve.
+        port: Port for the OpenAI server to listen on.
+        startup_timeout: Seconds to wait for the server to report ready.
+
+    Yields:
+        The server's OpenAI base URL.
+
+    Raises:
+        RuntimeError: If the server exits or fails to become ready in time.
+    """
+    command = [
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        model,
+        "--port",
+        str(port),
+        "--max-model-len",
+        "4096",
+    ]
+    logger.info("starting server: %s", " ".join(command))
+    server = subprocess.Popen(command)
+    try:
+        base_url = f"http://127.0.0.1:{port}/v1"
+        wait_until_ready(server, base_url, startup_timeout)
+        yield base_url
+    finally:
+        server.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            server.wait(timeout=60)
+        if server.poll() is None:
+            server.kill()
+            server.wait(timeout=60)
+
+
+def wait_until_ready(server: subprocess.Popen, base_url: str, timeout: float) -> None:
+    """Block until the server answers /models, it dies, or `timeout` elapses."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        exit_code = server.poll()
+        if exit_code is not None:
+            raise RuntimeError(f"vllm serve exited with code {exit_code} at startup")
+        try:
+            with urllib.request.urlopen(f"{base_url}/models", timeout=10) as response:
+                if response.status == 200:
+                    logger.info("server ready")
+                    return
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            pass
+        time.sleep(READY_POLL_INTERVAL)
+    raise RuntimeError(f"server was not ready within {timeout:.0f}s")
+
+
+def run_prompts(base_url: str, model: str) -> SmokeResult:
+    """Send every prompt to the served model and measure what comes back.
+
+    Throughput is aggregate decode throughput across the (sequential) prompt set:
+    total completion tokens over total wall-clock time spent in the requests.
+
+    Raises:
+        RuntimeError: If the server returns an empty answer for any prompt.
+    """
+    total_tokens = 0
+    per_prompt_tokens = []
+    started = time.monotonic()
+    for prompt in PROMPTS:
+        response = post_json(
+            f"{base_url}/chat/completions",
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": MAX_TOKENS,
+                "temperature": TEMPERATURE,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        answer = response["choices"][0]["message"]["content"]
+        tokens = response["usage"]["completion_tokens"]
+        if not answer or not answer.strip():
+            raise RuntimeError(f"empty answer for prompt: {prompt!r}")
+        logger.info("[%2d tokens] %s -> %s", tokens, prompt, answer.strip()[:80])
+        per_prompt_tokens.append(tokens)
+        total_tokens += tokens
+    elapsed = time.monotonic() - started
+
+    return SmokeResult(
+        completions=len(per_prompt_tokens),
+        min_completion_tokens=min(per_prompt_tokens),
+        output_tokens_per_second=total_tokens / elapsed,
+    )
+
+
+def failures(result: SmokeResult, spec: GateSpec) -> list[str]:
+    """Return one message per way `result` misses `spec`; empty means it passed."""
+    checks = []
+    if result.completions != spec.expected_prompts:
+        checks.append(
+            f"answered {result.completions} prompts, "
+            f"spec expects {spec.expected_prompts}"
+        )
+    if result.min_completion_tokens < spec.min_completion_tokens:
+        checks.append(
+            f"shortest answer was {result.min_completion_tokens} tokens, "
+            f"spec floor is {spec.min_completion_tokens}"
+        )
+    if result.output_tokens_per_second < spec.min_output_tokens_per_second:
+        checks.append(
+            f"decode throughput {result.output_tokens_per_second:.1f} tok/s is below "
+            f"the spec floor of {spec.min_output_tokens_per_second:.1f} tok/s"
+        )
+    return checks
+
+
+def record(path: Path, spec: GateSpec, result: SmokeResult, model: str) -> None:
+    """Overwrite the spec with floors derived from `result`, keeping provenance."""
+    document = {
+        **asdict(spec),
+        "model": model,
+        "expected_prompts": result.completions,
+        "min_completion_tokens": max(1, result.min_completion_tokens // 2),
+        "min_output_tokens_per_second": round(result.output_tokens_per_second / 2, 1),
+        "provenance": {
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "recorded_from": {
+                "min_completion_tokens": result.min_completion_tokens,
+                "output_tokens_per_second": round(result.output_tokens_per_second, 1),
+            },
+            "commit": os.environ.get("VLLM_COMMIT", "unknown"),
+            "hardware": os.environ.get("SMOKE_HARDWARE", "unknown"),
+            "note": (
+                "Floors are half the observed values: this is a not-broken gate, not a "
+                "performance benchmark. Re-record with --record after an intentional "
+                "change to the prompt set or the serving path."
+            ),
+        },
+    }
+    path.write_text(json.dumps(document, indent=2) + "\n")
+    logger.info("recorded spec to %s", path)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--spec", type=Path, required=True, help="Path to the spec.")
+    parser.add_argument("--model", help="Override the model id in the spec.")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=900.0,
+        help="Seconds to wait for the server to become ready.",
+    )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Rewrite the spec from this run instead of gating against it.",
+    )
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+
+    spec = GateSpec.load(args.spec)
+    model = args.model or spec.model
+
+    with serve(model, args.port, args.startup_timeout) as base_url:
+        result = run_prompts(base_url, model)
+
+    logger.info("result: %s", result)
+
+    if args.record:
+        record(args.spec, spec, result, model)
+        return 0
+
+    gate_failures = failures(result, spec)
+    for failure in gate_failures:
+        logger.error("GATE FAILED: %s", failure)
+    if gate_failures:
+        return 1
+    logger.info("gate passed against %s", args.spec)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
