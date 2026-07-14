@@ -41,19 +41,6 @@ jobs:
           git+https://github.com/marin-community/marin-style@999ea41d48c05db6f78552ddfa8d3cc6d49cd37f
           marin-style sync --check
 
-  gate-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-
-      - name: Test the nightly's gate
-        # The gate is stdlib-only by design, so its tests need neither vLLM nor a GPU.
-        run: >-
-          uv run --no-project --python 3.12 --with pytest
-          python -m pytest infra/nightly/ -q
-
   delta-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 20

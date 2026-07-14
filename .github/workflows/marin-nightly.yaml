@@ -39,28 +39,49 @@ concurrency:
 jobs:
   serve-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 40
     permissions:
       contents: read
       id-token: write   # mint the OIDC token that WIF exchanges for github-iris
     env:
       JOB_NAME: vllm-nightly-serve-smoke
+      # --user pins the job's canonical id, which `iris job stop` requires: it takes
+      # /<user>/<job> and raises on a bare name. Without pinning it, the id would depend on
+      # whichever identity CI authenticated as.
+      JOB_USER: vllm-ci
       TARGET_CLUSTER: ${{ github.event.inputs.target_cluster || 'cw-rno2a' }}
       MODEL: ${{ github.event.inputs.model || 'Qwen/Qwen3-0.6B' }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Trim the Iris bundle
-        # Iris bundles the working directory by enumerating `git ls-files` and caps the zip
-        # at 25MB; this repo's tracked tree is ~98MB. The job needs nothing from the bundle
-        # but the script it runs -- it clones the fork itself, because the build needs a
-        # real git repo (see run_h100.sh) -- so the index is reduced to exactly that file.
-        # The checkout is throwaway, so this never touches anything real.
-        run: |
-          git rm -r --cached --quiet .
-          git add -f infra/nightly/run_h100.sh
+        with:
+          # Full history and tags: setuptools-scm derives the package version from the
+          # nearest tag, and the merge-base below needs the shared history with upstream.
+          # A shallow checkout yields neither, and the version silently becomes 0.1.dev1.
+          fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v6
+
+      - name: Trim the Iris bundle
+        # Iris bundles the working directory and caps the zip at 25MB; this tree zips to
+        # 38MB, nearly all of it docs/. `git rm -r docs` (not --cached) has to drop them
+        # from the working tree too: the bundler enumerates
+        # `git ls-files --cached --others --exclude-standard`, so files merely removed from
+        # the index come back as untracked. Without docs the bundle is 14MB. The checkout
+        # is throwaway, so this never touches anything real.
+        run: git rm -r --quiet docs
+
+      - name: Resolve the upstream base commit and the package version
+        # The bundle ships without .git, so the two things setup.py would ask git for are
+        # computed here, where the real checkout is, and passed into the job.
+        # VLLM_PRECOMPILED_WHEEL_COMMIT is the upstream commit this fork sits on, so the
+        # prebuilt kernels match its base rather than falling back to upstream's nightlies.
+        run: |
+          git remote add upstream https://github.com/vllm-project/vllm.git
+          git fetch --quiet --no-tags upstream main
+          {
+            echo "VLLM_PRECOMPILED_WHEEL_COMMIT=$(git merge-base upstream/main HEAD)"
+            echo "SETUPTOOLS_SCM_PRETEND_VERSION=$(uvx --from setuptools-scm python -c 'from setuptools_scm import get_version; print(get_version())')"
+          } >> "$GITHUB_ENV"
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
@@ -84,28 +105,35 @@ jobs:
 
       - name: Serve and gate on one H100
         # --gpu is gated behind --enable-extra-resources by iris. --no-sync stops iris from
-        # trying to `uv sync` the trimmed workspace, which has no project in it. `iris job
-        # run` blocks, streams the job's logs, and exits non-zero unless the job succeeded,
-        # so the gate's exit code inside the job is this step's exit code.
+        # syncing the bundled workspace; run_h100.sh builds its own venv. `iris job run`
+        # blocks, streams the job's logs, and exits non-zero unless the job succeeded, so
+        # the gate's exit code inside the job is this step's exit code.
+        #
+        # --timeout is the server-side backstop that bounds how long a wedged run can hold
+        # the GPU. A healthy run is ~8 minutes end to end (install ~3, tests ~1.5, serve and
+        # gate ~2), so 25 minutes is generous without being open-ended.
         run: |
           iris --cluster marin job run \
             --target-cluster "$TARGET_CLUSTER" \
             --job-name "$JOB_NAME" \
+            --user "$JOB_USER" \
             --gpu H100x1 --enable-extra-resources \
             --cpu 8 --memory 64GB --disk 200GB \
             --no-sync \
-            --timeout 4800 \
-            -e VLLM_COMMIT "$VLLM_COMMIT" \
+            --timeout 1500 \
+            -e VLLM_PRECOMPILED_WHEEL_COMMIT "$VLLM_PRECOMPILED_WHEEL_COMMIT" \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION "$SETUPTOOLS_SCM_PRETEND_VERSION" \
             -e MODEL "$MODEL" \
+            -e VLLM_COMMIT "$GITHUB_SHA" \
             -e SMOKE_HARDWARE "H100x1 on $TARGET_CLUSTER via iris" \
             -- bash infra/nightly/run_h100.sh 2>&1 | tee nightly.log
-        env:
-          VLLM_COMMIT: ${{ github.sha }}
 
       - name: Stop any Iris job the run left behind
         if: always()
-        # Only matters if the runner was hard-killed. --cluster is a top-level flag.
-        run: iris --cluster marin job stop "$JOB_NAME" || true
+        # Only matters if the runner was hard-killed; `iris job run` already stops its own
+        # job on exit. The id must be canonical: `job stop` raises on a bare name, and with
+        # the `|| true` below that would fail silently and leak the GPU.
+        run: iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
 
       - uses: actions/upload-artifact@v4
         if: always()

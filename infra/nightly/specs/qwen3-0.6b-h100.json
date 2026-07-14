@@ -1,13 +1,16 @@
 {
   "model": "Qwen/Qwen3-0.6B",
-  "expected_prompts": 5,
-  "min_completion_tokens": 8,
-  "min_output_tokens_per_second": 20.0,
+  "expected_prompts": 4,
+  "min_completion_tokens": 32,
+  "min_output_tokens_per_second": 306.1,
   "provenance": {
-    "recorded_at": null,
-    "recorded_from": null,
-    "commit": null,
-    "hardware": "H100x1, submitted to the iris marin cluster and federated to CoreWeave",
-    "note": "NOT yet recorded from a real run: no H100 was available when this gate was written, so the floors are conservative a-priori bounds rather than measured ones. Qwen3-0.6B answering 5 short prompts sequentially on one H100 should clear them by a wide margin; they exist to catch a catastrophic regression (a model that serves garbage, or a serving path that falls back to something an order of magnitude slower). Tighten them by running the nightly with --record, which halves the observed values and fills in this block."
+    "recorded_at": "2026-07-14T21:17:28+00:00",
+    "recorded_from": {
+      "min_completion_tokens": 65,
+      "output_tokens_per_second": 612.3
+    },
+    "commit": "weaver/marin-standards-ci, on the upstream base a30addc7548a9a8b9b3323a7bc3eb7d7c4895d1c",
+    "hardware": "H100x1 on cw-rno2a, submitted to the iris marin cluster and federated to CoreWeave",
+    "note": "Floors are half the observed values: this is a not-broken gate, not a performance benchmark. Decode throughput came in at 612.5, 613.9 and 612.3 tok/s across three runs of this prompt set on the same hardware, so the floor has wide margin and only trips on a collapse -- a CPU fallback, or a recompile every step. Re-record with --record after an intentional change to the prompt set or the serving path."
   }
 }

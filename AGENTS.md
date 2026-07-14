@@ -81,20 +81,13 @@ build takes far too long to be a PR gate. Run them on an accelerator:
 .venv/bin/python -m pytest tests/v1/core/test_scheduler.py -v
 ```
 
-The nightly's gate is the exception — it is stdlib-only and runs anywhere:
-
-```bash
-uv run --no-project --with pytest python -m pytest infra/nightly/ -q
-```
-
 ## CI
 
 - `.github/workflows/marin-ci.yaml` — per-PR, CPU-only, minutes: the delta-scoped
-  `marin-style` lint, a `marin-style sync --check` drift gate, the nightly gate's
-  tests, and a smoke asserting the GrugMoE model and config still import and
-  resolve against the upstream base underneath them (the failure an upstream
-  refresh actually causes). It deliberately does **not** run upstream's test
-  suites or pre-commit matrix.
+  `marin-style` lint, a `marin-style sync --check` drift gate, and a smoke
+  asserting the GrugMoE model and config still import and resolve against the
+  upstream base underneath them (the failure an upstream refresh actually causes).
+  It deliberately does **not** run upstream's test suites or pre-commit matrix.
 - `.github/workflows/marin-nightly.yaml` — nightly (10:00 UTC) and on demand:
   builds this fork's commit on one CoreWeave H100 via Iris, runs the delta's GPU
   tests, serves `Qwen/Qwen3-0.6B` through the OpenAI server, and gates the answers

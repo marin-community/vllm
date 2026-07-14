@@ -33,16 +33,30 @@ from pathlib import Path
 
 logger = logging.getLogger("gpu_serve_smoke")
 
-# Held fixed: the spec's throughput floor is only comparable across runs that ask
-# the model for the same work.
+# (prompt, a substring the answer must contain -- None where no single answer is right).
+# Held fixed: the spec's throughput floor is only comparable across runs that ask the
+# model for the same work. Decoding is greedy, so the expected substrings are
+# deterministic, and they are what makes this a gate rather than a liveness probe: a
+# server that has lost its kernels still returns tokens, it just stops returning correct
+# ones.
+#
+# Every prompt here is one Qwen3-0.6B finishes on its own. An arithmetic prompt ("What
+# is 17 + 25? Answer with the number only.") was dropped for the opposite behavior: the
+# format constraint fights the reasoning, and the model second-guesses itself until it
+# hits whatever cap it is given -- 512, then 1536 -- so its answer was always a
+# truncated thought, which cannot tell us whether the model finished correctly.
 PROMPTS = (
-    "In one sentence, what is a large language model?",
-    "Write a Python function that reverses a string.",
-    "What is 17 + 25? Answer with the number only.",
-    "Name three primary colors.",
-    "Summarize why matrix multiplication is central to transformers.",
+    ("What is the capital of France? Answer with one word.", "paris"),
+    ("Write a Python function that reverses a string.", "def"),
+    ("In one sentence, what is a large language model?", None),
+    ("Name three primary colors.", None),
 )
-MAX_TOKENS = 64
+# Qwen3 thinks before it answers and the budget has to cover both -- thinking is what
+# these models do in production, so this accommodates it rather than turning it off. At
+# 64 tokens the whole budget went to the <think> block, every completion came back
+# truncated, and the gate was passing on token count alone. 1024 clears the longest of
+# the prompts above (474 tokens observed) with room to spare.
+MAX_TOKENS = 1024
 TEMPERATURE = 0.0
 REQUEST_TIMEOUT = 120.0
 READY_POLL_INTERVAL = 5.0
@@ -150,12 +164,12 @@ def run_prompts(base_url: str, model: str) -> SmokeResult:
     total completion tokens over total wall-clock time spent in the requests.
 
     Raises:
-        RuntimeError: If the server returns an empty answer for any prompt.
+        RuntimeError: If the server returns an empty or wrong answer for any prompt.
     """
     total_tokens = 0
     per_prompt_tokens = []
     started = time.monotonic()
-    for prompt in PROMPTS:
+    for prompt, expected in PROMPTS:
         response = post_json(
             f"{base_url}/chat/completions",
             {
@@ -170,6 +184,10 @@ def run_prompts(base_url: str, model: str) -> SmokeResult:
         tokens = response["usage"]["completion_tokens"]
         if not answer or not answer.strip():
             raise RuntimeError(f"empty answer for prompt: {prompt!r}")
+        if expected and expected not in answer.lower():
+            raise RuntimeError(
+                f"answer to {prompt!r} lacks {expected!r}: {answer.strip()!r}"
+            )
         logger.info("[%2d tokens] %s -> %s", tokens, prompt, answer.strip()[:80])
         per_prompt_tokens.append(tokens)
         total_tokens += tokens
