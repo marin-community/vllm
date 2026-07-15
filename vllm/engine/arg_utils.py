@@ -123,6 +123,8 @@ from vllm.v1.sample.logits_processor import LogitsProcessor
 from vllm.version import __version__ as VLLM_VERSION
 
 if TYPE_CHECKING:
+    from ray.runtime_env import RuntimeEnv
+
     from vllm.config.quantization import QuantizationConfigArgs
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.model_loader import LoadFormats
@@ -132,6 +134,7 @@ else:
     Executor = Any
     QuantizationMethods = str
     LoadFormats = str
+    RuntimeEnv = Any
     UsageContext = Any
 
 
@@ -141,6 +144,31 @@ logger = init_logger(__name__)
 T = TypeVar("T")
 TypeHint: TypeAlias = type[Any] | object
 TypeHintT: TypeAlias = type[T] | object
+
+_RAY_WORKER_SETUP_HOOK_ENV_VAR = "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR"
+
+
+def _runtime_env_for_nested_ray_init(
+    runtime_env: RuntimeEnv | None,
+) -> RuntimeEnv | None:
+    if runtime_env is None:
+        return None
+
+    nested_runtime_env = copy.deepcopy(runtime_env)
+    setup_hook = nested_runtime_env.pop("worker_process_setup_hook", None)
+    env_vars = nested_runtime_env.get("env_vars")
+    if setup_hook is not None or (
+        env_vars is not None and _RAY_WORKER_SETUP_HOOK_ENV_VAR in env_vars
+    ):
+        if env_vars is None:
+            env_vars = {}
+            nested_runtime_env["env_vars"] = env_vars
+        # Removing the key is insufficient when Ray is already initialized:
+        # actor runtime environments inherit the job-level hook variable. An
+        # explicit empty value acts as a tombstone, and Ray's worker bootstrap
+        # treats it as disabled.
+        env_vars[_RAY_WORKER_SETUP_HOOK_ENV_VAR] = ""
+    return nested_runtime_env
 
 
 def parse_type(return_type: Callable[[str], T]) -> Callable[[str], T]:
@@ -1989,7 +2017,9 @@ class EngineArgs:
             # as opposed to is_in_ray_actor().
             import ray
 
-            ray_runtime_env = ray.get_runtime_context().runtime_env
+            ray_runtime_env = _runtime_env_for_nested_ray_init(
+                ray.get_runtime_context().runtime_env
+            )
             # Avoid logging sensitive environment variables
             sanitized_env = ray_runtime_env.to_dict() if ray_runtime_env else {}
             if "env_vars" in sanitized_env:
