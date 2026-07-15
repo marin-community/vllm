@@ -1,20 +1,49 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import cast
+
 import numpy as np
 
-from vllm.v1.executor.ray_utils import detach_zero_copy_from_model_runner_output
+from vllm.config import VllmConfig
+from vllm.v1.executor.ray_utils import (
+    RayWorkerWrapper,
+    detach_zero_copy_from_model_runner_output,
+)
 from vllm.v1.outputs import (
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
     RoutedExpertsLists,
 )
+from vllm.v1.worker.worker_base import WorkerBase
+
+
+class _ConfigRecordingWorker:
+    def __init__(self) -> None:
+        self.config: object | None = None
+
+    def initialize_from_config(self, config: object) -> None:
+        self.config = config
 
 
 def _make_readonly(arr: np.ndarray) -> np.ndarray:
     arr.setflags(write=False)
     return arr
+
+
+def test_ray_worker_rank_remap_selects_remapped_kv_cache_config():
+    wrapper = RayWorkerWrapper(rpc_rank=2, global_rank=2)
+    worker = _ConfigRecordingWorker()
+    wrapper.worker = cast(WorkerBase, worker)
+    wrapper.vllm_config = cast(VllmConfig, object())
+
+    wrapper.adjust_rank({2: 0})
+    wrapper.initialize_from_config(["rank-0", "rank-1", "rank-2"])
+
+    assert wrapper.rpc_rank == 0
+    assert wrapper.global_rank == 0
+    assert worker.config == "rank-0"
 
 
 def test_detach_zero_copy_from_model_runner_output_copies_only_numpy_views():
