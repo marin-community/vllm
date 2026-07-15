@@ -1,9 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import pytest
+import copy
 
-from vllm.engine.arg_utils import EngineArgs
+import pytest
+from ray.runtime_env import RuntimeEnv
+
+from vllm.engine.arg_utils import EngineArgs, _runtime_env_for_nested_ray_init
 from vllm.model_executor.layers.quantization.quark.utils import deep_compare
+
+
+def test_nested_ray_runtime_env_removes_only_inherited_setup_hook():
+    runtime_env = RuntimeEnv(
+        worker_process_setup_hook="outer.module.setup",
+        env_vars={
+            "KEEP": "value",
+            "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR": "outer-hook-payload",
+        },
+        working_dir="s3://bucket/working-dir.zip",
+    )
+    original = copy.deepcopy(runtime_env)
+
+    nested_runtime_env = _runtime_env_for_nested_ray_init(runtime_env)
+
+    assert nested_runtime_env is not None
+    assert nested_runtime_env is not runtime_env
+    assert "worker_process_setup_hook" not in nested_runtime_env
+    assert nested_runtime_env["env_vars"] == {
+        "KEEP": "value",
+        "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR": "",
+    }
+    assert nested_runtime_env["working_dir"] == "s3://bucket/working-dir.zip"
+    assert runtime_env == original
 
 
 def test_cuda_empty_vs_unset_configs(monkeypatch: pytest.MonkeyPatch):
@@ -78,6 +105,56 @@ def test_ray_runtime_env(monkeypatch: pytest.MonkeyPatch):
     )
 
     ray.shutdown()
+
+
+def test_ray_runtime_env_strips_inherited_setup_hook(tmp_path):
+    sentinel = tmp_path / "hook-calls.txt"
+
+    def setup_hook():
+        with open(sentinel, "a", encoding="utf-8") as stream:
+            stream.write("called\n")
+
+    def create_config():
+        from vllm.platforms import current_platform
+
+        if not current_platform.device_type:
+            current_platform.device_type = "cpu"
+        engine_args = EngineArgs(
+            model="deepseek-ai/DeepSeek-V2-Lite", trust_remote_code=True
+        )
+        return engine_args.create_engine_config()
+
+    import ray
+
+    runtime_env = {
+        "worker_process_setup_hook": setup_hook,
+        "env_vars": {"KEEP": "value"},
+    }
+    ray.init(runtime_env=runtime_env)
+    try:
+        config_ref = ray.remote(create_config).remote()
+        config = ray.get(config_ref)
+
+        nested_runtime_env = config.parallel_config.ray_runtime_env
+        assert nested_runtime_env is not None
+        assert "worker_process_setup_hook" not in nested_runtime_env
+        assert nested_runtime_env.env_vars() == {
+            "KEEP": "value",
+            "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR": "",
+        }
+
+        def nested_probe():
+            import os
+
+            return os.environ.get("__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR")
+
+        result = ray.get(
+            ray.remote(runtime_env=nested_runtime_env)(nested_probe).remote()
+        )
+        assert result == ""
+        assert sentinel.read_text().splitlines() == ["called"]
+    finally:
+        ray.shutdown()
 
 
 def test_unrecognized_env(monkeypatch):
