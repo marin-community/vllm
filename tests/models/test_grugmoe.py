@@ -22,6 +22,7 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.models.grugmoe import (
     _ROUTER_COMBINE_WEIGHT_EPS,
@@ -37,7 +38,8 @@ from vllm.model_executor.models.grugmoe import (
     get_grug_moe_runtime_info,
 )
 from vllm.model_executor.models.registry import ModelRegistry
-from vllm.transformers_utils.config import get_config
+from vllm.transformers_utils.config import get_config, is_interleaved
+from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
 from vllm.v1.worker.workspace import init_workspace_manager
 
 
@@ -243,12 +245,12 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
                 "shared_expert_intermediate_dim": 24,
                 "num_experts": 6,
                 "num_experts_per_token": 2,
-                "num_layers": 3,
+                "num_layers": 26,
                 "num_heads": 4,
                 "num_kv_heads": 2,
                 "head_dim": 4,
-                "max_seq_len": 256,
-                "sliding_window": 64,
+                "max_seq_len": 32768,
+                "sliding_window": 2048,
                 "layer_norm_eps": 1e-6,
                 "initializer_std": 0.01,
                 "qk_mult": 0.5,
@@ -272,12 +274,18 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
         assert cfg.shared_expert_intermediate_size == 24
         assert cfg.num_local_experts == 6
         assert cfg.num_experts_per_tok == 2
-        assert cfg.num_hidden_layers == 3
+        assert cfg.num_hidden_layers == 26
         assert cfg.num_attention_heads == 4
         assert cfg.num_key_value_heads == 2
         assert cfg.attention_head_dim == 4
-        assert cfg.max_position_embeddings == 256
-        assert cfg.sliding_window == 64
+        assert cfg.max_position_embeddings == 32768
+        assert cfg.sliding_window == 2048
+        assert len(cfg.layer_types) == 26
+        assert cfg.layer_types[0] == "sliding_attention"
+        assert cfg.layer_types[3] == "full_attention"
+        assert cfg.layer_types[24] == "sliding_attention"
+        assert cfg.layer_types[25] == "full_attention"
+        assert is_interleaved(cfg)
         assert cfg.rms_norm_eps == 1e-6
         assert cfg.initializer_range == 0.01
         assert cfg.qk_mult == 0.5
@@ -286,6 +294,41 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
         assert cfg.disable_long_rope is True
         assert cfg.rope_theta == 50000.0
     assert cfg.rope_parameters["rope_theta"] == 50000.0
+
+    vllm_config = EngineArgs(
+        model=str(tmp_path),
+        tokenizer=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="float32",
+    ).create_engine_config()
+    assert vllm_config.model_config.get_sliding_window() == 2048
+    assert vllm_config.cache_config.sliding_window is None
+
+    runtime_config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
+    final_full_layer = GrugMoeDecoderLayer(
+        runtime_config,
+        cache_config=vllm_config.cache_config,
+        params_dtype=torch.float32,
+        layer_index=25,
+        prefix="layers.25",
+    )
+
+    assert final_full_layer.self_attn.attn.sliding_window is None
+
+
+def test_grug_moe_config_rejects_noncanonical_layer_types():
+    with pytest.raises(
+        ValueError,
+        match="must match the GrugMoE attention architecture",
+    ):
+        GrugMoeConfig(
+            num_layers=3,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        )
 
 
 def _minimal_model_config_for_parallel_check(

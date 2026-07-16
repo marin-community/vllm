@@ -33,7 +33,10 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs.grugmoe import grug_moe_rope_theta
+from vllm.transformers_utils.configs.grugmoe import (
+    grug_moe_layer_types,
+    grug_moe_rope_theta,
+)
 from vllm.v1.attention.backend import AttentionType
 
 logger = init_logger(__name__)
@@ -178,6 +181,7 @@ class GrugMoeRuntimeConfig:
             _config_attr(config, ("max_seq_len", "max_position_embeddings"), 4096)
         )
         num_heads = int(_config_attr(config, ("num_heads", "num_attention_heads"), 16))
+        num_layers = int(_config_attr(config, ("num_layers", "num_hidden_layers"), 24))
         return cls(
             vocab_size=int(_config_attr(config, ("vocab_size",))),
             hidden_dim=int(_config_attr(config, ("hidden_dim", "hidden_size"), 2048)),
@@ -206,9 +210,7 @@ class GrugMoeRuntimeConfig:
                     config, ("num_experts_per_token", "num_experts_per_tok"), 2
                 )
             ),
-            num_layers=int(
-                _config_attr(config, ("num_layers", "num_hidden_layers"), 24)
-            ),
+            num_layers=num_layers,
             num_heads=num_heads,
             num_kv_heads=int(
                 _config_attr(config, ("num_kv_heads", "num_key_value_heads"), num_heads)
@@ -241,6 +243,10 @@ class GrugMoeRuntimeConfig:
                 f"num_heads={self.num_heads}; set head_dim explicitly"
             )
         return self.hidden_dim // self.num_heads
+
+    @property
+    def attention_layer_types(self) -> tuple[str, ...]:
+        return tuple(grug_moe_layer_types(self.num_layers))
 
     def validate(self) -> "GrugMoeRuntimeConfig":
         if self.vocab_size <= 0:
@@ -275,6 +281,7 @@ class GrugMoeRuntimeConfig:
             raise ValueError("max_seq_len must be positive")
         if self.sliding_window <= 1:
             raise ValueError("sliding_window must be greater than 1")
+        _ = self.attention_layer_types
         return self
 
 
@@ -624,7 +631,7 @@ class GrugMoeDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        is_long = layer_index % 4 == 3 or layer_index == cfg.num_layers - 1
+        is_long = cfg.attention_layer_types[layer_index] == "full_attention"
         sliding_window = None if is_long else cfg.sliding_window
         self.input_layernorm = RMSNorm(cfg.hidden_dim, eps=cfg.layer_norm_eps)
         self.attn_gated_norm = GrugMoeGatedNorm(
