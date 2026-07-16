@@ -6,12 +6,27 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
+# Grug architecture: every fourth layer and the final layer use full attention.
+_FULL_ATTENTION_INTERVAL = 4
+
 
 def _coalesce(*values: Any) -> Any:
     for value in values:
         if value is not None:
             return value
     return None
+
+
+def grug_moe_layer_types(num_layers: int) -> list[str]:
+    return [
+        (
+            "full_attention"
+            if (layer_index + 1) % _FULL_ATTENTION_INTERVAL == 0
+            or layer_index == num_layers - 1
+            else "sliding_attention"
+        )
+        for layer_index in range(num_layers)
+    ]
 
 
 def grug_moe_rope_theta(config: Any) -> float:
@@ -62,6 +77,7 @@ class GrugMoeConfig(PretrainedConfig):
         max_seq_len: int | None = None,
         max_position_embeddings: int | None = None,
         sliding_window: int | None = None,
+        layer_types: list[str] | None = None,
         layer_norm_eps: float | None = None,
         rms_norm_eps: float | None = None,
         initializer_std: float | None = None,
@@ -109,6 +125,11 @@ class GrugMoeConfig(PretrainedConfig):
             rope = {"theta": rope_theta}
         if rope_parameters is None:
             rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
+        resolved_layer_types = grug_moe_layer_types(num_hidden_layers)
+        if layer_types is not None and layer_types != resolved_layer_types:
+            raise ValueError(
+                "layer_types must match the GrugMoE attention architecture"
+            )
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -135,6 +156,7 @@ class GrugMoeConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.max_seq_len = max_position_embeddings
         self.sliding_window = int(_coalesce(sliding_window, max_position_embeddings))
+        self.layer_types = resolved_layer_types
         self.rms_norm_eps = float(_coalesce(rms_norm_eps, layer_norm_eps, 1e-5))
         self.layer_norm_eps = self.rms_norm_eps
         self.initializer_range = float(
@@ -154,4 +176,8 @@ class GrugMoeConfig(PretrainedConfig):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
-__all__ = ["GrugMoeConfig", "grug_moe_rope_theta"]
+__all__ = [
+    "GrugMoeConfig",
+    "grug_moe_layer_types",
+    "grug_moe_rope_theta",
+]
