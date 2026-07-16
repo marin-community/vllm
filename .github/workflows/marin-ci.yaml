@@ -31,6 +31,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
+        with:
+          # Pin uv so setup-uv resolves the version locally. Unpinned, it queries the
+          # GitHub /releases/latest API for "latest", which is rate-limited and outage
+          # prone and has flaked this job ("Could not determine uv version ... Falling
+          # back to latest. Getting latest version from GitHub API").
+          version: "0.11.21"
 
       - name: Lint the Marin delta
         run: uv run infra/pre-commit.py --all-files
@@ -48,6 +54,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
+          # Pin uv to avoid setup-uv's flaky GitHub /releases/latest lookup (see the
+          # marin-precommit job above).
+          version: "0.11.21"
           enable-cache: true
 
       - name: Install vLLM (python-only, CPU)

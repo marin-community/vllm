@@ -60,6 +60,10 @@ jobs:
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v6
+        with:
+          # Pin uv to avoid setup-uv's flaky GitHub /releases/latest lookup, which
+          # queries the API for "latest" and is rate-limited and outage prone.
+          version: "0.11.21"
 
       - name: Trim the Iris bundle
         # Iris bundles the working directory and caps the zip at 25MB; this tree zips to
