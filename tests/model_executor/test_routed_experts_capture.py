@@ -4,6 +4,7 @@ import types
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -11,8 +12,14 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    RoutedExpertsManager,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -39,6 +46,37 @@ def _capturer_with_buffer(
         dtype=torch.int32,
     )
     return c
+
+
+def _routed_experts_manager() -> RoutedExpertsManager:
+    hf_config = SimpleNamespace(
+        num_experts=16,
+        num_experts_per_tok=2,
+        num_hidden_layers=2,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=hf_config),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=2,
+            cp_kv_cache_interleave_size=2,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=12,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=4,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            )
+        ],
+    )
+    return RoutedExpertsManager(vllm_config, kv_cache_config)
 
 
 class DummyRouter(BaseRouter):
@@ -249,3 +287,58 @@ def test_routed_experts_capturer_dp_unexpected_batch_raises():
     ):
         capturer.capture(layer_id=0, topk_ids=topk)
     assert capturer.device_buffer[0, 0, 0].item() == -1
+
+
+@pytest.mark.skip_global_cleanup
+def test_routed_experts_manager_dcp_maps_both_owners_and_block_boundary():
+    manager = _routed_experts_manager()
+    block_ids = [3, 7]
+
+    rank0_slots, global_slots = manager.make_slot_mapping(
+        block_ids,
+        token_start=0,
+        num_tokens=9,
+        cp_rank=0,
+    )
+    rank1_slots, rank1_global_slots = manager.make_slot_mapping(
+        block_ids,
+        token_start=0,
+        num_tokens=9,
+        cp_rank=1,
+    )
+
+    assert rank0_slots.tolist() == [12, 13, -1, -1, 14, 15, -1, -1, 28]
+    assert rank1_slots.tolist() == [-1, -1, 12, 13, -1, -1, 14, 15, -1]
+    assert global_slots.tolist() == [24, 25, 26, 27, 28, 29, 30, 31, 56]
+    assert np.array_equal(global_slots, rank1_global_slots)
+
+    prefill_routes = np.arange(9 * 2 * 2, dtype=np.uint8).reshape(9, 2, 2) % 16
+    manager.store_batch(prefill_routes, global_slots)
+    assert np.array_equal(manager.get(block_ids, num_tokens=9), prefill_routes)
+
+    rank0_decode_slots, decode_slots = manager.make_slot_mapping(
+        block_ids,
+        token_start=9,
+        num_tokens=1,
+        cp_rank=0,
+    )
+    decode_routes = np.array([[[1, 0], [3, 2]]], dtype=np.uint8)
+    manager.store_batch(decode_routes, decode_slots)
+
+    assert rank0_decode_slots.tolist() == [29]
+    assert decode_slots.tolist() == [57]
+    assert np.array_equal(
+        manager.get(block_ids, num_tokens=10, token_start=9),
+        decode_routes,
+    )
+    assert not np.any(global_slots == -1)
+    assert not np.any(decode_slots == -1)
+
+
+@pytest.mark.skip_global_cleanup
+def test_routed_experts_manager_rejects_pad_slot_write():
+    manager = _routed_experts_manager()
+    routes = np.zeros((1, 2, 2), dtype=np.uint8)
+
+    with pytest.raises(ValueError, match="PAD_SLOT_ID"):
+        manager.store_batch(routes, np.array([-1]))

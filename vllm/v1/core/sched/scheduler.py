@@ -7,6 +7,9 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
+
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -277,19 +280,30 @@ class Scheduler(SchedulerInterface):
         )
 
         if self.enable_return_routed_experts:
-            assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
-                "enable_return_routed_experts does not support context parallelism "
-                "(dcp_world_size > 1 or pcp_world_size > 1)"
-            )
+            if self.pcp_world_size > 1:
+                raise ValueError(
+                    "enable_return_routed_experts does not support prefill "
+                    "context parallelism (pcp_world_size > 1)"
+                )
+            if self.dcp_world_size > 1 and not envs.VLLM_ALLOW_ROUTED_EXPERTS_DCP:
+                raise ValueError(
+                    "enable_return_routed_experts with decode context "
+                    "parallelism requires VLLM_ALLOW_ROUTED_EXPERTS_DCP=1"
+                )
 
             self.routed_experts_mgr = RoutedExpertsManager(
                 vllm_config=vllm_config,
                 kv_cache_config=kv_cache_config,
             )
-            # Block-ID snapshot taken at schedule time (before forward),
-            # so update_from_output can read slot data even if a later
-            # schedule() frees the blocks (async scheduling race).
-            self._re_block_ids: dict[str, list[int]] = {}
+            # Schedule-time state keyed by SchedulerOutput identity. Async
+            # scheduling can enqueue another step for the same request before
+            # the prior output is consumed, so a request-keyed snapshot would
+            # be overwritten and request.num_computed_tokens would already
+            # point at the later step. The EngineCore retains each local
+            # SchedulerOutput object until its matching result is consumed,
+            # making its identity an unambiguous scheduler-only key (and
+            # avoiding transmission of full block tables to workers twice).
+            self._re_schedule_states: dict[int, dict[str, tuple[list[int], int]]] = {}
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
@@ -1065,6 +1079,19 @@ class Scheduler(SchedulerInterface):
         self.waiting.prepend_request(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        # Snapshot routed-expert reconstruction state before advancing token
+        # positions below. A later async schedule may advance the same request
+        # again or mutate/free its block table before this output is consumed.
+        if self.enable_return_routed_experts:
+            gid = self.routed_experts_mgr.attn_gid
+            self._re_schedule_states[id(scheduler_output)] = {
+                rid: (
+                    list(self.kv_cache_manager.get_blocks(rid).get_block_ids()[gid]),
+                    self.requests[rid].num_computed_tokens,
+                )
+                for rid in scheduler_output.num_scheduled_tokens
+            }
+
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
         # 1. The scheduler_output of the current step has to include the
@@ -1087,22 +1114,6 @@ class Scheduler(SchedulerInterface):
             # Drop from the in-flight-prefill set once it's no longer prefilling.
             if not request.is_prefill_chunk:
                 self._inflight_prefills.discard(request)
-
-        # Snapshot block IDs for routed experts before forward starts.
-        # A concurrent schedule() may preempt requests and free blocks
-        # before update_from_output runs; the snapshot survives that.
-        # Use update() to preserve entries from the previous step that
-        # have not yet been consumed by update_from_output (async
-        # scheduling may call _update_after_schedule again before the
-        # prior update_from_output runs).
-        if self.enable_return_routed_experts:
-            gid = self.routed_experts_mgr.attn_gid
-            self._re_block_ids.update(
-                {
-                    rid: self.kv_cache_manager.get_blocks(rid).get_block_ids()[gid]
-                    for rid in num_scheduled_tokens
-                }
-            )
 
         # Clear the finished request IDs.
         # NOTE: We shouldn't do self.finished_req_ids.clear() here because
@@ -1434,12 +1445,52 @@ class Scheduler(SchedulerInterface):
         # whose routing was just D2H'd into model_runner_output.
         routing_data = None
         routing_offsets: dict[str, int] = {}
+        re_schedule_state = (
+            self._re_schedule_states.pop(id(scheduler_output), None)
+            if self.enable_return_routed_experts
+            else None
+        )
         if (
             self.enable_return_routed_experts
             and model_runner_output.routed_experts is not None
         ):
+            if re_schedule_state is None:
+                raise RuntimeError(
+                    "Missing schedule-time state for routed-expert output"
+                )
             re = model_runner_output.routed_experts
-            self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
+            local_slot_mappings = []
+            global_slot_mappings = []
+            for rid in model_runner_output.req_ids:
+                num_tokens = num_scheduled_tokens[rid]
+                try:
+                    block_ids, token_start = re_schedule_state[rid]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "Routed-expert output contains a request absent from "
+                        f"its schedule-time state: {rid}"
+                    ) from exc
+                local_slots, global_slots = self.routed_experts_mgr.make_slot_mapping(
+                    block_ids,
+                    token_start,
+                    num_tokens,
+                    # Executors return the first TP worker of the final PP
+                    # stage. PCP is rejected above, so its DCP rank is zero.
+                    cp_rank=0,
+                )
+                local_slot_mappings.append(local_slots)
+                global_slot_mappings.append(global_slots)
+
+            expected_local_slots = np.concatenate(local_slot_mappings)
+            if not np.array_equal(re.slot_mapping, expected_local_slots):
+                raise RuntimeError(
+                    "Routed-expert worker slot mapping does not match the "
+                    "scheduler block snapshot"
+                )
+            self.routed_experts_mgr.store_batch(
+                re.routing_data,
+                np.concatenate(global_slot_mappings),
+            )
             routing_data = re.routing_data.astype(
                 self.routed_experts_mgr.routed_experts_by_slot.dtype,
                 copy=False,
@@ -1461,8 +1512,8 @@ class Scheduler(SchedulerInterface):
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
+            active_request = self.requests.get(req_id)
+            if active_request is None or active_request.is_finished():
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism or in async scheduling).
@@ -1472,6 +1523,7 @@ class Scheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
+            request = active_request
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
@@ -1553,7 +1605,8 @@ class Scheduler(SchedulerInterface):
             ):
                 req_offset = routing_offsets[req_id]
                 end = req_offset + num_tokens_scheduled
-                block_ids = self._re_block_ids.pop(req_id, [])
+                assert re_schedule_state is not None
+                block_ids = re_schedule_state[req_id][0]
                 if num_output_tokens_before == 0:
                     # Prefill completed: read full prompt routing from
                     # slot buffer using the block-ID snapshot taken at
