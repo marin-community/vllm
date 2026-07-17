@@ -127,11 +127,33 @@ def join_host_port(host: str, port: int) -> str:
         return f"{host}:{port}"
 
 
+def resolve_ipv4_host(host: str, port: int) -> str:
+    """Resolve hostnames before handing them to native network clients."""
+    force_ipv4 = os.environ.get("VLLM_FORCE_IPV4", "0").strip().lower() in (
+        "1",
+        "true",
+    )
+    if not force_ipv4:
+        return host
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        addresses = socket.getaddrinfo(
+            host,
+            port,
+            family=socket.AF_INET,
+            type=socket.SOCK_STREAM,
+        )
+        return addresses[0][4][0]
+    return host
+
+
 def get_distributed_init_method(ip: str, port: int) -> str:
     return get_tcp_uri(ip, port)
 
 
 def get_tcp_uri(ip: str, port: int) -> str:
+    ip = resolve_ipv4_host(ip, port)
     if is_valid_ipv6_address(ip):
         return f"tcp://[{ip}]:{port}"
     else:

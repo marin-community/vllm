@@ -30,7 +30,7 @@ from torch.distributed.rendezvous import rendezvous
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.utils.network_utils import get_tcp_uri
+from vllm.utils.network_utils import get_tcp_uri, resolve_ipv4_host
 from vllm.utils.system_utils import suppress_stdout
 
 logger = init_logger(__name__)
@@ -161,6 +161,7 @@ def create_tcp_store(
     **kwargs: Any,
 ) -> TCPStore:
     """Create a TCPStore, optionally taking ownership of ``listen_socket``."""
+    host = resolve_ipv4_host(host, port)
     if listen_socket is None:
         return TCPStore(host_name=host, port=port, **kwargs)
 
@@ -502,6 +503,7 @@ def get_cached_tcp_store_client(host: str, port: int) -> TCPStore:
     Cached so that every call with the same ``(host, port)`` reuses the
     same connection.  A new ``(host, port)`` evicts the old entry.
     """
+    host = resolve_ipv4_host(host, port)
     return TCPStore(host, port, is_master=False, wait_for_workers=False)
 
 
