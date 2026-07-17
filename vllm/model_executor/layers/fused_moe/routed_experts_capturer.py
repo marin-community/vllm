@@ -14,6 +14,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 
 logger = logging.getLogger(__name__)
@@ -234,10 +235,11 @@ class RoutedExpertsManager:
     """Scheduler-side slot-indexed buffer for routed experts.
 
     Lives on CPU in the scheduler process. Each slot corresponds to
-    ``block_id * block_size + offset_in_block`` where ``block_id`` is
-    drawn from the physical KV-cache block pool, so routing data is
-    tied to physical blocks and naturally survives preemption for
-    prefix-cached blocks (prefix hits re-expose the same slots).
+    ``block_id * logical_block_size + offset_in_block`` where ``block_id`` is
+    drawn from the KV-cache block pool. Under DCP, ``logical_block_size`` is
+    the local physical block size multiplied by the DCP world size. This gives
+    every DCP owner a distinct routing slot even though their rank-local KV
+    slots overlap, and naturally survives preemption for prefix-cached blocks.
 
     Data flow per step:
       1. Worker D2Hs its device capture buffer into
@@ -272,7 +274,11 @@ class RoutedExpertsManager:
             if isinstance(g.kv_cache_spec, FullAttentionSpec)
         )
         attn_group = kv_cache_config.kv_cache_groups[self.attn_gid]
-        self.block_size = attn_group.kv_cache_spec.block_size
+        self.local_block_size = attn_group.kv_cache_spec.block_size
+        parallel_config = vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.cp_interleave = parallel_config.cp_kv_cache_interleave_size
+        self.block_size = self.local_block_size * self.dcp_world_size
 
         # All kv_cache_groups share the same physical block pool, so
         # block IDs span [0, num_blocks) regardless of how many groups
@@ -312,7 +318,57 @@ class RoutedExpertsManager:
         indexing handles repeated / out-of-order indices. Called once
         per scheduler step in ``update_from_output``.
         """
+        if len(data) != len(slot_mapping):
+            raise ValueError(
+                "Routed-expert data and slot mapping lengths differ: "
+                f"{len(data)} != {len(slot_mapping)}"
+            )
+        if np.any(slot_mapping == PAD_SLOT_ID):
+            raise ValueError("Routed-expert data cannot be stored in PAD_SLOT_ID")
         self.routed_experts_by_slot[slot_mapping] = data
+
+    def make_slot_mapping(
+        self,
+        block_ids: list[int],
+        token_start: int,
+        num_tokens: int,
+        cp_rank: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build selected-worker and rank-independent slot mappings.
+
+        The first result reproduces the worker block-table mapping, including
+        ``PAD_SLOT_ID`` for tokens owned by another DCP rank. The second maps
+        every logical token to a distinct scheduler slot and is safe to store.
+        """
+        positions = np.arange(
+            token_start,
+            token_start + num_tokens,
+            dtype=np.int64,
+        )
+        if positions.size == 0:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty
+
+        block_indices = positions // self.block_size
+        if block_indices[-1] >= len(block_ids):
+            raise ValueError(
+                "Routed-expert slot mapping exceeds the request block table: "
+                f"position={positions[-1]}, blocks={len(block_ids)}, "
+                f"block_size={self.block_size}"
+            )
+
+        block_numbers = np.asarray(block_ids, dtype=np.int64)[block_indices]
+        block_offsets = positions % self.block_size
+        global_slots = block_numbers * self.block_size + block_offsets
+
+        owner_ranks = block_offsets // self.cp_interleave % self.dcp_world_size
+        rounds = block_offsets // (self.cp_interleave * self.dcp_world_size)
+        local_offsets = rounds * self.cp_interleave + (
+            block_offsets % self.cp_interleave
+        )
+        local_slots = block_numbers * self.local_block_size + local_offsets
+        local_slots = np.where(owner_ranks == cp_rank, local_slots, PAD_SLOT_ID)
+        return local_slots, global_slots
 
     def get(
         self,

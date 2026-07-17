@@ -112,6 +112,44 @@ def test_scheduled_encoder_input_stats_disabled_without_log_stats(
     assert scheduler_output.scheduled_encoder_input_stats is None
 
 
+def _create_routed_experts_scheduler(
+    monkeypatch,
+    *,
+    dcp_world_size: int,
+    pcp_world_size: int = 1,
+    allow_dcp: bool = False,
+    async_scheduling: bool = False,
+) -> Scheduler:
+    base = create_scheduler(
+        max_num_batched_tokens=64,
+        max_model_len=64,
+        num_blocks=12,
+        block_size=4,
+        device="cpu",
+        async_scheduling=async_scheduling,
+    )
+    config = base.vllm_config
+    config.model_config.enable_return_routed_experts = True
+    hf_config = config.model_config.hf_text_config
+    hf_config.num_experts = 16
+    hf_config.num_experts_per_tok = 2
+    config.parallel_config.decode_context_parallel_size = dcp_world_size
+    config.parallel_config.prefill_context_parallel_size = pcp_world_size
+    config.parallel_config.cp_kv_cache_interleave_size = 2
+    if allow_dcp:
+        monkeypatch.setenv("VLLM_ALLOW_ROUTED_EXPERTS_DCP", "1")
+    else:
+        monkeypatch.delenv("VLLM_ALLOW_ROUTED_EXPERTS_DCP", raising=False)
+
+    scheduler_cls = config.scheduler_config.get_scheduler_cls()
+    return scheduler_cls(
+        vllm_config=config,
+        kv_cache_config=base.kv_cache_config,
+        structured_output_manager=base.structured_output_manager,
+        block_size=4 * dcp_world_size * pcp_world_size,
+    )
+
+
 def test_add_requests():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)
@@ -3379,6 +3417,196 @@ def test_runner_routed_experts_ignored_when_feature_disabled():
     assert not hasattr(scheduler, "routed_experts_mgr")
     assert len(engine_core_outputs[0].outputs) == 1
     assert engine_core_outputs[0].outputs[0].routed_experts is None
+
+
+@pytest.mark.skip_global_cleanup
+def test_routed_experts_dcp_requires_explicit_opt_in(monkeypatch):
+    with pytest.raises(ValueError, match="VLLM_ALLOW_ROUTED_EXPERTS_DCP=1"):
+        _create_routed_experts_scheduler(monkeypatch, dcp_world_size=2)
+
+
+@pytest.mark.skip_global_cleanup
+def test_routed_experts_pcp_remains_rejected_with_dcp_opt_in(monkeypatch):
+    with pytest.raises(ValueError, match="prefill context parallelism"):
+        _create_routed_experts_scheduler(
+            monkeypatch,
+            dcp_world_size=1,
+            pcp_world_size=2,
+            allow_dcp=True,
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_routed_experts_dcp_prefill_and_decode_preserve_all_owner_rows(monkeypatch):
+    scheduler = _create_routed_experts_scheduler(
+        monkeypatch,
+        dcp_world_size=2,
+        allow_dcp=True,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=9,
+        max_tokens=2,
+        block_size=8,
+    )[0]
+    scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    num_prefill_tokens = prefill_output.num_scheduled_tokens[request.request_id]
+    prefill_block_ids = scheduler.kv_cache_manager.get_blocks(
+        request.request_id
+    ).get_block_ids()[scheduler.routed_experts_mgr.attn_gid]
+    local_prefill_slots, _ = scheduler.routed_experts_mgr.make_slot_mapping(
+        prefill_block_ids,
+        token_start=0,
+        num_tokens=num_prefill_tokens,
+        cp_rank=0,
+    )
+    num_layers = scheduler.vllm_config.model_config.hf_text_config.num_hidden_layers
+    prefill_routes = (
+        np.arange(num_prefill_tokens * num_layers * 2, dtype=np.int32).reshape(
+            num_prefill_tokens, num_layers, 2
+        )
+        % 16
+    )
+    prefill_result = scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[123]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            routed_experts=RoutedExpertsLists(
+                routing_data=prefill_routes,
+                slot_mapping=local_prefill_slots,
+            ),
+        ),
+    )
+    assert np.array_equal(
+        prefill_result[0].outputs[0].routed_experts,
+        prefill_routes,
+    )
+
+    decode_output = scheduler.schedule()
+    decode_start = request.num_computed_tokens - 1
+    decode_block_ids = scheduler.kv_cache_manager.get_blocks(
+        request.request_id
+    ).get_block_ids()[scheduler.routed_experts_mgr.attn_gid]
+    local_decode_slots, _ = scheduler.routed_experts_mgr.make_slot_mapping(
+        decode_block_ids,
+        token_start=decode_start,
+        num_tokens=1,
+        cp_rank=0,
+    )
+    decode_routes = (
+        np.arange(num_layers * 2, dtype=np.int32).reshape(1, num_layers, 2) % 16
+    )
+    decode_result = scheduler.update_from_output(
+        decode_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[124]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            routed_experts=RoutedExpertsLists(
+                routing_data=decode_routes,
+                slot_mapping=local_decode_slots,
+            ),
+        ),
+    )
+    assert np.array_equal(
+        decode_result[0].outputs[0].routed_experts,
+        decode_routes,
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_routed_experts_async_steps_keep_independent_schedule_state(monkeypatch):
+    scheduler = _create_routed_experts_scheduler(
+        monkeypatch,
+        dcp_world_size=1,
+        async_scheduling=True,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=9,
+        max_tokens=2,
+        block_size=4,
+    )[0]
+    scheduler.add_request(request)
+
+    # Enqueue decode before consuming the prefill result, matching the
+    # EngineCore batch-queue behavior. The request's live token position now
+    # describes decode, but prefill output must retain its own position/table.
+    prefill_output = scheduler.schedule()
+    decode_output = scheduler.schedule()
+    assert prefill_output.num_scheduled_tokens[request.request_id] == 9
+    assert decode_output.num_scheduled_tokens[request.request_id] == 1
+    assert request.num_computed_tokens == 10
+
+    num_layers = scheduler.vllm_config.model_config.hf_text_config.num_hidden_layers
+    prefill_routes = (
+        np.arange(9 * num_layers * 2, dtype=np.int32).reshape(9, num_layers, 2) % 16
+    )
+    prefill_slots, _ = scheduler.routed_experts_mgr.make_slot_mapping(
+        scheduler._re_schedule_states[id(prefill_output)][request.request_id][0],
+        token_start=0,
+        num_tokens=9,
+        cp_rank=0,
+    )
+    prefill_result = scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[123]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            routed_experts=RoutedExpertsLists(
+                routing_data=prefill_routes,
+                slot_mapping=prefill_slots,
+            ),
+        ),
+    )
+    assert np.array_equal(
+        prefill_result[0].outputs[0].routed_experts,
+        prefill_routes,
+    )
+
+    decode_routes = (
+        np.arange(num_layers * 2, dtype=np.int32).reshape(1, num_layers, 2) % 16
+    )
+    decode_slots, _ = scheduler.routed_experts_mgr.make_slot_mapping(
+        scheduler._re_schedule_states[id(decode_output)][request.request_id][0],
+        token_start=9,
+        num_tokens=1,
+        cp_rank=0,
+    )
+    decode_result = scheduler.update_from_output(
+        decode_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[124]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            routed_experts=RoutedExpertsLists(
+                routing_data=decode_routes,
+                slot_mapping=decode_slots,
+            ),
+        ),
+    )
+    assert np.array_equal(
+        decode_result[0].outputs[0].routed_experts,
+        decode_routes,
+    )
+    assert not scheduler._re_schedule_states
 
 
 @pytest.mark.parametrize("use_v2_model_runner", [False, True])

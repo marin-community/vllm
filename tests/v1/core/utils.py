@@ -7,6 +7,7 @@ import vllm.envs as envs
 from tests.v1.kv_connector.unit.utils import MockKVConfig
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
@@ -69,6 +70,7 @@ def create_scheduler(
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
+    device: str = "auto",
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -165,6 +167,7 @@ def create_scheduler(
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,
+        device_config=DeviceConfig(device=device),
         parallel_config=ParallelConfig(
             pipeline_parallel_size=pipeline_parallel_size,
             data_parallel_size=data_parallel_size,
