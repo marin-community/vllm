@@ -3,11 +3,12 @@
 
 import io
 
+import httpx
 import numpy as np
 import pybase64 as base64
 import pytest
 
-from ...utils import RemoteOpenAIServer
+from ...utils import VLLM_PATH, RemoteOpenAIServer
 
 MODEL_NAME = "TitanML/tiny-mixtral"
 
@@ -31,6 +32,8 @@ def server():
         "--enable-return-routed-experts",
         "--hf-overrides",
         '{"sliding_window": null}',
+        "--chat-template",
+        str(VLLM_PATH / "examples/template_chatml.jinja"),
     ]
     with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
         yield remote_server
@@ -62,3 +65,66 @@ async def test_routed_experts(server):
         assert topk == NUM_EXPERTS_PER_TOK
         assert (routed_experts >= 0).all()
         assert (routed_experts < NUM_LOCAL_EXPERTS).all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "user", "content": "Hello, world"}],
+        [
+            {"role": "user", "content": "Name a primary color."},
+            {"role": "assistant", "content": "Red."},
+            {"role": "user", "content": "Name another."},
+        ],
+    ],
+)
+async def test_chat_routed_experts_are_causally_aligned_nested_lists(server, messages):
+    request = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "max_tokens": 4,
+        "temperature": 0,
+        "ignore_eos": True,
+        "return_token_ids": True,
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        chat_response = await client.post(
+            server.url_for("v1/chat/completions"),
+            json=request,
+        )
+        chat_response.raise_for_status()
+        chat = chat_response.json()
+        chat_choice = chat["choices"][0]
+        prompt_token_ids = chat["prompt_token_ids"]
+        generated_token_ids = chat_choice["token_ids"]
+        chat_routes = chat_choice["routed_experts"]
+
+        completion_response = await client.post(
+            server.url_for("v1/completions"),
+            json={
+                "model": MODEL_NAME,
+                "prompt": prompt_token_ids,
+                "max_tokens": 4,
+                "temperature": 0,
+                "ignore_eos": True,
+                "return_token_ids": True,
+            },
+        )
+        completion_response.raise_for_status()
+        completion_choice = completion_response.json()["choices"][0]
+
+    completion_routes = np.load(
+        io.BytesIO(base64.b64decode(completion_choice["routed_experts"]))
+    )
+    assert completion_choice["token_ids"] == generated_token_ids
+    assert len(chat_routes) == len(generated_token_ids) == 4
+    assert chat_routes == completion_routes[-len(generated_token_ids) :].tolist()
+    assert len(chat_routes[0]) == NUM_HIDDEN_LAYERS
+    assert len(chat_routes[0][0]) == NUM_EXPERTS_PER_TOK
+    assert all(
+        isinstance(expert_id, int) and 0 <= expert_id < NUM_LOCAL_EXPERTS
+        for token_routes in chat_routes
+        for layer_routes in token_routes
+        for expert_id in layer_routes
+    )
