@@ -162,7 +162,7 @@ jobs:
       actions: read    # pull failed-job logs for the excerpt
       contents: read
     steps:
-      - uses: marin-community/marin-style/actions/report-failure@744dcf9e081f118ea52e9c43b9bf52f67c33d29d
+      - uses: marin-community/marin-style/actions/report-failure@ae742ca9a6d62ab7639355ddc1d8419b390dfff6  # v0.2.1
         with:
           lane: serve-smoke
           trigger-token: ${{ secrets.LOOM_TRIGGER_GH_TOKEN }}
