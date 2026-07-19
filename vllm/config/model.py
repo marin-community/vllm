@@ -1183,7 +1183,12 @@ class ModelConfig:
     ) -> None:
         total_num_attention_heads = self.model_arch_config.total_num_attention_heads
         tensor_parallel_size = parallel_config.tensor_parallel_size
-        if total_num_attention_heads % tensor_parallel_size != 0:
+        # The TPU backend pads attention projections before sharding, so its TP
+        # mesh need not divide the model's logical attention-head count.
+        if (
+            total_num_attention_heads % tensor_parallel_size != 0
+            and not current_platform.is_tpu()
+        ):
             raise ValueError(
                 f"Total number of attention heads ({total_num_attention_heads})"
                 " must be divisible by tensor parallel size "
