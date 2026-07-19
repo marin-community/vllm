@@ -353,13 +353,19 @@ def _minimal_model_config_for_parallel_check(
     return model_config
 
 
-def test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads():
+def test_grug_moe_parallel_config_allows_tpu_sharding_independent_of_heads(
+    monkeypatch,
+):
     parallel_config = ParallelConfig(tensor_parallel_size=8)
 
     grug_model_config = _minimal_model_config_for_parallel_check(
         ["GrugMoeForCausalLM"],
         "grug_moe",
     )
+    monkeypatch.setattr("vllm.config.model.current_platform.is_tpu", lambda: True)
+    ModelConfig.verify_with_parallel_config(grug_model_config, parallel_config)
+
+    monkeypatch.setattr("vllm.config.model.current_platform.is_tpu", lambda: False)
     with pytest.raises(ValueError, match="Total number of attention heads"):
         ModelConfig.verify_with_parallel_config(grug_model_config, parallel_config)
 
@@ -371,7 +377,9 @@ def test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads():
         ModelConfig.verify_with_parallel_config(generic_model_config, parallel_config)
 
 
-def test_grug_moe_rejects_replicated_tensor_parallel_core_layers(monkeypatch):
+def test_grug_moe_allows_tpu_tensor_sharding_but_preserves_gpu_restrictions(
+    monkeypatch,
+):
     fake_pp_group = SimpleNamespace(world_size=1)
     fake_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -389,6 +397,10 @@ def test_grug_moe_rejects_replicated_tensor_parallel_core_layers(monkeypatch):
         "vllm.model_executor.models.grugmoe.get_pp_group",
         lambda: fake_pp_group,
     )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.grugmoe.current_platform.is_tpu",
+        lambda: False,
+    )
 
     _raise_for_unsupported_modes(fake_config)
 
@@ -398,6 +410,17 @@ def test_grug_moe_rejects_replicated_tensor_parallel_core_layers(monkeypatch):
     fake_config.parallel_config.pipeline_parallel_size = 1
     fake_config.parallel_config.tensor_parallel_size = 8
     with pytest.raises(NotImplementedError, match="tensor_parallel_size=1"):
+        _raise_for_unsupported_modes(fake_config)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.grugmoe.current_platform.is_tpu",
+        lambda: True,
+    )
+    fake_config.quant_config = SimpleNamespace(get_name=lambda: "unquantized")
+    _raise_for_unsupported_modes(fake_config)
+
+    fake_config.quant_config = SimpleNamespace(get_name=lambda: "fp8")
+    with pytest.raises(NotImplementedError, match="does not support quantization"):
         _raise_for_unsupported_modes(fake_config)
 
 
@@ -466,7 +489,9 @@ def test_grug_moe_uses_qb_bias_for_selection_and_normalized_unbiased_weights():
     )
     with torch.no_grad():
         mlp.router.weight.copy_(router_weight)
-        mlp.router.bias.copy_(router_bias)
+        # Match TPU functional_call, which substitutes the registered bias
+        # after the custom router has captured its initial Parameter.
+        mlp.router.bias = torch.nn.Parameter(router_bias.clone())
         routed_experts = mlp.experts.routed_experts
         routed_experts.w13_weight[:, : cfg.intermediate_dim, :].copy_(gate_weight)
         routed_experts.w13_weight[:, cfg.intermediate_dim :, :].copy_(up_weight)
