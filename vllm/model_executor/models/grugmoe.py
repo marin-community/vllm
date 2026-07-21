@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Correctness-first GPU implementation of Marin GrugMoE."""
+"""Correctness-first GPU and TPU implementation of Marin GrugMoE."""
 
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -46,6 +46,7 @@ logger = init_logger(__name__)
 _GATED_NORM_RANK = 128
 _ROUTER_COMBINE_WEIGHT_SUM = 2.5
 _ROUTER_COMBINE_WEIGHT_EPS = 1e-9
+_UNQUANTIZED_METHOD = "unquantized"
 
 
 def _config_attr(config: Any, names: tuple[str, ...], default: Any = None) -> Any:
@@ -316,9 +317,9 @@ class GrugMoeGatedNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
-        gate_hidden, _ = self.down_proj(x)
+        gate_hidden = _apply_grug_linear(self.down_proj, x)
         gate_hidden = F.silu(gate_hidden)
-        gate, _ = self.up_proj(gate_hidden)
+        gate = _apply_grug_linear(self.up_proj, gate_hidden)
         return x * torch.sigmoid(gate).to(dtype)
 
 
@@ -407,6 +408,14 @@ class GrugMoeRouter(BaseRouter):
         return topk_weights, topk_ids
 
 
+def _apply_grug_linear(layer: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor:
+    """Apply a Grug projection without adding its separately handled bias."""
+    if current_platform.is_tpu():
+        output, _ = layer(x)
+        return output
+    return F.linear(x, layer.weight)
+
+
 class GrugMoeMLP(nn.Module):
     """QB-routed MoE with normalized sigmoid combine weights."""
 
@@ -449,7 +458,7 @@ class GrugMoeMLP(nn.Module):
         )
 
     def _forward_torch_reference(self, x_flat: torch.Tensor) -> torch.Tensor:
-        router_logits, _ = self.router(x_flat.float())
+        router_logits = _apply_grug_linear(self.router, x_flat.float())
         combine_weights, selected = self.experts.router.select_experts(
             hidden_states=x_flat,
             router_logits=router_logits,
@@ -492,7 +501,7 @@ class GrugMoeMLP(nn.Module):
         if not x_flat.is_cuda and not current_platform.is_tpu():
             out = self._forward_torch_reference(x_flat)
             return out.to(x.dtype).reshape(orig_shape)
-        router_logits, _ = self.router(x_flat.float())
+        router_logits = _apply_grug_linear(self.router, x_flat.float())
         out = self.experts(
             hidden_states=x_flat,
             router_logits=router_logits,
@@ -580,7 +589,7 @@ class GrugMoeAttention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=cfg.num_kv_heads,
             cache_config=cache_config,
-            quant_config=None,
+            quant_config=quant_config,
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=AttentionType.DECODER,
@@ -602,7 +611,7 @@ class GrugMoeAttention(nn.Module):
         dot = torch.sum(attn_heads * aligned_value, dim=-1, keepdim=True)
         value_norm_sq = torch.sum(aligned_value * aligned_value, dim=-1, keepdim=True)
         attn_heads = attn_heads - (dot / (value_norm_sq + 1e-6)) * aligned_value
-        gate, _ = self.attn_gate(hidden_states)
+        gate = _apply_grug_linear(self.attn_gate, hidden_states)
         gate = 2 * torch.sigmoid(gate)
         attn_heads = gate[..., None].to(attn_heads.dtype) * attn_heads
         return attn_heads.reshape(num_tokens, self.q_size)
@@ -798,7 +807,7 @@ def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
     if vllm_config.lora_config is not None:
         raise NotImplementedError("GrugMoE does not support LoRA")
     quant_config = vllm_config.quant_config
-    if quant_config is not None and quant_config.get_name() != "unquantized":
+    if quant_config is not None and quant_config.get_name() != _UNQUANTIZED_METHOD:
         raise NotImplementedError("GrugMoE does not support quantization")
     if not is_tpu and parallel_config.tensor_parallel_size != 1:
         raise NotImplementedError(

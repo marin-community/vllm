@@ -353,7 +353,7 @@ def _minimal_model_config_for_parallel_check(
     return model_config
 
 
-def test_grug_moe_parallel_config_allows_tpu_sharding_independent_of_heads(
+def test_parallel_config_allows_tpu_heads_but_preserves_gpu_checks(
     monkeypatch,
 ):
     parallel_config = ParallelConfig(tensor_parallel_size=8)
@@ -377,18 +377,29 @@ def test_grug_moe_parallel_config_allows_tpu_sharding_independent_of_heads(
         ModelConfig.verify_with_parallel_config(generic_model_config, parallel_config)
 
 
-def test_grug_moe_allows_tpu_tensor_sharding_but_preserves_gpu_restrictions(
-    monkeypatch,
+def _minimal_vllm_config_for_mode_check(
+    *,
+    tensor_parallel_size=1,
+    pipeline_parallel_size=1,
+    quantization_method=None,
 ):
-    fake_pp_group = SimpleNamespace(world_size=1)
-    fake_config = SimpleNamespace(
+    quant_config = (
+        None
+        if quantization_method is None
+        else SimpleNamespace(get_name=lambda: quantization_method)
+    )
+    return SimpleNamespace(
         parallel_config=SimpleNamespace(
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
         ),
         lora_config=None,
-        quant_config=None,
+        quant_config=quant_config,
     )
+
+
+def _patch_grug_parallel_runtime(monkeypatch, fake_config, *, is_tpu):
+    fake_pp_group = SimpleNamespace(world_size=1)
     monkeypatch.setattr(
         "vllm.model_executor.models.grugmoe.get_tensor_model_parallel_world_size",
         lambda: fake_config.parallel_config.tensor_parallel_size,
@@ -399,29 +410,49 @@ def test_grug_moe_allows_tpu_tensor_sharding_but_preserves_gpu_restrictions(
     )
     monkeypatch.setattr(
         "vllm.model_executor.models.grugmoe.current_platform.is_tpu",
-        lambda: False,
+        lambda: is_tpu,
     )
 
-    _raise_for_unsupported_modes(fake_config)
 
-    fake_config.parallel_config.pipeline_parallel_size = 2
-    with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
-        _raise_for_unsupported_modes(fake_config)
-    fake_config.parallel_config.pipeline_parallel_size = 1
-    fake_config.parallel_config.tensor_parallel_size = 8
-    with pytest.raises(NotImplementedError, match="tensor_parallel_size=1"):
-        _raise_for_unsupported_modes(fake_config)
-
-    monkeypatch.setattr(
-        "vllm.model_executor.models.grugmoe.current_platform.is_tpu",
-        lambda: True,
+@pytest.mark.parametrize(
+    ("tensor_parallel_size", "pipeline_parallel_size", "message"),
+    [(1, 2, "pipeline_parallel_size=1"), (8, 1, "tensor_parallel_size=1")],
+)
+def test_grug_moe_preserves_gpu_parallel_restrictions(
+    monkeypatch,
+    tensor_parallel_size,
+    pipeline_parallel_size,
+    message,
+):
+    fake_config = _minimal_vllm_config_for_mode_check(
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
     )
-    fake_config.quant_config = SimpleNamespace(get_name=lambda: "unquantized")
-    _raise_for_unsupported_modes(fake_config)
-
-    fake_config.quant_config = SimpleNamespace(get_name=lambda: "fp8")
-    with pytest.raises(NotImplementedError, match="does not support quantization"):
+    _patch_grug_parallel_runtime(monkeypatch, fake_config, is_tpu=False)
+    with pytest.raises(NotImplementedError, match=message):
         _raise_for_unsupported_modes(fake_config)
+
+
+@pytest.mark.parametrize(
+    ("quantization_method", "supported"),
+    [("unquantized", True), ("fp8", False)],
+)
+def test_grug_moe_tpu_accepts_only_unquantized_method(
+    monkeypatch,
+    quantization_method,
+    supported,
+):
+    fake_config = _minimal_vllm_config_for_mode_check(
+        tensor_parallel_size=8,
+        quantization_method=quantization_method,
+    )
+    _patch_grug_parallel_runtime(monkeypatch, fake_config, is_tpu=True)
+
+    if supported:
+        _raise_for_unsupported_modes(fake_config)
+    else:
+        with pytest.raises(NotImplementedError, match="does not support quantization"):
+            _raise_for_unsupported_modes(fake_config)
 
 
 def test_grug_gated_norm_matches_reference_math():
