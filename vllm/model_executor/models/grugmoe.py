@@ -1074,10 +1074,12 @@ def _try_load_grug_expert_weight(
             raise ValueError(
                 f"Grug expert parameter {mapped_name!r} has no FusedMoE weight_loader"
             )
-        if loaded_weight.dim() == 3:
-            loaded_experts = loaded_weight.unbind(dim=0)
-        else:
-            loaded_experts = (loaded_weight,)
+        if loaded_weight.dim() != 3:
+            raise ValueError(
+                "Expected stacked 3D Grug expert weight "
+                f"{name!r}, got shape {tuple(loaded_weight.shape)}"
+            )
+        loaded_experts = loaded_weight.unbind(dim=0)
         for expert_id, loaded_expert in enumerate(loaded_experts):
             weight_loader(
                 param,

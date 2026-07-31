@@ -1156,6 +1156,19 @@ def test_grug_moe_3d_expert_weights_load_into_fused_moe_layout():
     torch.testing.assert_close(routed_experts.w2_weight, down_weight)
 
 
+def test_grug_moe_rejects_unstacked_expert_weights():
+    cfg = _tiny_config()
+    mlp = GrugMoeMLP(cfg, params_dtype=torch.float32)
+    params_dict = dict(mlp.named_parameters())
+
+    with pytest.raises(ValueError, match="Expected stacked 3D Grug expert weight"):
+        _try_load_grug_expert_weight(
+            "experts.gate_proj.weight",
+            torch.zeros(cfg.intermediate_dim, cfg.hidden_dim),
+            params_dict,
+        )
+
+
 def test_grug_moe_tiny_decoder_layer_matches_reference_math():
     cfg = GrugMoeRuntimeConfig(
         vocab_size=32,
