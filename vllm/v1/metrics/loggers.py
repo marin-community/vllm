@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -274,6 +275,15 @@ class LoggingStatLogger(StatLoggerBase):
             self.log_prefix + ", ".join(log_parts),
             *log_args,
         )
+        if self.last_scheduler_stats.kv_cache_group_usage:
+            log_fn(
+                self.log_prefix + "GrugMoE KV group usage: %s",
+                json.dumps(
+                    self.last_scheduler_stats.kv_cache_group_usage,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
 
         self.spec_decoding_logging.log(log_fn=log_fn)
         self.kv_connector_logging.log(log_fn=log_fn)
@@ -347,6 +357,11 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
             )
             self.last_scheduler_stats.kv_cache_usage += (
                 last_scheduler_stats.kv_cache_usage
+            )
+        for engine_idx, last_scheduler_stats in self.last_scheduler_stats_dict.items():
+            self.last_scheduler_stats.kv_cache_group_usage.extend(
+                {"engine_idx": engine_idx, **group}
+                for group in last_scheduler_stats.kv_cache_group_usage
             )
         self.last_scheduler_stats.kv_cache_usage /= len(self.last_scheduler_stats_dict)
 

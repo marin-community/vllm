@@ -199,6 +199,73 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    def make_group_usage_stats(self) -> list[dict[str, object]]:
+        """Separate cache payload, physical occupancy, and pool reservation."""
+        reserved_physical_bytes = sum(
+            tensor.size for tensor in self.kv_cache_config.kv_cache_tensors
+        )
+        physical_bytes_per_block = (
+            reserved_physical_bytes // self.kv_cache_config.num_blocks
+        )
+        stats: list[dict[str, object]] = []
+        for group_id, (group, manager) in enumerate(
+            zip(
+                self.kv_cache_config.kv_cache_groups,
+                self.coordinator.single_type_managers,
+                strict=True,
+            )
+        ):
+            active_block_ids: set[int] = set()
+            active_block_references = 0
+            for blocks in manager.req_to_blocks.values():
+                for block in blocks:
+                    if block.is_null:
+                        continue
+                    active_block_ids.add(block.block_id)
+                    active_block_references += 1
+
+            spec = group.kv_cache_spec
+            page_size_bytes = spec.page_size_bytes
+            real_page_size_bytes = getattr(
+                spec,
+                "real_page_size_bytes",
+                page_size_bytes,
+            )
+            layer_count = len(group.layer_names)
+            active_blocks = len(active_block_ids)
+            active_payload_bytes = active_blocks * real_page_size_bytes * layer_count
+            active_padded_bytes = active_blocks * page_size_bytes * layer_count
+            active_physical_bytes = active_blocks * physical_bytes_per_block
+            role = (
+                "sconv"
+                if all(".sconv_" in layer_name for layer_name in group.layer_names)
+                else "attention"
+            )
+            stats.append(
+                {
+                    "group_id": group_id,
+                    "role": role,
+                    "kind": get_kv_cache_spec_kind(spec).value,
+                    "window": get_kv_cache_spec_sliding_window(spec),
+                    "block_size": spec.block_size,
+                    "page_size_bytes": page_size_bytes,
+                    "real_page_size_bytes": real_page_size_bytes,
+                    "layer_count": layer_count,
+                    "layer_names": tuple(group.layer_names),
+                    "active_requests": len(manager.req_to_blocks),
+                    "active_blocks": active_blocks,
+                    "active_block_references": active_block_references,
+                    "active_payload_bytes": active_payload_bytes,
+                    "active_padded_bytes": active_padded_bytes,
+                    "active_physical_bytes": active_physical_bytes,
+                    "active_padding_bytes": active_padded_bytes - active_payload_bytes,
+                    "reserved_blocks": self.kv_cache_config.num_blocks,
+                    "physical_bytes_per_block": physical_bytes_per_block,
+                    "reserved_physical_bytes": reserved_physical_bytes,
+                }
+            )
+        return stats
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.

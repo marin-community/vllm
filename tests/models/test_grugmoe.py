@@ -31,12 +31,15 @@ from vllm.model_executor.models.grugmoe import (
     GrugMoeDecoderLayer,
     GrugMoeGatedNorm,
     GrugMoeMLP,
+    GrugMoeModel,
     GrugMoeRouter,
     GrugMoeRuntimeConfig,
     _raise_for_unsupported_modes,
     _try_load_grug_expert_weight,
     get_grug_moe_runtime_info,
 )
+from vllm.model_executor.models.grugmoe_sconv import GrugMoeSconvBackend
+from vllm.model_executor.models.grugmoe_sconv_ops import fused_sconv
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.config import get_config, is_interleaved
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
@@ -184,6 +187,11 @@ class _FakeDenseMLP(nn.Module):
         return _reference_dense_mlp(x, self)
 
 
+class _ZeroMLP(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.zeros_like(x)
+
+
 def test_grug_moe_config_parses_hf_aliases_and_rope_theta():
     hf_config = SimpleNamespace(
         vocab_size=128,
@@ -329,6 +337,252 @@ def test_grug_moe_config_rejects_noncanonical_layer_types():
                 "full_attention",
             ],
         )
+
+
+def test_grug_moe_exact_reference_config_uses_every_custom_path():
+    hf_config = GrugMoeConfig(
+        vocab_size=64,
+        hidden_dim=16,
+        intermediate_dim=6,
+        shared_expert_intermediate_dim=8,
+        num_shared_experts=2,
+        num_experts=8,
+        num_experts_per_token=2,
+        num_layers=7,
+        num_heads=4,
+        local_kv_heads=4,
+        global_kv_heads=2,
+        head_dim=4,
+        max_seq_len=1024,
+        sliding_window=512,
+        global_every=6,
+        rope_fraction=0.5,
+        rope_fused=True,
+        gated_norm=True,
+        attn_gate=True,
+        xsa=True,
+        qb_routing=True,
+        legacy_input_output_gated_norm=False,
+        mtp_depth=1,
+        sconv=True,
+        sconv_kernel=4,
+        sconv_sites=("k", "v", "attn", "mlp"),
+    )
+    cfg = GrugMoeRuntimeConfig.from_hf_config(hf_config)
+
+    assert cfg.attention_layer_types == (
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "full_attention",
+    )
+    assert cfg.num_kv_heads == 4
+    assert cfg.resolved_local_kv_heads == 4
+    assert cfg.resolved_global_kv_heads == 2
+    assert cfg.num_shared_experts == 2
+    assert cfg.sconv_sites == ("k", "v", "attn", "mlp")
+
+    local_layer = GrugMoeDecoderLayer(
+        cfg,
+        cache_config=None,
+        params_dtype=torch.float32,
+        layer_index=0,
+        prefix="exact.layers.0",
+    )
+    global_layer = GrugMoeDecoderLayer(
+        cfg,
+        cache_config=None,
+        params_dtype=torch.float32,
+        layer_index=5,
+        prefix="exact.layers.5",
+    )
+
+    assert local_layer.self_attn.logical_num_kv_heads == 4
+    assert global_layer.self_attn.logical_num_kv_heads == 2
+    assert local_layer.self_attn.kv_size == 16
+    assert global_layer.self_attn.kv_size == 16
+    assert local_layer.self_attn.attn.sliding_window == 512
+    assert global_layer.self_attn.attn.sliding_window is None
+    assert local_layer.self_attn.use_rope is True
+    assert global_layer.self_attn.use_rope is False
+    assert local_layer.self_attn.rotary_emb.rotary_dim == 2
+    assert local_layer.self_attn.rotary_emb.is_neox_style is False
+    assert local_layer.self_attn.sconv_k is not None
+    assert local_layer.self_attn.sconv_v is not None
+    assert local_layer.sconv_attn is not None
+    assert local_layer.sconv_mlp is not None
+    assert GrugMoeSconvBackend.get_name() == "GRUGMOE_SCONV"
+    assert GrugMoeSconvBackend.indexes_kv_by_block_stride() is True
+    assert local_layer.shared_expert is None
+    assert local_layer.shared_experts is not None
+    assert len(local_layer.shared_experts) == 2
+    assert {
+        expert.gate_proj.weight.shape[0] for expert in local_layer.shared_experts
+    } == {4}
+    assert cfg.legacy_input_output_gated_norm is False
+    assert cfg.mtp_depth == 1
+
+    model = GrugMoeModel(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=hf_config,
+                dtype=torch.float32,
+            ),
+            cache_config=None,
+            compilation_config=get_current_vllm_config().compilation_config,
+        ),
+        prefix="exact-model",
+    )
+    assert model.embed_gated_norm is None
+    assert model.final_gated_norm is None
+
+
+def test_grug_moe_fused_rope_matches_training_interleaved_pairs():
+    cfg = GrugMoeRuntimeConfig(
+        vocab_size=32,
+        hidden_dim=8,
+        intermediate_dim=4,
+        shared_expert_intermediate_dim=0,
+        num_experts=4,
+        num_experts_per_token=2,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        max_seq_len=8,
+        sliding_window=4,
+        rope_fraction=0.5,
+        rope_fused=True,
+    ).validate()
+    attn = GrugMoeAttention(
+        cfg,
+        cache_config=None,
+        params_dtype=torch.float32,
+        sliding_window=cfg.sliding_window,
+        use_rope=True,
+        qk_mult_scale=1.0,
+    )
+    positions = torch.tensor([0, 1, 3], dtype=torch.long)
+    q = torch.linspace(-0.8, 0.9, steps=positions.numel() * 8).view(-1, 8)
+    k = torch.linspace(0.7, -0.6, steps=positions.numel() * 4).view(-1, 4)
+
+    actual_q, actual_k = attn.rotary_emb(positions, q, k)
+
+    def training_fused_rope(x: torch.Tensor, num_heads: int) -> torch.Tensor:
+        heads = x.view(x.shape[0], num_heads, cfg.inferred_head_dim)
+        angles = positions.float()
+        cos = torch.cos(angles)[:, None]
+        sin = torch.sin(angles)[:, None]
+        expected = heads.clone()
+        x0 = heads[..., 0]
+        x1 = heads[..., 1]
+        expected[..., 0] = x0 * cos - x1 * sin
+        expected[..., 1] = x1 * cos + x0 * sin
+        return expected.reshape_as(x)
+
+    torch.testing.assert_close(actual_q, training_fused_rope(q, 2))
+    torch.testing.assert_close(actual_k, training_fused_rope(k, 1))
+
+
+def test_grug_moe_sconv_loads_levanter_kernel_channel_layout():
+    cfg = GrugMoeRuntimeConfig(
+        vocab_size=32,
+        hidden_dim=8,
+        intermediate_dim=4,
+        shared_expert_intermediate_dim=0,
+        num_experts=4,
+        num_experts_per_token=2,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=2,
+        max_seq_len=16,
+        sliding_window=8,
+        sconv=True,
+        sconv_kernel=4,
+    ).validate()
+    layer = GrugMoeDecoderLayer(
+        cfg,
+        cache_config=None,
+        params_dtype=torch.bfloat16,
+        layer_index=0,
+        prefix="sconv-layout.layers.0",
+    )
+    short_conv = layer.self_attn.sconv_k
+    assert short_conv is not None
+    levanter_weight = torch.arange(
+        cfg.sconv_kernel * short_conv.dim,
+        dtype=torch.bfloat16,
+    ).view(cfg.sconv_kernel, short_conv.dim)
+
+    short_conv.weight_loader(short_conv.weight, levanter_weight)
+
+    assert short_conv.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(short_conv.weight, levanter_weight.T)
+    cache_spec = short_conv.state.get_kv_cache_spec(get_current_vllm_config())
+    assert cache_spec.block_size == cfg.sconv_kernel
+    assert cache_spec.sliding_window == cfg.sconv_kernel
+    assert cache_spec.page_size_bytes == (
+        cfg.sconv_kernel
+        * short_conv.dim
+        * torch.empty((), dtype=torch.bfloat16).element_size()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_grug_moe_sconv_cuda_uses_current_to_oldest_tap_order():
+    tokens, channels, width, block_size = 6, 3, 4, 16
+    x = torch.arange(
+        1,
+        tokens * channels + 1,
+        dtype=torch.float32,
+        device="cuda",
+    ).view(tokens, channels)
+    weight = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [0.5, -1.0, 1.5, -2.0],
+            [2.0, 0.25, -0.5, 1.0],
+        ],
+        device="cuda",
+    )
+    cache = torch.zeros(
+        1,
+        1,
+        block_size,
+        channels,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    positions = torch.arange(tokens, dtype=torch.long, device="cuda")
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    seq_idx = torch.zeros(tokens, dtype=torch.int32, device="cuda")
+    slot_mapping = positions.clone()
+    query_start = torch.zeros(tokens, dtype=torch.int32, device="cuda")
+
+    actual = fused_sconv(
+        x,
+        weight,
+        cache,
+        positions,
+        block_table,
+        seq_idx,
+        slot_mapping,
+        query_start,
+        off_s=0,
+        width=channels,
+        block_size=block_size,
+    )
+    expected = torch.zeros_like(x)
+    for token in range(tokens):
+        for tap in range(width):
+            if token >= tap:
+                expected[token] += weight[:, tap] * x[token - tap]
+
+    torch.testing.assert_close(actual, expected)
 
 
 def _minimal_model_config_for_parallel_check(
@@ -615,6 +869,80 @@ def test_grug_moe_routed_experts_keep_model_dtype():
     assert layer.shared_expert.gate_proj.weight.dtype == torch.bfloat16
 
 
+def test_grug_moe_two_distinct_shared_experts_are_summed():
+    cfg = GrugMoeRuntimeConfig(
+        vocab_size=32,
+        hidden_dim=4,
+        intermediate_dim=3,
+        shared_expert_intermediate_dim=4,
+        num_shared_experts=2,
+        num_experts=4,
+        num_experts_per_token=2,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=2,
+        max_seq_len=8,
+        sliding_window=8,
+        initializer_std=0.02,
+        disable_pko=True,
+    ).validate()
+    layer = GrugMoeDecoderLayer(
+        cfg,
+        cache_config=None,
+        params_dtype=torch.float32,
+        layer_index=0,
+        prefix="two-shared.layers.0",
+    )
+    assert layer.shared_experts is not None
+    first, second = layer.shared_experts
+    fake_attn = _FakeAttention(cfg.hidden_dim)
+    layer.self_attn = fake_attn
+    layer.mlp = _ZeroMLP()
+    for shared_expert in layer.shared_experts:
+        for projection in (
+            shared_expert.gate_proj,
+            shared_expert.up_proj,
+            shared_expert.down_proj,
+        ):
+            projection.cpu_linear = F.linear
+    with torch.no_grad():
+        for gated_norm in (layer.attn_gated_norm, layer.mlp_gated_norm):
+            gated_norm.down_proj.weight.zero_()
+            gated_norm.up_proj.weight.zero_()
+        fake_attn.weight.zero_()
+        _fill_parameter(first.gate_proj.weight, -0.2, 0.3)
+        _fill_parameter(first.up_proj.weight, 0.4, -0.1)
+        _fill_parameter(first.down_proj.weight, -0.3, 0.2)
+        _fill_parameter(second.gate_proj.weight, 0.7, -0.4)
+        _fill_parameter(second.up_proj.weight, -0.5, 0.6)
+        _fill_parameter(second.down_proj.weight, 0.2, 0.8)
+
+    hidden = torch.tensor(
+        [[0.2, -0.3, 0.5, 0.7], [-0.4, 0.6, -0.1, 0.3]],
+        dtype=torch.float32,
+    )
+    positions = torch.arange(hidden.shape[0], dtype=torch.long)
+    with set_forward_context(
+        None,
+        get_current_vllm_config(),
+        num_tokens=hidden.shape[0],
+    ):
+        actual = layer(positions, hidden)
+
+    mlp_in = _reference_gated_norm(
+        _reference_rms_norm(hidden, layer.post_attention_layernorm),
+        layer.mlp_gated_norm,
+    )
+    first_out = _reference_dense_mlp(mlp_in, first)
+    second_out = _reference_dense_mlp(mlp_in, second)
+    expected = hidden + first_out + second_out
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    assert torch.count_nonzero(first_out)
+    assert torch.count_nonzero(second_out)
+    assert not torch.allclose(first_out, second_out)
+
+
 def test_grug_moe_attention_schedule_matches_training_architecture():
     cfg = GrugMoeRuntimeConfig(
         vocab_size=32,
@@ -660,7 +988,7 @@ def test_grug_moe_attention_schedule_matches_training_architecture():
     assert short_layer.self_attn.attn.sliding_window == cfg.sliding_window
     assert short_layer.self_attn.use_rope is True
     assert short_layer.self_attn.qk_mult_scale == 1.0
-    assert short_layer.self_attn.rotary_emb.rotary_dim == cfg.inferred_head_dim // 2
+    assert short_layer.self_attn.rotary_emb.rotary_dim == cfg.rotary_dim
     for layer in (periodic_long_layer, final_long_layer):
         assert layer.self_attn.attn.sliding_window is None
         assert layer.self_attn.use_rope is False

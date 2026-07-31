@@ -83,6 +83,14 @@ class Scheduler(SchedulerInterface):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
+        hf_config = getattr(
+            vllm_config.model_config,
+            "hf_text_config",
+            vllm_config.model_config.hf_config,
+        )
+        self.log_kv_cache_group_usage = (
+            getattr(hf_config, "model_type", None) == "grug_moe"
+        )
         self.observability_config = vllm_config.observability_config
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
@@ -2148,6 +2156,11 @@ class Scheduler(SchedulerInterface):
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            kv_cache_group_usage=(
+                self.kv_cache_manager.make_group_usage_stats()
+                if self.log_kv_cache_group_usage
+                else []
+            ),
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,

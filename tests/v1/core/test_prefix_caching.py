@@ -172,6 +172,88 @@ def make_kv_cache_config_hybrid_model(
     )
 
 
+def test_kv_group_usage_separates_reservation_from_live_occupancy():
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_kv_cache_config_hybrid_model(
+            block_size=block_size,
+            num_blocks=64,
+            sliding_window_blocks=2,
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    request = make_request(
+        "usage",
+        list(range(55)),
+        block_size,
+        sha256,
+    )
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(request)
+    assert num_computed_tokens == 0
+    assert manager.allocate_slots(
+        request,
+        num_new_tokens=55,
+        num_new_computed_tokens=0,
+        new_computed_blocks=computed_blocks,
+    )
+
+    initial = manager.make_group_usage_stats()
+    assert [group["kind"] for group in initial] == [
+        "full_attention",
+        "sliding_window",
+        "sliding_window",
+    ]
+    assert {group["active_requests"] for group in initial} == {1}
+    assert {group["active_blocks"] for group in initial} == {4}
+    assert {group["reserved_blocks"] for group in initial} == {64}
+    for group in initial:
+        assert group["active_payload_bytes"] == (
+            group["active_blocks"]
+            * group["real_page_size_bytes"]
+            * group["layer_count"]
+        )
+        assert group["active_padded_bytes"] == (
+            group["active_blocks"] * group["page_size_bytes"] * group["layer_count"]
+        )
+        assert group["active_padding_bytes"] == (
+            group["active_padded_bytes"] - group["active_payload_bytes"]
+        )
+        assert group["active_physical_bytes"] == (
+            group["active_blocks"] * group["physical_bytes_per_block"]
+        )
+        assert group["reserved_physical_bytes"] == sum(
+            tensor.size for tensor in manager.kv_cache_config.kv_cache_tensors
+        )
+
+    request.num_computed_tokens = 55
+    request.append_output_token_ids([1] * 16)
+    assert manager.allocate_slots(
+        request,
+        num_new_tokens=16,
+        num_new_computed_tokens=0,
+    )
+    first_extension = manager.make_group_usage_stats()
+
+    request.num_computed_tokens = 71
+    request.append_output_token_ids([2] * 16)
+    assert manager.allocate_slots(
+        request,
+        num_new_tokens=16,
+        num_new_computed_tokens=0,
+    )
+    second_extension = manager.make_group_usage_stats()
+
+    assert first_extension[0]["active_blocks"] == 5
+    assert second_extension[0]["active_blocks"] == 6
+    assert first_extension[1]["active_blocks"] == 4
+    assert second_extension[1]["active_blocks"] == 4
+    assert first_extension[2]["active_blocks"] == 4
+    assert second_extension[2]["active_blocks"] == 4
+    assert {group["active_requests"] for group in second_extension} == {1}
+
+
 def make_kv_cache_config_three_types(
     block_size: int, num_blocks: int, third_spec_type: str = "mamba"
 ) -> KVCacheConfig:
