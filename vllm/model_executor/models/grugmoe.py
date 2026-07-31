@@ -1058,6 +1058,8 @@ def _try_load_grug_expert_weight(
     name: str,
     loaded_weight: torch.Tensor,
     params_dict: dict[str, nn.Parameter],
+    *,
+    expected_experts: int,
 ) -> str | None:
     for weight_name, param_name, shard_id in _EXPERT_WEIGHT_MAPPING:
         if weight_name not in name:
@@ -1078,6 +1080,11 @@ def _try_load_grug_expert_weight(
             raise ValueError(
                 "Expected stacked 3D Grug expert weight "
                 f"{name!r}, got shape {tuple(loaded_weight.shape)}"
+            )
+        if loaded_weight.shape[0] != expected_experts:
+            raise ValueError(
+                f"Expected {expected_experts} stacked Grug experts for "
+                f"{name!r}, got {loaded_weight.shape[0]}"
             )
         loaded_experts = loaded_weight.unbind(dim=0)
         for expert_id, loaded_expert in enumerate(loaded_experts):
@@ -1164,7 +1171,10 @@ class GrugMoeForCausalLM(nn.Module):
 
             if (
                 mapped_name := _try_load_grug_expert_weight(
-                    name, loaded_weight, params_dict
+                    name,
+                    loaded_weight,
+                    params_dict,
+                    expected_experts=self.config.num_experts,
                 )
             ) is not None:
                 loaded_params.add(mapped_name)

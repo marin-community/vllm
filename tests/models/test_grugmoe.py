@@ -1124,6 +1124,7 @@ def test_grug_moe_3d_expert_weights_load_into_fused_moe_layout():
             "experts.gate_proj.weight",
             gate_weight,
             params_dict,
+            expected_experts=cfg.num_experts,
         )
         == "experts.routed_experts.w13_weight"
     )
@@ -1132,6 +1133,7 @@ def test_grug_moe_3d_expert_weights_load_into_fused_moe_layout():
             "experts.up_proj.weight",
             up_weight,
             params_dict,
+            expected_experts=cfg.num_experts,
         )
         == "experts.routed_experts.w13_weight"
     )
@@ -1140,6 +1142,7 @@ def test_grug_moe_3d_expert_weights_load_into_fused_moe_layout():
             "experts.down_proj.weight",
             down_weight,
             params_dict,
+            expected_experts=cfg.num_experts,
         )
         == "experts.routed_experts.w2_weight"
     )
@@ -1166,6 +1169,27 @@ def test_grug_moe_rejects_unstacked_expert_weights():
             "experts.gate_proj.weight",
             torch.zeros(cfg.intermediate_dim, cfg.hidden_dim),
             params_dict,
+            expected_experts=cfg.num_experts,
+        )
+
+
+def test_grug_moe_rejects_wrong_expert_count():
+    cfg = _tiny_config()
+    mlp = GrugMoeMLP(cfg, params_dtype=torch.float32)
+    params_dict = dict(mlp.named_parameters())
+
+    with pytest.raises(
+        ValueError, match=f"Expected {cfg.num_experts} stacked Grug experts"
+    ):
+        _try_load_grug_expert_weight(
+            "experts.gate_proj.weight",
+            torch.zeros(
+                cfg.num_experts - 1,
+                cfg.intermediate_dim,
+                cfg.hidden_dim,
+            ),
+            params_dict,
+            expected_experts=cfg.num_experts,
         )
 
 
