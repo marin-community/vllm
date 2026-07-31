@@ -38,7 +38,10 @@ from vllm.model_executor.models.grugmoe import (
     _try_load_grug_expert_weight,
     get_grug_moe_runtime_info,
 )
-from vllm.model_executor.models.grugmoe_sconv import GrugMoeSconvBackend
+from vllm.model_executor.models.grugmoe_sconv import (
+    GrugMoeSconvBackend,
+    GrugMoeShortConv,
+)
 from vllm.model_executor.models.grugmoe_sconv_ops import fused_sconv
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.config import get_config, is_interleaved
@@ -530,6 +533,32 @@ def test_grug_moe_sconv_loads_levanter_kernel_channel_layout():
         * short_conv.dim
         * torch.empty((), dtype=torch.bfloat16).element_size()
     )
+
+
+def test_grug_moe_sconv_profile_run_uses_only_current_token_tap():
+    short_conv = GrugMoeShortConv(
+        dim=4,
+        kernel_size=3,
+        num_heads=2,
+        dtype=torch.float32,
+        prefix="sconv-profile",
+    )
+    x = torch.arange(1, 13, dtype=torch.float32).view(3, 4)
+    weight = torch.tensor(
+        [
+            [0.5, 3.0, -2.0],
+            [-1.0, 2.0, 4.0],
+            [1.5, -3.0, 0.25],
+            [2.0, 5.0, -0.5],
+        ],
+    )
+    with torch.no_grad():
+        short_conv.weight.copy_(weight)
+
+    with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
+        actual = short_conv(x, torch.arange(x.shape[0]))
+
+    torch.testing.assert_close(actual, x * weight[:, 0])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

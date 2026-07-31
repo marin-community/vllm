@@ -221,6 +221,11 @@ class GrugMoeShortConv(nn.Module):
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         metadata = get_forward_context().attn_metadata
+        if metadata is None:
+            # V1 profiles activation memory before it allocates KV caches or builds
+            # paged metadata. Keep only the current-token tap: it has the real output
+            # shape and cannot mix dummy tokens from different requests.
+            return x * self.weight[:, 0]
         if not isinstance(metadata, dict):
             raise RuntimeError("GrugMoE sconv requires paged forward metadata")
         stream_metadata = metadata.get(self.state.prefix)
