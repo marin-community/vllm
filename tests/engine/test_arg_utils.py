@@ -845,6 +845,22 @@ class TestDeviceIds:
 
 
 class TestDpDeviceIdSharding:
+    def test_explicit_zero_dp_start_rank_overrides_inferred_node_rank(self):
+        args = EngineArgs(
+            model="facebook/opt-125m",
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+            data_parallel_size=8,
+            data_parallel_size_local=8,
+            data_parallel_start_rank=0,
+            nnodes=2,
+            node_rank=1,
+        )
+
+        config = args.create_engine_config(headless=True)
+
+        assert config.parallel_config.data_parallel_rank == 0
+
     def test_dp_supervisor_device_ids_stay_env_relative(self):
         """Regression test: the DP supervisor must pass env-relative indices,
         not physical IDs, because each child re-resolves --device-ids
@@ -887,3 +903,15 @@ class TestDpDeviceIdSharding:
             get_physical_gpu_ids_for_local_dp_rank(
                 evar, local_dp_rank=2, world_size=2, user_assigned_gpu_ids=[4, 5, 6, 7]
             )
+
+    def test_dp_rank_shards_one_local_pipeline_stage_per_gpu(self):
+        from vllm.platforms import current_platform
+        from vllm.v1.engine.utils import get_physical_gpu_ids_for_local_dp_rank
+
+        assert get_physical_gpu_ids_for_local_dp_rank(
+            current_platform.device_control_env_var,
+            local_dp_rank=5,
+            world_size=2,
+            local_world_size=1,
+            user_assigned_gpu_ids=list(range(8)),
+        ) == [5]
