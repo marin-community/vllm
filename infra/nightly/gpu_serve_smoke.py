@@ -264,6 +264,11 @@ def main() -> int:
         action="store_true",
         help="Rewrite the spec from this run instead of gating against it.",
     )
+    parser.add_argument(
+        "--result-json",
+        type=Path,
+        help="Write the observed serving metrics as JSON.",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
@@ -274,6 +279,9 @@ def main() -> int:
         result = run_prompts(base_url, model)
 
     logger.info("result: %s", result)
+
+    if args.result_json is not None:
+        args.result_json.write_text(json.dumps(asdict(result), indent=2) + "\n")
 
     if args.record:
         record(args.spec, spec, result, model)
