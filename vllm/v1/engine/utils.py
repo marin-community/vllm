@@ -212,8 +212,15 @@ class CoreEngineProcManager:
                 needs_device_env_isolation = not (
                     current_platform.is_cuda_alike() or current_platform.is_xpu()
                 )
+                # A multi-node DP engine owns only its node-local TP/PP shard,
+                # so assign that shard explicitly before spawning the process.
+                needs_multinode_dp_shard = (
+                    vllm_config.parallel_config.nnodes_within_dp > 1
+                )
                 if is_dp and (
-                    needs_device_env_isolation or vllm_config.parallel_config.use_ray
+                    needs_multinode_dp_shard
+                    or needs_device_env_isolation
+                    or vllm_config.parallel_config.use_ray
                 ):
                     set_assigned_physical_gpu_ids_for_dp_rank(
                         vllm_config, local_dp_rank, user_assigned_gpu_ids
@@ -349,8 +356,10 @@ def get_physical_gpu_ids_for_local_dp_rank(
     Returns list of physical GPU IDs for the specified
     data parallel rank.
 
-    For example, if world_size=2 and local_dp_rank=1, and there are 4 devices,
-    this will return [2, 3] for local_dp_rank=1.
+    The shard starts at ``local_dp_rank * local_world_size``. For example,
+    ``world_size=4``, ``local_world_size=2``, and ``local_dp_rank=1`` returns
+    devices 2 and 3. ``local_world_size`` defaults to ``world_size`` for
+    single-node callers.
 
     If user_assigned_gpu_ids is provided (e.g. from --device-ids), this DP
     rank's shard is sliced from it instead of being derived from the
@@ -359,7 +368,7 @@ def get_physical_gpu_ids_for_local_dp_rank(
     if local_world_size is None:
         local_world_size = world_size
     if user_assigned_gpu_ids is not None:
-        start = local_dp_rank * world_size
+        start = local_dp_rank * local_world_size
         stop = start + local_world_size
         if stop > len(user_assigned_gpu_ids):
             raise ValueError(
@@ -371,16 +380,16 @@ def get_physical_gpu_ids_for_local_dp_rank(
         return [
             current_platform.device_id_to_physical_device_id(i)
             for i in range(
-                local_dp_rank * world_size,
-                local_dp_rank * world_size + local_world_size,
+                local_dp_rank * local_world_size,
+                local_dp_rank * local_world_size + local_world_size,
             )
         ]
     except IndexError as e:
         raise Exception(
             f"Error computing device indices for "
             f"{device_control_env_var}: "
-            f"local range: [{local_dp_rank * world_size}, "
-            f"{(local_dp_rank + 1) * world_size}) "
+            f"local range: [{local_dp_rank * local_world_size}, "
+            f"{(local_dp_rank + 1) * local_world_size}) "
             "base value: "
             f'"{os.getenv(device_control_env_var)}"'
         ) from e
