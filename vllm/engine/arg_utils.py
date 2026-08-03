@@ -2234,7 +2234,7 @@ class EngineArgs:
             )
             if self.nnodes > 1:
                 logger.info(
-                    "Inferred data_parallel_rank %d from node_rank %d",
+                    "Using data_parallel_rank %d on node_rank %d",
                     self.data_parallel_rank,
                     self.node_rank,
                 )

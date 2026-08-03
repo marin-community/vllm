@@ -43,6 +43,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     checkpoint_prepare_distributed_state,
     checkpoint_restore_distributed_state,
+    get_ep_group,
     get_pp_group,
     get_tp_group,
 )
@@ -391,6 +392,28 @@ class Worker(WorkerBase):
                 self.distributed_init_method,
                 self.local_rank,
                 current_platform.dist_backend,
+            )
+            pp_group = get_pp_group()
+            tp_group = get_tp_group()
+            ep_group = get_ep_group() if self.model_config.is_moe else None
+            physical_gpu_id = current_platform.device_id_to_physical_device_id(
+                self.local_rank
+            )
+            logger.info(
+                "Worker placement: process_rank=%d node_rank=%d local_rank=%d "
+                "DP=%d/%d EP=%s/%s PP=%d/%d TP=%d/%d GPU=%s",
+                torch.distributed.get_rank(),
+                parallel_config.node_rank,
+                self.local_rank,
+                parallel_config.data_parallel_rank,
+                parallel_config.data_parallel_size,
+                ep_group.rank_in_group if ep_group is not None else "N/A",
+                ep_group.world_size if ep_group is not None else "N/A",
+                pp_group.rank_in_group,
+                pp_group.world_size,
+                tp_group.rank_in_group,
+                tp_group.world_size,
+                physical_gpu_id,
             )
 
             if self.use_v2_model_runner:
