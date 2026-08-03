@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 
 import torch
@@ -29,7 +30,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
+    PPMissingLayer,
+    extract_layer_index,
+    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
+    make_layers,
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
@@ -38,6 +43,8 @@ from vllm.transformers_utils.configs.grugmoe import (
     grug_moe_rope_theta,
 )
 from vllm.v1.attention.backend import AttentionType
+
+from .interfaces import SupportsPP
 
 logger = init_logger(__name__)
 
@@ -95,10 +102,13 @@ def get_grug_moe_runtime_info(
 ) -> dict[str, Any]:
     """Return worker-local GrugMoE runtime state for logs and diagnostics."""
     grug_model = getattr(model, "model", model)
-    layers = getattr(grug_model, "layers", None)
-    if not layers:
-        raise RuntimeError("GrugMoE runtime info requires at least one layer")
-    first_layer = layers[0]
+    layers = getattr(grug_model, "layers", ())
+    first_layer = next(
+        (layer for layer in layers if isinstance(layer, GrugMoeDecoderLayer)),
+        None,
+    )
+    if first_layer is None:
+        raise RuntimeError("GrugMoE runtime info requires a local decoder layer")
     moe_runner = first_layer.mlp.experts
     moe_config = moe_runner.moe_config
     moe_parallel_config = moe_config.moe_parallel_config
@@ -107,9 +117,14 @@ def get_grug_moe_runtime_info(
         int(expert_id) for expert_id in expert_map_manager.get_local_expert_ids()
     ]
     attention_backend = first_layer.self_attn.attn.attn_backend.get_name()
+    pp_group = get_pp_group()
     return {
         "tp_size": int(moe_parallel_config.tp_size),
         "tp_rank": int(moe_parallel_config.tp_rank),
+        "pp_size": int(pp_group.world_size),
+        "pp_rank": int(pp_group.rank_in_group),
+        "start_layer": int(grug_model.start_layer),
+        "end_layer": int(grug_model.end_layer),
         "dp_size": int(moe_parallel_config.dp_size),
         "dp_rank": int(moe_parallel_config.dp_rank),
         "ep_size": int(moe_parallel_config.ep_size),
@@ -133,11 +148,16 @@ def _log_grug_moe_runtime_info(
 ) -> None:
     info = get_grug_moe_runtime_info(vllm_config, model)
     logger.info(
-        "GrugMoE effective config: TP=%d/%d DP=%d/%d EP=%d/%d "
+        "GrugMoE effective config: TP=%d/%d PP=%d/%d layers=[%d,%d) "
+        "DP=%d/%d EP=%d/%d "
         "use_ep=%s experts=%d local=%d top_k=%d ownership=%s "
         "placement=%s all2all=%s attention=%s",
         info["tp_rank"],
         info["tp_size"],
+        info["pp_rank"],
+        info["pp_size"],
+        info["start_layer"],
+        info["end_layer"],
         info["dp_rank"],
         info["dp_size"],
         info["ep_rank"],
@@ -173,6 +193,7 @@ class GrugMoeRuntimeConfig:
     qk_mult_long_scale: float = 1.0
     disable_pko: bool = True
     disable_long_rope: bool = True
+    tie_word_embeddings: bool = False
     rope_theta: float = 10000.0
 
     @classmethod
@@ -230,6 +251,9 @@ class GrugMoeRuntimeConfig:
             ),
             disable_pko=bool(_config_attr(config, ("disable_pko",), True)),
             disable_long_rope=bool(_config_attr(config, ("disable_long_rope",), True)),
+            tie_word_embeddings=bool(
+                _config_attr(config, ("tie_word_embeddings",), False)
+            ),
             rope_theta=grug_moe_rope_theta(config),
         ).validate()
 
@@ -703,40 +727,55 @@ class GrugMoeModel(nn.Module):
             )
         self.params_dtype = vllm_config.model_config.dtype
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.config.vocab_size,
-            self.config.hidden_dim,
-            params_dtype=self.params_dtype,
-            quant_config=None,
-            prefix=f"{prefix}.embed_tokens",
+        if get_pp_group().is_first_rank or (
+            self.config.tie_word_embeddings and get_pp_group().is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                self.config.vocab_size,
+                self.config.hidden_dim,
+                params_dtype=self.params_dtype,
+                quant_config=None,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+        if get_pp_group().is_first_rank:
+            self.embed_norm = RMSNorm(
+                self.config.hidden_dim,
+                eps=self.config.layer_norm_eps,
+            )
+            self.embed_gated_norm = GrugMoeGatedNorm(
+                self.config.hidden_dim,
+                self.params_dtype,
+                prefix=f"{prefix}.embed_gated_norm",
+            )
+        else:
+            self.embed_norm = PPMissingLayer()
+            self.embed_gated_norm = PPMissingLayer()
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            self.config.num_layers,
+            lambda prefix: GrugMoeDecoderLayer(
+                self.config,
+                vllm_config.cache_config,
+                self.params_dtype,
+                layer_index=extract_layer_index(prefix),
+                prefix=prefix,
+            ),
+            prefix=f"{prefix}.layers",
         )
-        self.embed_norm = RMSNorm(
-            self.config.hidden_dim,
-            eps=self.config.layer_norm_eps,
-        )
-        self.embed_gated_norm = GrugMoeGatedNorm(
-            self.config.hidden_dim,
-            self.params_dtype,
-            prefix=f"{prefix}.embed_gated_norm",
-        )
-        self.layers = nn.ModuleList(
-            [
-                GrugMoeDecoderLayer(
-                    self.config,
-                    vllm_config.cache_config,
-                    self.params_dtype,
-                    layer_index,
-                    prefix=f"{prefix}.layers.{layer_index}",
-                )
-                for layer_index in range(self.config.num_layers)
-            ]
-        )
-        self.norm = RMSNorm(self.config.hidden_dim, eps=self.config.layer_norm_eps)
-        self.final_gated_norm = GrugMoeGatedNorm(
-            self.config.hidden_dim,
-            self.params_dtype,
-            prefix=f"{prefix}.final_gated_norm",
-        )
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(
+                self.config.hidden_dim,
+                eps=self.config.layer_norm_eps,
+            )
+            self.final_gated_norm = GrugMoeGatedNorm(
+                self.config.hidden_dim,
+                self.params_dtype,
+                prefix=f"{prefix}.final_gated_norm",
+            )
+        else:
+            self.norm = PPMissingLayer()
+            self.final_gated_norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.config.hidden_dim
         )
@@ -751,29 +790,29 @@ class GrugMoeModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if intermediate_tensors is not None:
-            raise NotImplementedError("GrugMoE does not support pipeline parallelism")
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                if input_ids is None:
+                    raise ValueError(
+                        "input_ids must be provided when inputs_embeds is None"
+                    )
+                hidden_states = self.embed_input_ids(input_ids)
+            hidden_states = self.embed_gated_norm(self.embed_norm(hidden_states))
         else:
-            if input_ids is None:
-                raise ValueError(
-                    "input_ids must be provided when inputs_embeds is None"
-                )
-            hidden_states = self.embed_input_ids(input_ids)
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
 
-        hidden_states = self.embed_gated_norm(self.embed_norm(hidden_states))
-        for layer in self.layers:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(positions, hidden_states)
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({"hidden_states": hidden_states})
         return self.final_gated_norm(self.norm(hidden_states))
 
 
 def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
-    if parallel_config.pipeline_parallel_size != 1:
-        raise NotImplementedError("GrugMoE currently supports pipeline_parallel_size=1")
-    if get_pp_group().world_size != 1:
-        raise NotImplementedError("GrugMoE currently supports pipeline_parallel_size=1")
     if vllm_config.lora_config is not None:
         raise NotImplementedError("GrugMoE does not support LoRA")
     if vllm_config.quant_config is not None:
@@ -847,7 +886,7 @@ def _try_load_grug_expert_weight(
     return None
 
 
-class GrugMoeForCausalLM(nn.Module):
+class GrugMoeForCausalLM(nn.Module, SupportsPP):
     fall_back_to_pt_during_load = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -857,24 +896,25 @@ class GrugMoeForCausalLM(nn.Module):
         if hf_config is None:
             hf_config = vllm_config.model_config.hf_config
         self.config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
-        self.tie_word_embeddings = bool(
-            getattr(hf_config, "tie_word_embeddings", False)
-        )
+        self.tie_word_embeddings = self.config.tie_word_embeddings
         self.quant_config: QuantizationConfig | None = None
         self.model = GrugMoeModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
         )
         _log_grug_moe_runtime_info(vllm_config, self)
-        self.lm_head = ParallelLMHead(
-            self.config.vocab_size,
-            self.config.hidden_dim,
-            params_dtype=vllm_config.model_config.dtype,
-            quant_config=None,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
-        if self.tie_word_embeddings:
-            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                self.config.vocab_size,
+                self.config.hidden_dim,
+                params_dtype=vllm_config.model_config.dtype,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            if self.tie_word_embeddings:
+                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -914,6 +954,8 @@ class GrugMoeForCausalLM(nn.Module):
             if self.tie_word_embeddings and name.startswith("lm_head."):
                 continue
             if any(substring in name for substring in unused_substrings):
+                continue
+            if is_pp_missing_parameter(name, self):
                 continue
 
             if (
