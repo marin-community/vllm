@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "brand": "Marin vLLM",
+  "distribution_name": "vllm",
+  "python_version": "3.12",
+  "torch_version": "2.11.0+cu129",
+  "torch_metadata_requirement": "torch==2.11.0",
+  "torch_index_url": "https://download.pytorch.org/whl/cu129",
+  "cuda_toolkit_version": "12.9.1",
+  "cuda_runtime_version": "12.9",
+  "cuda_variant": "cu129",
+  "validation_task_image": "ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58",
+  "platforms": {
+    "x86_64": {
+      "runner": "ubuntu-24.04",
+      "build_base_image": "pytorch/manylinux2_28-builder:cuda12.9@sha256:d26cd7a9489b53310296e86042de630ac947e25a71dd24b547b86ca9a0a3fc79",
+      "max_jobs": 2,
+      "nvcc_threads": 2,
+      "sm_targets": ["7.5", "8.0", "8.6", "8.9", "9.0", "10.0", "12.0"],
+      "validation": {
+        "gpu": "H100",
+        "gpu_resource": "H100x1",
+        "compute_capability": "9.0",
+        "target_cluster": "cw-rno2a",
+        "cpu": 8,
+        "memory": "64GB",
+        "run_source_tests": true,
+        "spec": "infra/nightly/specs/qwen3-0.6b-h100.json"
+      }
+    },
+    "aarch64": {
+      "runner": "ubuntu-24.04-arm",
+      "build_base_image": "pytorch/manylinuxaarch64-builder:cuda12.9@sha256:a938397b8896d35d35edc86a402930cc55d12ffc67fe0b4d19a5dff21781d7f4",
+      "max_jobs": 2,
+      "nvcc_threads": 2,
+      "sm_targets": ["8.0", "8.7", "8.9", "9.0", "10.0", "12.0"],
+      "validation": {
+        "gpu": "GB200",
+        "gpu_resource": "GB200x1",
+        "compute_capability": "10.0",
+        "target_cluster": "cw-us-east-08a",
+        "cpu": 16,
+        "memory": "128GB",
+        "run_source_tests": false,
+        "spec": "infra/nightly/specs/qwen3-0.6b-gb200.json"
+      }
+    }
+  }
+}
