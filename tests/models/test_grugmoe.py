@@ -33,7 +33,6 @@ from vllm.model_executor.models.grugmoe import (
     GrugMoeMLP,
     GrugMoeRouter,
     GrugMoeRuntimeConfig,
-    _raise_for_unsupported_modes,
     _try_load_grug_expert_weight,
     get_grug_moe_runtime_info,
 )
@@ -370,36 +369,6 @@ def test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads():
         ModelConfig.verify_with_parallel_config(generic_model_config, parallel_config)
 
 
-def test_grug_moe_rejects_replicated_tensor_parallel_core_layers(monkeypatch):
-    fake_pp_group = SimpleNamespace(world_size=1)
-    fake_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
-        ),
-        lora_config=None,
-        quant_config=None,
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.models.grugmoe.get_tensor_model_parallel_world_size",
-        lambda: fake_config.parallel_config.tensor_parallel_size,
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.models.grugmoe.get_pp_group",
-        lambda: fake_pp_group,
-    )
-
-    _raise_for_unsupported_modes(fake_config)
-
-    fake_config.parallel_config.pipeline_parallel_size = 2
-    with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
-        _raise_for_unsupported_modes(fake_config)
-    fake_config.parallel_config.pipeline_parallel_size = 1
-    fake_config.parallel_config.tensor_parallel_size = 8
-    with pytest.raises(NotImplementedError, match="tensor_parallel_size=1"):
-        _raise_for_unsupported_modes(fake_config)
-
-
 def test_grug_gated_norm_matches_reference_math():
     module = GrugMoeGatedNorm(
         hidden_dim=2,
@@ -561,12 +530,18 @@ def test_grug_moe_runtime_info_reports_worker_local_ep_contract():
     )
     model = SimpleNamespace(
         layers=[layer],
+        start_layer=0,
+        end_layer=1,
     )
     vllm_config = SimpleNamespace()
 
     info = get_grug_moe_runtime_info(vllm_config, model)
 
     assert info["tp_size"] == 1
+    assert info["pp_size"] == 1
+    assert info["pp_rank"] == 0
+    assert info["start_layer"] == 0
+    assert info["end_layer"] == 1
     assert info["dp_size"] == 1
     assert info["ep_size"] == 1
     assert info["use_ep"] is False
