@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Serve a model with this fork's OpenAI server and gate the result.
 
-Runs *inside* the nightly's Iris GPU job (see .github/workflows/marin-nightly.yaml),
-against a vLLM built from the fork commit under test. Boots `vllm serve`, waits for
-the server to report ready, sends a fixed prompt set, and compares the run against a
-checked-in spec: every prompt must come back with a non-empty answer of at least
+Runs inside an Iris GPU job against either a vLLM built from the fork commit under
+test or a cleanly installed release wheel. Boots `vllm serve`, waits for the server
+to report ready, sends a fixed prompt set, and compares the run against a checked-in
+spec: every prompt must come back with a non-empty answer of at least
 `min_completion_tokens`, and decode throughput must clear the spec's floor.
 
 Deliberately stdlib-only and it never imports vllm: it talks to the server over HTTP,
@@ -21,6 +21,8 @@ import contextlib
 import json
 import logging
 import os
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -98,21 +100,8 @@ def post_json(url: str, payload: dict, timeout: float) -> dict:
         return json.loads(response.read())
 
 
-@contextlib.contextmanager
-def serve(model: str, port: int, startup_timeout: float) -> Iterator[str]:
-    """Run `vllm serve` for the duration of the block, yielding its base URL.
-
-    Args:
-        model: HF model id to serve.
-        port: Port for the OpenAI server to listen on.
-        startup_timeout: Seconds to wait for the server to report ready.
-
-    Yields:
-        The server's OpenAI base URL.
-
-    Raises:
-        RuntimeError: If the server exits or fails to become ready in time.
-    """
+def server_command(model: str, port: int, attention_backend: str | None) -> list[str]:
+    """Build the OpenAI server command for this smoke."""
     command = [
         sys.executable,
         "-m",
@@ -124,19 +113,69 @@ def serve(model: str, port: int, startup_timeout: float) -> Iterator[str]:
         "--max-model-len",
         "4096",
     ]
+    if attention_backend is not None:
+        command.extend(("--attention-backend", attention_backend))
+    return command
+
+
+def pick_free_port() -> int:
+    """Return a currently-free localhost TCP port.
+
+    The GB200 validation lane runs with host networking, so a fixed serve port
+    collides with anything already bound on the node (including a prior run's
+    server that outlived its job). Letting the kernel assign a free port avoids
+    that class of "address already in use" startup failure.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _terminate_process_group(server: subprocess.Popen) -> None:
+    """Stop the server and every process in its group, escalating to SIGKILL."""
+    for sig, timeout in ((signal.SIGTERM, 60), (signal.SIGKILL, 60)):
+        if server.poll() is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(os.getpgid(server.pid), sig)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            server.wait(timeout=timeout)
+
+
+@contextlib.contextmanager
+def serve(
+    model: str,
+    port: int,
+    startup_timeout: float,
+    attention_backend: str | None,
+) -> Iterator[str]:
+    """Run `vllm serve` for the duration of the block, yielding its base URL.
+
+    Args:
+        model: HF model id to serve.
+        port: Port for the OpenAI server to listen on.
+        startup_timeout: Seconds to wait for the server to report ready.
+        attention_backend: Explicit vLLM attention backend, or auto-selection when
+            unset.
+
+    Yields:
+        The server's OpenAI base URL.
+
+    Raises:
+        RuntimeError: If the server exits or fails to become ready in time.
+    """
+    command = server_command(model, port, attention_backend)
     logger.info("starting server: %s", " ".join(command))
-    server = subprocess.Popen(command)
+    # Own a fresh process group so cleanup reaps vLLM's API-server and engine-core
+    # children, not just the launcher. A leaked child keeps the serve port bound and
+    # makes the next run on the same node fail with "address already in use".
+    server = subprocess.Popen(command, start_new_session=True)
     try:
         base_url = f"http://127.0.0.1:{port}/v1"
         wait_until_ready(server, base_url, startup_timeout)
         yield base_url
     finally:
-        server.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            server.wait(timeout=60)
-        if server.poll() is None:
-            server.kill()
-            server.wait(timeout=60)
+        _terminate_process_group(server)
 
 
 def wait_until_ready(server: subprocess.Popen, base_url: str, timeout: float) -> None:
@@ -252,7 +291,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec", type=Path, required=True, help="Path to the spec.")
     parser.add_argument("--model", help="Override the model id in the spec.")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Serve port; 0 (default) lets the kernel pick a free one.",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        help="Pass an explicit attention backend to vLLM instead of auto-selecting.",
+    )
     parser.add_argument(
         "--startup-timeout",
         type=float,
@@ -264,16 +312,30 @@ def main() -> int:
         action="store_true",
         help="Rewrite the spec from this run instead of gating against it.",
     )
+    parser.add_argument(
+        "--result-json",
+        type=Path,
+        help="Write the observed serving metrics as JSON.",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
     spec = GateSpec.load(args.spec)
     model = args.model or spec.model
+    port = args.port or pick_free_port()
 
-    with serve(model, args.port, args.startup_timeout) as base_url:
+    with serve(
+        model,
+        port,
+        args.startup_timeout,
+        args.attention_backend,
+    ) as base_url:
         result = run_prompts(base_url, model)
 
     logger.info("result: %s", result)
+
+    if args.result_json is not None:
+        args.result_json.write_text(json.dumps(asdict(result), indent=2) + "\n")
 
     if args.record:
         record(args.spec, spec, result, model)
