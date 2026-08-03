@@ -24,6 +24,9 @@ concurrency:
   group: marin-ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  UV_VERSION: "0.11.21"
+
 jobs:
   marin-precommit:
     runs-on: ubuntu-latest
@@ -36,7 +39,7 @@ jobs:
           # GitHub /releases/latest API for "latest", which is rate-limited and outage
           # prone and has flaked this job ("Could not determine uv version ... Falling
           # back to latest. Getting latest version from GitHub API").
-          version: "0.11.21"
+          version: ${{ env.UV_VERSION }}
 
       - name: Lint the Marin delta
         run: uv run infra/pre-commit.py --all-files
@@ -56,7 +59,7 @@ jobs:
         with:
           # Pin uv to avoid setup-uv's flaky GitHub /releases/latest lookup (see the
           # marin-precommit job above).
-          version: "0.11.21"
+          version: ${{ env.UV_VERSION }}
           enable-cache: true
 
       - name: Install vLLM (python-only, CPU)
@@ -68,3 +71,17 @@ jobs:
 
       - name: Check the GrugMoE delta resolves against this base
         run: .venv/bin/python infra/ci/delta_smoke.py
+
+  release-metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Test GPU release metadata and promotion gates
+        run: >-
+          uv run --python 3.12 --no-project --with pytest
+          python -m pytest infra/release/tests -v
