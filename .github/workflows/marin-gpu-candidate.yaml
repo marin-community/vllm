@@ -1,0 +1,288 @@
+name: Marin vLLM GPU Candidate
+
+# Marin fork only. Build one immutable candidate from every merged main commit.
+# GPU validation and release promotion live in marin-gpu-release.yaml.
+
+on:
+  push:
+    branches: [main]
+    # These paths do not alter packaged wheel bytes. Candidate-workflow changes
+    # remain testable through workflow_dispatch.
+    paths-ignore:
+      - ".github/workflows/marin-ci.yaml"
+      - ".github/workflows/marin-gpu-candidate.yaml"
+      - ".github/workflows/marin-gpu-release.yaml"
+      - "infra/release/gpu_validation.py"
+      - "infra/release/tests/**"
+  workflow_dispatch:
+
+concurrency:
+  group: marin-vllm-gpu-candidate-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_CONFIG: infra/release/config.json
+  UV_VERSION: "0.11.21"
+
+jobs:
+  prepare:
+    name: Resolve build matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      candidate_tag: ${{ steps.source.outputs.candidate_tag }}
+      created_at: ${{ steps.source.outputs.created_at }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Create the metadata environment
+        run: uv venv --python 3.12
+
+      - name: Read the release platforms
+        id: matrix
+        run: |
+          echo "matrix=$(.venv/bin/python infra/release/gpu_release.py build-matrix --config "$RELEASE_CONFIG")" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the immutable candidate identity
+        id: source
+        run: |
+          SHORT_SHA=$(git rev-parse --short=12 "$GITHUB_SHA")
+          CREATED_AT=$(git show -s --format=%cI "$GITHUB_SHA")
+          {
+            echo "candidate_tag=marin-vllm-gpu-candidate-${SHORT_SHA}"
+            echo "created_at=${CREATED_AT}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.architecture }} wheel
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 480
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKER_BUILD_SUMMARY: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reclaim x86_64 runner disk and add swap
+        if: matrix.architecture == 'x86_64'
+        run: |
+          # The CUDA-13 compile peaks past the runner's ~16GB RAM and OOM-kills the
+          # runner agent mid-build (frozen step, no logs). Free disk and back the
+          # memory spikes with a large swapfile so the build fits the standard runner.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 32G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          df -h /
+          free -h
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Create the metadata environment
+        run: uv venv --python 3.12
+
+      - name: Resolve source and builder provenance
+        id: provenance
+        run: |
+          git remote add upstream https://github.com/vllm-project/vllm.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/vllm-project/vllm.git
+          git fetch --quiet --no-tags upstream main
+          UPSTREAM_BASE=$(git merge-base upstream/main "$GITHUB_SHA")
+
+          VERSION_DATE=$(date -u -d "${{ needs.prepare.outputs.created_at }}" +%Y%m%d)
+          VERSION_TAG="v0.0.0.dev${VERSION_DATE}+marin.$(git rev-parse --short=12 "$GITHUB_SHA")"
+          while read -r tag; do
+            [[ -z "$tag" ]] || git tag --delete "$tag"
+          done < <(git tag --points-at "$GITHUB_SHA")
+          git tag "$VERSION_TAG" "$GITHUB_SHA"
+
+          {
+            echo "upstream_base=${UPSTREAM_BASE}"
+            echo "base_image_digest=${{ matrix.build_base_image }}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Persist the compiler cache (compact object outputs, not the multi-GB base
+      # layers) across runs. Our overlay only touches Python, so at a fixed base an
+      # overlay-only rebuild is an all-hit ccache pass that finishes in minutes; the
+      # first build at a new base is a full cold compile that seeds the cache. Both
+      # steps are best-effort so a cache hiccup never fails the pin-critical build.
+      - name: Restore the CUDA compile cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ccache-cache
+          key: marin-vllm-cu130-ccache-${{ matrix.architecture }}-${{ github.sha }}
+          restore-keys: |
+            marin-vllm-cu130-ccache-${{ matrix.architecture }}-
+
+      - name: Load the compile cache into the builder
+        continue-on-error: true
+        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+        with:
+          cache-map: |
+            {
+              "ccache-cache": "/root/.cache/ccache"
+            }
+
+      - name: Build and export the CUDA 13.0 wheel
+        run: |
+          mkdir -p artifacts
+          docker buildx build \
+            --target marin-wheel-export \
+            --output type=local,dest=artifacts \
+            --build-arg BUILD_OS=manylinux \
+            --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
+            --build-arg CUDA_VERSION="${{ matrix.cuda_version }}" \
+            --build-arg PYTHON_VERSION="${{ matrix.python_version }}" \
+            --build-arg torch_cuda_arch_list="${{ matrix.sm_targets }}" \
+            --build-arg max_jobs="${{ matrix.max_jobs }}" \
+            --build-arg VLLM_MAX_SIZE_MB="${{ matrix.max_wheel_size_mb }}" \
+            --build-arg nvcc_threads="${{ matrix.nvcc_threads }}" \
+            --build-arg GIT_REPO_CHECK=1 \
+            --build-arg RUN_WHEEL_CHECK=true \
+            --progress plain \
+            -f docker/Dockerfile .
+
+      - name: Tag the wheel
+        run: |
+          source .buildkite/scripts/lib/manylinux.sh
+          WHEELS=(artifacts/dist/*.whl)
+          if [[ ${#WHEELS[@]} -ne 1 ]]; then
+            echo "Expected one wheel, found ${#WHEELS[@]}" >&2
+            exit 1
+          fi
+          apply_manylinux_tag "${WHEELS[0]}"
+
+      - name: Inspect wheel metadata and contents
+        run: |
+          WHEELS=(artifacts/dist/*.whl)
+          .venv/bin/python infra/release/gpu_release.py inspect-wheel \
+            --config "$RELEASE_CONFIG" \
+            --wheel "${WHEELS[0]}" \
+            --architecture "${{ matrix.architecture }}" \
+            --fork-commit "$GITHUB_SHA" \
+            --upstream-base "${{ steps.provenance.outputs.upstream_base }}" \
+            --built-at "${{ steps.provenance.outputs.built_at }}" \
+            --base-image "${{ matrix.build_base_image }}" \
+            --base-image-digest "${{ steps.provenance.outputs.base_image_digest }}" \
+            --output "artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json"
+          mv "${WHEELS[0]}" artifacts/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marin-vllm-gpu-candidate-${{ matrix.architecture }}
+          path: |
+            artifacts/*.whl
+            artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish immutable candidate
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Create the metadata environment
+        run: uv venv --python 3.12
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: marin-vllm-gpu-candidate-*
+          path: candidate
+          merge-multiple: true
+
+      - name: Assemble the candidate manifest
+        run: |
+          FRAGMENT_ARGS=()
+          while IFS= read -r fragment; do
+            FRAGMENT_ARGS+=(--fragment "$fragment")
+          done < <(find candidate -maxdepth 1 -name '*-fragment.json' -print | sort)
+          .venv/bin/python infra/release/gpu_release.py assemble-candidate \
+            --config "$RELEASE_CONFIG" \
+            "${FRAGMENT_ARGS[@]}" \
+            --repository "$GITHUB_REPOSITORY" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --created-at "${{ needs.prepare.outputs.created_at }}" \
+            --output candidate/marin-vllm-gpu-manifest.json
+          .venv/bin/python infra/release/gpu_release.py verify-assets \
+            --manifest candidate/marin-vllm-gpu-manifest.json \
+            --directory candidate \
+            --config "$RELEASE_CONFIG"
+          .venv/bin/python infra/release/gpu_release.py release-notes \
+            --manifest candidate/marin-vllm-gpu-manifest.json \
+            --output candidate-notes.md
+
+      - name: Check for an existing immutable candidate
+        id: existing
+        run: |
+          if gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            mkdir existing
+            gh release download "$CANDIDATE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir existing
+            .venv/bin/python infra/release/gpu_release.py verify-assets \
+              --manifest existing/marin-vllm-gpu-manifest.json \
+              --directory existing \
+              --config "$RELEASE_CONFIG"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish candidate assets once
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          gh release create "$CANDIDATE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Marin vLLM GPU candidate $(git rev-parse --short=12 "$GITHUB_SHA")" \
+            --notes-file candidate-notes.md \
+            --prerelease \
+            candidate/*.whl \
+            candidate/marin-vllm-gpu-manifest.json
+
+      - name: Verify published candidate assets
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          mkdir published
+          gh release download "$CANDIDATE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir published
+          .venv/bin/python infra/release/gpu_release.py verify-assets \
+            --manifest published/marin-vllm-gpu-manifest.json \
+            --directory published \
+            --config "$RELEASE_CONFIG"
