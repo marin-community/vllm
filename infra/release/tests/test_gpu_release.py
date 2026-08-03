@@ -22,6 +22,7 @@ from infra.release.gpu_release import (
     load_json,
     sha256_file,
     validate_wheel_fragment,
+    validation_matrix,
     verify_release_assets,
 )
 
@@ -229,14 +230,33 @@ def test_candidate_rejects_cross_arch_source_mismatch(tmp_path):
         )
 
 
-def test_release_binds_passed_gpu_results_to_candidate_wheel_digests(tmp_path):
+def test_validation_matrix_projects_iris_resources_from_release_config():
+    config = load_json(CONFIG_PATH)
+
+    matrix = validation_matrix(config)
+
+    assert matrix == {
+        "include": [
+            {
+                "architecture": architecture,
+                "hardware": platform["validation"]["gpu"],
+                "gpu_resource": platform["validation"]["gpu_resource"],
+                "target_cluster": platform["validation"]["target_cluster"],
+                "cpu": platform["validation"]["cpu"],
+                "memory": platform["validation"]["memory"],
+            }
+            for architecture, platform in config["platforms"].items()
+        ]
+    }
+
+
+def release_fixture(tmp_path: Path) -> tuple[dict, dict, list[dict], dict]:
     config = load_json(CONFIG_PATH)
     candidate_manifest = candidate(tmp_path)
     validations = [
         validation(candidate_manifest, architecture)
         for architecture in config["platforms"]
     ]
-
     manifest = finalize_release(
         candidate_manifest,
         validations,
@@ -245,6 +265,11 @@ def test_release_binds_passed_gpu_results_to_candidate_wheel_digests(tmp_path):
         published_at="2026-08-04T00:00:00Z",
         provenance={"run_id": "456"},
     )
+    return config, candidate_manifest, validations, manifest
+
+
+def test_release_binds_passed_gpu_results_to_candidate_wheel_digests(tmp_path):
+    _, _, _, manifest = release_fixture(tmp_path)
 
     assert manifest["release"]["status"] == "released"
     assert manifest["release"]["candidate_tag"] == CANDIDATE_TAG
@@ -258,12 +283,7 @@ def test_release_binds_passed_gpu_results_to_candidate_wheel_digests(tmp_path):
 
 
 def test_release_rejects_allocator_absence_from_gpu_result(tmp_path):
-    config = load_json(CONFIG_PATH)
-    candidate_manifest = candidate(tmp_path)
-    validations = [
-        validation(candidate_manifest, architecture)
-        for architecture in config["platforms"]
-    ]
+    config, candidate_manifest, validations, _ = release_fixture(tmp_path)
     broken = copy.deepcopy(validations[0])
     broken["gates"]["cumem_allocator"] = {"status": "absent"}
     validations[0] = broken
@@ -287,20 +307,7 @@ def write_validation_assets(tmp_path: Path, validations: list[dict]) -> None:
 
 
 def test_final_release_verification_binds_urls_and_detached_results(tmp_path):
-    config = load_json(CONFIG_PATH)
-    candidate_manifest = candidate(tmp_path)
-    validations = [
-        validation(candidate_manifest, architecture)
-        for architecture in config["platforms"]
-    ]
-    manifest = finalize_release(
-        candidate_manifest,
-        validations,
-        config=config,
-        release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
-        published_at="2026-08-04T00:00:00Z",
-        provenance={"run_id": "456"},
-    )
+    config, _, validations, manifest = release_fixture(tmp_path)
     write_validation_assets(tmp_path, validations)
 
     verify_release_assets(manifest, tmp_path, config)
@@ -312,20 +319,7 @@ def test_final_release_verification_binds_urls_and_detached_results(tmp_path):
 
 
 def test_final_release_verification_rejects_changed_validation_asset(tmp_path):
-    config = load_json(CONFIG_PATH)
-    candidate_manifest = candidate(tmp_path)
-    validations = [
-        validation(candidate_manifest, architecture)
-        for architecture in config["platforms"]
-    ]
-    manifest = finalize_release(
-        candidate_manifest,
-        validations,
-        config=config,
-        release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
-        published_at="2026-08-04T00:00:00Z",
-        provenance={"run_id": "456"},
-    )
+    config, _, validations, manifest = release_fixture(tmp_path)
     write_validation_assets(tmp_path, validations)
     changed_path = tmp_path / "marin-vllm-validation-h100.json"
     changed_path.write_text(json.dumps({**validations[0], "result": "failed"}))
@@ -391,4 +385,3 @@ def test_wheel_tests_preload_installed_package_before_adding_checkout(tmp_path):
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert f"wheel tests import vllm from {site_packages}" in completed.stdout

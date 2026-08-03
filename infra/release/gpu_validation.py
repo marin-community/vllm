@@ -23,8 +23,13 @@ from pathlib import Path
 from typing import Any
 
 from gpu_release import (
+    CUMEM_GATE,
+    DISTRIBUTION_GATE,
     GRUG_ARCHITECTURE,
+    SERVE_GATE,
+    SOURCE_TESTS_GATE,
     VALIDATION_SENTINEL,
+    WHEEL_SHA_GATE,
     load_json,
     sha256_file,
     validate_candidate,
@@ -105,20 +110,32 @@ def initial_result(
         "hardware": {"requested": hardware},
         "environment": {"task_image": task_image},
         "gates": {
-            "wheel_sha256": gate("not_run"),
-            "distribution_metadata": gate("not_run"),
+            WHEEL_SHA_GATE: gate("not_run"),
+            DISTRIBUTION_GATE: gate("not_run"),
             "vllm._C": gate("not_run"),
             GRUG_ARCHITECTURE: gate("not_run"),
-            "cumem_allocator": gate("not_run"),
-            "source_tests": gate("not_run"),
-            "serve_smoke": gate("not_run"),
+            CUMEM_GATE: gate("not_run"),
+            SOURCE_TESTS_GATE: gate("not_run"),
+            SERVE_GATE: gate("not_run"),
         },
         "result": "failed",
     }
 
 
-def installed_probe(args: argparse.Namespace) -> int:
-    import torch
+def installed_vllm_path(source_root: Path) -> Path:
+    """Import vllm and require its package to live outside the checkout."""
+    import vllm  # noqa: PLC0415
+
+    package_path = Path(vllm.__file__).resolve()
+    if package_path.is_relative_to(source_root.resolve()):
+        raise ValidationFailure(
+            f"vllm imported from source checkout {package_path}, not the wheel"
+        )
+    return package_path
+
+
+def probe_installed(args: argparse.Namespace) -> int:
+    import torch  # noqa: PLC0415
 
     result: dict[str, Any] = {
         "environment": {
@@ -129,22 +146,16 @@ def installed_probe(args: argparse.Namespace) -> int:
         },
         "hardware": {},
         "gates": {
-            "distribution_metadata": gate("not_run"),
+            DISTRIBUTION_GATE: gate("not_run"),
             "vllm._C": gate("not_run"),
             GRUG_ARCHITECTURE: gate("not_run"),
-            "cumem_allocator": gate("not_run"),
+            CUMEM_GATE: gate("not_run"),
         },
     }
     failed = False
     try:
-        vllm = importlib.import_module("vllm")
-        source_root = args.source_root.resolve()
-        package_path = Path(vllm.__file__).resolve()
+        package_path = installed_vllm_path(args.source_root)
         result["environment"]["vllm_package_path"] = str(package_path)
-        if package_path.is_relative_to(source_root):
-            raise ValidationFailure(
-                f"vllm imported from source checkout {package_path}, not the wheel"
-            )
         distribution = metadata.distribution(args.distribution)
         actual_name = distribution.metadata["Name"]
         actual_version = distribution.version
@@ -161,10 +172,10 @@ def installed_probe(args: argparse.Namespace) -> int:
             raise ValidationFailure(
                 f"Torch CUDA runtime {torch.version.cuda}, expected {args.cuda_runtime}"
             )
-        result["gates"]["distribution_metadata"] = gate("passed")
+        result["gates"][DISTRIBUTION_GATE] = gate("passed")
     except Exception as exc:
         failed = True
-        result["gates"]["distribution_metadata"] = gate("failed", str(exc))
+        result["gates"][DISTRIBUTION_GATE] = gate("failed", str(exc))
 
     if not torch.cuda.is_available():
         failed = True
@@ -205,7 +216,7 @@ def installed_probe(args: argparse.Namespace) -> int:
 
         if not cumem_available:
             failed = True
-            result["gates"]["cumem_allocator"] = gate(
+            result["gates"][CUMEM_GATE] = gate(
                 "absent", "vllm.device_allocator.cumem reported unavailable"
             )
         else:
@@ -226,17 +237,17 @@ def installed_probe(args: argparse.Namespace) -> int:
                 del tensor
                 gc.collect()
                 torch.cuda.synchronize()
-            result["gates"]["cumem_allocator"] = {
+            result["gates"][CUMEM_GATE] = {
                 "status": "passed",
                 "allocated_bytes": usage,
                 "checksum": checksum,
             }
     except ModuleNotFoundError as exc:
         failed = True
-        result["gates"]["cumem_allocator"] = gate("absent", repr(exc))
+        result["gates"][CUMEM_GATE] = gate("absent", repr(exc))
     except Exception as exc:
         failed = True
-        result["gates"]["cumem_allocator"] = gate("failed", repr(exc))
+        result["gates"][CUMEM_GATE] = gate("failed", repr(exc))
 
     write_json(args.output, result)
     return int(failed)
@@ -244,21 +255,17 @@ def installed_probe(args: argparse.Namespace) -> int:
 
 def run_wheel_tests(args: argparse.Namespace) -> int:
     """Run checkout test modules against the already imported wheel package."""
-    import vllm
-
     source_root = args.source_root.resolve()
-    package_path = Path(vllm.__file__).resolve()
-    if package_path.is_relative_to(source_root):
-        print(
-            f"error: vllm imported from source checkout {package_path}",
-            file=sys.stderr,
-        )
+    try:
+        package_path = installed_vllm_path(source_root)
+    except ValidationFailure as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"::: wheel tests import vllm from {package_path}", flush=True)
 
     # `vllm` is now fixed in sys.modules with its site-packages __path__. Add the
     # checkout only so pytest can import the candidate commit's `tests` package.
-    import pytest
+    import pytest  # noqa: PLC0415
 
     sys.path.insert(0, str(source_root))
     os.chdir(source_root)
@@ -271,6 +278,152 @@ def run_wheel_tests(args: argparse.Namespace) -> int:
 def emit_result(result: dict[str, Any]) -> None:
     payload = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
     print(VALIDATION_SENTINEL + base64.b64encode(payload).decode(), flush=True)
+
+
+def install_wheel_environment(
+    workdir: Path,
+    wheel: Path,
+    config: dict[str, Any],
+    environment: dict[str, str],
+) -> Path:
+    virtual_environment = workdir / "venv"
+    require_command(
+        [
+            "uv",
+            "venv",
+            "--python",
+            config["python_version"],
+            str(virtual_environment),
+        ],
+        cwd=workdir,
+        environment=environment,
+        phase="virtual environment creation",
+    )
+    python = virtual_environment / "bin/python"
+    require_command(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--index-url",
+            config["torch_index_url"],
+            f"torch=={config['torch_version']}",
+        ],
+        cwd=workdir,
+        environment=environment,
+        phase="Torch installation",
+    )
+    require_command(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--index-strategy",
+            "unsafe-best-match",
+            "--extra-index-url",
+            config["torch_index_url"],
+            str(wheel),
+            "pytest",
+            "tblib",
+        ],
+        cwd=workdir,
+        environment=environment,
+        phase="wheel installation",
+    )
+    return python
+
+
+def run_installed_probe(
+    python: Path,
+    workdir: Path,
+    repo_root: Path,
+    candidate: dict[str, Any],
+    config: dict[str, Any],
+    expected_validation: dict[str, Any],
+    environment: dict[str, str],
+) -> tuple[dict[str, Any], int]:
+    probe_path = workdir / "installed-probe.json"
+    return_code = run_command(
+        [
+            str(python),
+            str(Path(__file__).resolve()),
+            "probe-installed",
+            "--distribution",
+            candidate["distribution"]["name"],
+            "--version",
+            candidate["distribution"]["version"],
+            "--torch-version",
+            config["torch_version"],
+            "--cuda-runtime",
+            config["cuda_runtime_version"],
+            "--compute-capability",
+            expected_validation["compute_capability"],
+            "--source-root",
+            str(repo_root),
+            "--output",
+            str(probe_path),
+        ],
+        cwd=workdir,
+        environment=environment,
+    )
+    if not probe_path.is_file():
+        raise ValidationFailure("installed-wheel probe produced no result")
+    return load_json(probe_path), return_code
+
+
+def run_source_suite(
+    python: Path, workdir: Path, repo_root: Path, environment: dict[str, str]
+) -> None:
+    command = [
+        str(python),
+        str(Path(__file__).resolve()),
+        "run-wheel-tests",
+        "--source-root",
+        str(repo_root),
+        "--",
+        "-v",
+        *SOURCE_TESTS,
+    ]
+    for test in SOURCE_TEST_DESELECTS:
+        command.extend(["--deselect", test])
+    return_code = run_command(command, cwd=workdir, environment=environment)
+    if return_code != 0:
+        raise ValidationFailure(f"source behavior tests exited with code {return_code}")
+
+
+def run_serving_smoke(
+    python: Path,
+    workdir: Path,
+    repo_root: Path,
+    model: str,
+    spec: str,
+    environment: dict[str, str],
+) -> dict[str, Any]:
+    result_path = workdir / "serve-smoke.json"
+    return_code = run_command(
+        [
+            str(python),
+            str(repo_root / "infra/nightly/gpu_serve_smoke.py"),
+            "--model",
+            model,
+            "--spec",
+            str(repo_root / spec),
+            "--result-json",
+            str(result_path),
+        ],
+        cwd=workdir,
+        environment=environment,
+    )
+    if not result_path.is_file():
+        raise ValidationFailure("serve smoke produced no result")
+    metrics = load_json(result_path)
+    if return_code != 0:
+        raise ValidationFailure(f"serve smoke exited with code {return_code}")
+    return metrics
 
 
 def validate(args: argparse.Namespace) -> int:
@@ -310,13 +463,13 @@ def validate(args: argparse.Namespace) -> int:
             actual_digest = sha256_file(wheel)
             expected_digest = platform_record["wheel"]["sha256"]
             if actual_digest != expected_digest:
-                result["gates"]["wheel_sha256"] = gate(
+                result["gates"][WHEEL_SHA_GATE] = gate(
                     "failed", f"{actual_digest} != {expected_digest}"
                 )
                 raise ValidationFailure(
                     "downloaded wheel SHA-256 does not match manifest"
                 )
-            result["gates"]["wheel_sha256"] = gate("passed")
+            result["gates"][WHEEL_SHA_GATE] = gate("passed")
 
             environment = os.environ.copy()
             environment.update(
@@ -325,81 +478,18 @@ def validate(args: argparse.Namespace) -> int:
                     "VLLM_USE_FLASHINFER_SAMPLER": "0",
                 }
             )
-            virtual_environment = workdir / "venv"
-            require_command(
-                [
-                    "uv",
-                    "venv",
-                    "--python",
-                    config["python_version"],
-                    str(virtual_environment),
-                ],
-                cwd=workdir,
-                environment=environment,
-                phase="virtual environment creation",
+            python = install_wheel_environment(
+                workdir, wheel, config, environment
             )
-            python = virtual_environment / "bin/python"
-            require_command(
-                [
-                    "uv",
-                    "pip",
-                    "install",
-                    "--python",
-                    str(python),
-                    "--index-url",
-                    config["torch_index_url"],
-                    f"torch=={config['torch_version']}",
-                ],
-                cwd=workdir,
-                environment=environment,
-                phase="Torch installation",
+            probe, probe_return_code = run_installed_probe(
+                python,
+                workdir,
+                repo_root,
+                candidate,
+                config,
+                expected_validation,
+                environment,
             )
-            require_command(
-                [
-                    "uv",
-                    "pip",
-                    "install",
-                    "--python",
-                    str(python),
-                    "--index-strategy",
-                    "unsafe-best-match",
-                    "--extra-index-url",
-                    config["torch_index_url"],
-                    str(wheel),
-                    "pytest",
-                    "tblib",
-                ],
-                cwd=workdir,
-                environment=environment,
-                phase="wheel installation",
-            )
-
-            probe_path = workdir / "installed-probe.json"
-            probe_command = [
-                str(python),
-                str(Path(__file__).resolve()),
-                "probe-installed",
-                "--distribution",
-                candidate["distribution"]["name"],
-                "--version",
-                candidate["distribution"]["version"],
-                "--torch-version",
-                config["torch_version"],
-                "--cuda-runtime",
-                config["cuda_runtime_version"],
-                "--compute-capability",
-                expected_validation["compute_capability"],
-                "--source-root",
-                str(repo_root),
-                "--output",
-                str(probe_path),
-            ]
-            probe_return_code = run_command(
-                probe_command, cwd=workdir, environment=environment
-            )
-            if not probe_path.is_file():
-                raise ValidationFailure("installed-wheel probe produced no result")
-            probe = load_json(probe_path)
             result["environment"].update(probe.get("environment", {}))
             result["hardware"].update(probe.get("hardware", {}))
             result["gates"].update(probe.get("gates", {}))
@@ -409,62 +499,33 @@ def validate(args: argparse.Namespace) -> int:
                 )
 
             if expected_validation["run_source_tests"]:
-                source_test_command = [
-                    str(python),
-                    str(Path(__file__).resolve()),
-                    "run-wheel-tests",
-                    "--source-root",
-                    str(repo_root),
-                    "--",
-                    "-v",
-                    *SOURCE_TESTS,
-                ]
-                for test in SOURCE_TEST_DESELECTS:
-                    source_test_command.extend(["--deselect", test])
-                source_test_return_code = run_command(
-                    source_test_command,
-                    cwd=workdir,
-                    environment=environment,
-                )
-                if source_test_return_code != 0:
-                    result["gates"]["source_tests"] = gate(
-                        "failed", f"pytest exited with code {source_test_return_code}"
-                    )
-                    raise ValidationFailure("source behavior tests failed")
-                result["gates"]["source_tests"] = gate("passed")
+                try:
+                    run_source_suite(python, workdir, repo_root, environment)
+                except ValidationFailure as exc:
+                    result["gates"][SOURCE_TESTS_GATE] = gate("failed", str(exc))
+                    raise
+                result["gates"][SOURCE_TESTS_GATE] = gate("passed")
             else:
-                result["gates"]["source_tests"] = gate(
+                result["gates"][SOURCE_TESTS_GATE] = gate(
                     "not_run", "source behavior suite runs on the H100 lane"
                 )
 
-            serving_result = workdir / "serve-smoke.json"
-            serve_return_code = run_command(
-                [
-                    str(python),
-                    str(repo_root / "infra/nightly/gpu_serve_smoke.py"),
-                    "--model",
+            try:
+                serve_metrics = run_serving_smoke(
+                    python,
+                    workdir,
+                    repo_root,
                     args.model,
-                    "--spec",
-                    str(repo_root / expected_validation["spec"]),
-                    "--result-json",
-                    str(serving_result),
-                ],
-                cwd=workdir,
-                environment=environment,
-            )
-            if serving_result.is_file():
-                result["gates"]["serve_smoke"] = {
-                    "status": "passed" if serve_return_code == 0 else "failed",
-                    "metrics": load_json(serving_result),
-                }
-            else:
-                result["gates"]["serve_smoke"] = gate(
-                    "failed", "serve smoke produced no result"
+                    expected_validation["spec"],
+                    environment,
                 )
-            if serve_return_code != 0:
-                raise ValidationFailure(
-                    f"serve smoke exited with code {serve_return_code}"
-                )
+            except ValidationFailure as exc:
+                result["gates"][SERVE_GATE] = gate("failed", str(exc))
+                raise
+            result["gates"][SERVE_GATE] = {
+                "status": "passed",
+                "metrics": serve_metrics,
+            }
 
         result["result"] = "passed"
     except Exception as exc:
@@ -505,7 +566,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.command == "probe-installed":
-        return installed_probe(args)
+        return probe_installed(args)
     if args.command == "run-wheel-tests":
         return run_wheel_tests(args)
     if args.command == "validate":

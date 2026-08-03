@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Serve a model with this fork's OpenAI server and gate the result.
 
-Runs *inside* the nightly's Iris GPU job (see .github/workflows/marin-nightly.yaml),
-against a vLLM built from the fork commit under test. Boots `vllm serve`, waits for
-the server to report ready, sends a fixed prompt set, and compares the run against a
-checked-in spec: every prompt must come back with a non-empty answer of at least
+Runs inside an Iris GPU job against either a vLLM built from the fork commit under
+test or a cleanly installed release wheel. Boots `vllm serve`, waits for the server
+to report ready, sends a fixed prompt set, and compares the run against a checked-in
+spec: every prompt must come back with a non-empty answer of at least
 `min_completion_tokens`, and decode throughput must clear the spec's floor.
 
 Deliberately stdlib-only and it never imports vllm: it talks to the server over HTTP,

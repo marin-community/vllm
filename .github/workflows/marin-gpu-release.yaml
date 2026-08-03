@@ -38,6 +38,7 @@ jobs:
       candidate_tag: ${{ steps.candidate.outputs.candidate_tag }}
       release_tag: ${{ steps.candidate.outputs.release_tag }}
       source_commit: ${{ steps.candidate.outputs.source_commit }}
+      validation_matrix: ${{ steps.matrix.outputs.matrix }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -49,6 +50,13 @@ jobs:
 
       - name: Create the metadata environment
         run: uv venv --python 3.12
+
+      - name: Read the validation platforms
+        id: matrix
+        run: |
+          MATRIX=$(.venv/bin/python infra/release/gpu_release.py \
+            validation-matrix --config "$RELEASE_CONFIG")
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
 
       - name: Select and verify candidate
         id: candidate
@@ -116,20 +124,7 @@ jobs:
     if: needs.resolve.outputs.publish == 'true'
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - architecture: x86_64
-            hardware: H100
-            gpu_resource: H100x1
-            target_cluster: cw-rno2a
-            cpu: 8
-            memory: 64GB
-          - architecture: aarch64
-            hardware: GB200
-            gpu_resource: GB200x1
-            target_cluster: cw-us-east-08a
-            cpu: 16
-            memory: 128GB
+      matrix: ${{ fromJSON(needs.resolve.outputs.validation_matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 55
     permissions:

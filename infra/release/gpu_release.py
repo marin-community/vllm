@@ -14,6 +14,8 @@ import os
 import re
 import sys
 import zipfile
+from dataclasses import dataclass
+from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
@@ -26,10 +28,42 @@ SOURCE_REPOSITORY = "https://github.com/marin-community/vllm"
 UPSTREAM_REPOSITORY = "https://github.com/vllm-project/vllm"
 REQUIRED_EXTENSIONS = ("vllm._C", "vllm.cumem_allocator")
 GRUG_ARCHITECTURE = "GrugMoeForCausalLM"
+CANDIDATE_TAG_PREFIX = "marin-vllm-gpu-candidate-"
+RELEASE_TAG_PREFIX = "marin-vllm-gpu-"
+BUILD_ABI_KEYS = (
+    "python_version",
+    "torch_version",
+    "torch_index_url",
+    "cuda_toolkit_version",
+    "cuda_variant",
+)
+RELEASE_ABI_KEYS = (*BUILD_ABI_KEYS, "cuda_runtime_version")
+WHEEL_SHA_GATE = "wheel_sha256"
+DISTRIBUTION_GATE = "distribution_metadata"
+CUMEM_GATE = "cumem_allocator"
+SOURCE_TESTS_GATE = "source_tests"
+SERVE_GATE = "serve_smoke"
+REQUIRED_RUNTIME_GATES = (
+    WHEEL_SHA_GATE,
+    DISTRIBUTION_GATE,
+    "vllm._C",
+    GRUG_ARCHITECTURE,
+    CUMEM_GATE,
+    SERVE_GATE,
+)
 
 
 class ReleaseError(RuntimeError):
     """A release input violates the published artifact contract."""
+
+
+@dataclass(frozen=True)
+class WheelDocument:
+    """Release-relevant records read from one wheel archive."""
+
+    metadata: Message
+    tags: list[str]
+    packaged: dict[str, str]
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -71,7 +105,7 @@ def release_asset_url(repository: str, tag: str, filename: str) -> str:
     )
 
 
-def _wheel_document(wheel: Path) -> tuple[Any, list[str], dict[str, str]]:
+def _wheel_document(wheel: Path) -> WheelDocument:
     with zipfile.ZipFile(wheel) as archive:
         metadata_names = [
             name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
@@ -115,7 +149,7 @@ def _wheel_document(wheel: Path) -> tuple[Any, list[str], dict[str, str]]:
             ),
             GRUG_ARCHITECTURE: grug_state,
         }
-    return metadata, wheel_metadata.get_all("Tag", []), packaged
+    return WheelDocument(metadata, wheel_metadata.get_all("Tag", []), packaged)
 
 
 def inspect_wheel(
@@ -132,7 +166,10 @@ def inspect_wheel(
 ) -> dict[str, Any]:
     if architecture not in config["platforms"]:
         raise ReleaseError(f"unsupported architecture {architecture!r}")
-    metadata, wheel_tags, packaged = _wheel_document(wheel)
+    document = _wheel_document(wheel)
+    metadata = document.metadata
+    wheel_tags = document.tags
+    packaged = document.packaged
     distribution = metadata.get("Name", "")
     expected_distribution = config["distribution_name"]
     if normalized_distribution_name(distribution) != normalized_distribution_name(
@@ -188,11 +225,7 @@ def inspect_wheel(
             "torch_metadata_requirement": config["torch_metadata_requirement"],
         },
         "build": {
-            "python_version": config["python_version"],
-            "torch_version": config["torch_version"],
-            "torch_index_url": config["torch_index_url"],
-            "cuda_toolkit_version": config["cuda_toolkit_version"],
-            "cuda_variant": config["cuda_variant"],
+            **{key: config[key] for key in BUILD_ABI_KEYS},
             "base_image": base_image,
             "base_image_digest": base_image_digest,
             "built_at": built_at,
@@ -213,8 +246,7 @@ def inspect_wheel(
     }
 
 
-def validate_wheel_fragment(fragment: dict[str, Any]) -> None:
-    packaged = fragment["platform"]["packaged"]
+def validate_packaged_contents(packaged: dict[str, str]) -> None:
     absent = [
         name
         for name in (*REQUIRED_EXTENSIONS, GRUG_ARCHITECTURE)
@@ -223,6 +255,10 @@ def validate_wheel_fragment(fragment: dict[str, Any]) -> None:
     if absent:
         states = {name: packaged.get(name, "absent") for name in absent}
         raise ReleaseError(f"required wheel contents are absent: {states}")
+
+
+def validate_wheel_fragment(fragment: dict[str, Any]) -> None:
+    validate_packaged_contents(fragment["platform"]["packaged"])
 
 
 def assemble_candidate(
@@ -257,16 +293,7 @@ def assemble_candidate(
                     f"{architecture} fragment disagrees on {field}: "
                     f"{fragment[field]!r} != {first[field]!r}"
                 )
-        expected_build = {
-            key: first["build"][key]
-            for key in (
-                "python_version",
-                "torch_version",
-                "torch_index_url",
-                "cuda_toolkit_version",
-                "cuda_variant",
-            )
-        }
+        expected_build = {key: first["build"][key] for key in BUILD_ABI_KEYS}
         actual_build = {key: fragment["build"][key] for key in expected_build}
         if actual_build != expected_build:
             raise ReleaseError(f"{architecture} fragment has a different build ABI")
@@ -293,14 +320,7 @@ def assemble_candidate(
         },
         "source": first["source"],
         "distribution": first["distribution"],
-        "abi": {
-            "python_version": config["python_version"],
-            "torch_version": config["torch_version"],
-            "torch_index_url": config["torch_index_url"],
-            "cuda_toolkit_version": config["cuda_toolkit_version"],
-            "cuda_runtime_version": config["cuda_runtime_version"],
-            "cuda_variant": config["cuda_variant"],
-        },
+        "abi": {key: config[key] for key in RELEASE_ABI_KEYS},
         "platforms": platforms,
         "validation": {"status": "pending", "targets": []},
     }
@@ -324,7 +344,7 @@ def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None
         raise ReleaseError("manifest is not a candidate")
     _validate_manifest_common(manifest, config)
     expected_tag = (
-        "marin-vllm-gpu-candidate-" + manifest["source"]["fork_commit"][:12]
+        CANDIDATE_TAG_PREFIX + manifest["source"]["fork_commit"][:12]
     )
     if manifest["release"]["tag"] != expected_tag:
         raise ReleaseError("candidate tag does not match its fork commit")
@@ -352,14 +372,7 @@ def _validate_manifest_common(
             raise ReleaseError(f"source {field} is not a full Git commit")
     if manifest["distribution"]["name"] != config["distribution_name"]:
         raise ReleaseError("distribution name changed")
-    expected_abi = {
-        "python_version": config["python_version"],
-        "torch_version": config["torch_version"],
-        "torch_index_url": config["torch_index_url"],
-        "cuda_toolkit_version": config["cuda_toolkit_version"],
-        "cuda_runtime_version": config["cuda_runtime_version"],
-        "cuda_variant": config["cuda_variant"],
-    }
+    expected_abi = {key: config[key] for key in RELEASE_ABI_KEYS}
     if manifest["abi"] != expected_abi:
         raise ReleaseError("release ABI changed")
     architectures = {item["architecture"] for item in manifest["platforms"]}
@@ -397,14 +410,8 @@ def _validate_manifest_common(
         if re.fullmatch(r"[0-9a-f]{64}", platform["wheel"]["sha256"]) is None:
             raise ReleaseError(f"{architecture} wheel SHA-256 is malformed")
         build = platform["build"]
-        expected_build = {
-            "python_version": config["python_version"],
-            "torch_version": config["torch_version"],
-            "torch_index_url": config["torch_index_url"],
-            "cuda_toolkit_version": config["cuda_toolkit_version"],
-            "cuda_variant": config["cuda_variant"],
-            "base_image": expected_platform["build_base_image"],
-        }
+        expected_build = {key: config[key] for key in BUILD_ABI_KEYS}
+        expected_build["base_image"] = expected_platform["build_base_image"]
         for key, expected in expected_build.items():
             if build.get(key) != expected:
                 raise ReleaseError(f"{architecture} build {key} changed")
@@ -419,10 +426,10 @@ def _validate_manifest_common(
         if provenance.get("system") != "GitHub Actions":
             raise ReleaseError(f"{architecture} build provenance is missing")
         if not provenance.get("run_url", "").startswith(
-            "https://github.com/marin-community/vllm/actions/runs/"
+            f"{SOURCE_REPOSITORY}/actions/runs/"
         ):
             raise ReleaseError(f"{architecture} build run URL is missing")
-        validate_wheel_fragment({"platform": platform})
+        validate_packaged_contents(platform["packaged"])
 
 
 def validate_release(manifest: dict[str, Any], config: dict[str, Any]) -> None:
@@ -431,22 +438,18 @@ def validate_release(manifest: dict[str, Any], config: dict[str, Any]) -> None:
     _validate_manifest_common(manifest, config)
     source_prefix = manifest["source"]["fork_commit"][:12]
     if manifest["release"].get("candidate_tag") != (
-        f"marin-vllm-gpu-candidate-{source_prefix}"
+        f"{CANDIDATE_TAG_PREFIX}{source_prefix}"
     ):
         raise ReleaseError("release names the wrong candidate tag")
     if re.fullmatch(
-        rf"marin-vllm-gpu-[0-9]{{8}}-{source_prefix}",
+        rf"{RELEASE_TAG_PREFIX}[0-9]{{8}}-{source_prefix}",
         manifest["release"]["tag"],
     ) is None:
         raise ReleaseError("release tag does not match its fork commit")
     if manifest["validation"].get("status") != "passed":
         raise ReleaseError("release validation status is not passed")
     validations = manifest["validation"].get("targets", [])
-    by_architecture = {item.get("architecture"): item for item in validations}
-    if len(by_architecture) != len(validations):
-        raise ReleaseError("release contains duplicate validation results")
-    if set(by_architecture) != set(config["platforms"]):
-        raise ReleaseError("release does not contain both GPU validation results")
+    index_validations(validations, config)
 
     candidate = copy.deepcopy(manifest)
     candidate["release"]["tag"] = manifest["release"]["candidate_tag"]
@@ -530,16 +533,9 @@ def validate_validation_result(
         raise ReleaseError(
             f"{architecture} validation did not pass: {result.get('result')!r}"
         )
-    required_gates = [
-        "wheel_sha256",
-        "distribution_metadata",
-        "vllm._C",
-        GRUG_ARCHITECTURE,
-        "cumem_allocator",
-        "serve_smoke",
-    ]
+    required_gates = list(REQUIRED_RUNTIME_GATES)
     if expected_validation["run_source_tests"]:
-        required_gates.append("source_tests")
+        required_gates.append(SOURCE_TESTS_GATE)
     failed = {
         gate: result.get("gates", {}).get(gate, {}).get("status", "absent")
         for gate in required_gates
@@ -547,14 +543,25 @@ def validate_validation_result(
     }
     if failed:
         raise ReleaseError(f"{architecture} validation gates did not pass: {failed}")
-    allocator_gate = result["gates"]["cumem_allocator"]
+    allocator_gate = result["gates"][CUMEM_GATE]
     if allocator_gate.get("allocated_bytes", 0) <= 0:
         raise ReleaseError(f"{architecture} cuMem gate did not allocate memory")
-    serve_metrics = result["gates"]["serve_smoke"].get("metrics", {})
+    serve_metrics = result["gates"][SERVE_GATE].get("metrics", {})
     if serve_metrics.get("completions", 0) <= 0:
         raise ReleaseError(f"{architecture} serving gate has no completions")
     if serve_metrics.get("output_tokens_per_second", 0) <= 0:
         raise ReleaseError(f"{architecture} serving gate has no throughput result")
+
+
+def index_validations(
+    validations: list[dict[str, Any]], config: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    by_architecture = {result.get("architecture"): result for result in validations}
+    if len(by_architecture) != len(validations):
+        raise ReleaseError("release contains duplicate validation results")
+    if set(by_architecture) != set(config["platforms"]):
+        raise ReleaseError("release does not contain both GPU validation results")
+    return by_architecture
 
 
 def finalize_release(
@@ -567,11 +574,7 @@ def finalize_release(
     provenance: dict[str, Any],
 ) -> dict[str, Any]:
     validate_candidate(candidate, config)
-    by_architecture = {result.get("architecture"): result for result in validations}
-    if len(by_architecture) != len(validations):
-        raise ReleaseError("release contains duplicate validation results")
-    if set(by_architecture) != set(config["platforms"]):
-        raise ReleaseError("release does not contain both GPU validation results")
+    by_architecture = index_validations(validations, config)
     for result in validations:
         validate_validation_result(result, candidate, config)
 
@@ -614,13 +617,30 @@ def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     return {"include": includes}
 
 
+def validation_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    includes = []
+    for architecture, platform in config["platforms"].items():
+        validation = platform["validation"]
+        includes.append(
+            {
+                "architecture": architecture,
+                "hardware": validation["gpu"],
+                "gpu_resource": validation["gpu_resource"],
+                "target_cluster": validation["target_cluster"],
+                "cpu": validation["cpu"],
+                "memory": validation["memory"],
+            }
+        )
+    return {"include": includes}
+
+
 def extract_validation(log_path: Path) -> dict[str, Any]:
-    sentinel = None
+    encoded_payload = None
     with log_path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
             if line.startswith(VALIDATION_SENTINEL):
-                sentinel = line.removeprefix(VALIDATION_SENTINEL).strip()
-    if sentinel is None:
+                encoded_payload = line.removeprefix(VALIDATION_SENTINEL).strip()
+    if encoded_payload is None:
         return {
             "schema_version": 1,
             "result": "failed",
@@ -628,7 +648,7 @@ def extract_validation(log_path: Path) -> dict[str, Any]:
             "gates": {},
         }
     try:
-        decoded = base64.b64decode(sentinel, validate=True)
+        decoded = base64.b64decode(encoded_payload, validate=True)
         result = json.loads(decoded)
     except (ValueError, json.JSONDecodeError) as exc:
         raise ReleaseError("GPU validation record is not valid base64 JSON") from exc
@@ -709,6 +729,9 @@ def parse_args() -> argparse.Namespace:
     matrix_parser = subparsers.add_parser("build-matrix")
     matrix_parser.add_argument("--config", type=Path, required=True)
 
+    validation_matrix_parser = subparsers.add_parser("validation-matrix")
+    validation_matrix_parser.add_argument("--config", type=Path, required=True)
+
     inspect_parser = subparsers.add_parser("inspect-wheel")
     inspect_parser.add_argument("--config", type=Path, required=True)
     inspect_parser.add_argument("--wheel", type=Path, required=True)
@@ -776,6 +799,14 @@ def main() -> int:
             print(
                 json.dumps(
                     build_matrix(load_json(args.config)), separators=(",", ":")
+                )
+            )
+            return 0
+        if args.command == "validation-matrix":
+            print(
+                json.dumps(
+                    validation_matrix(load_json(args.config)),
+                    separators=(",", ":"),
                 )
             )
             return 0
