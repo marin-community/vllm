@@ -14,7 +14,7 @@
     "x86_64": {
       "runner": "ubuntu-24.04",
       "build_base_image": "pytorch/manylinux2_28-builder:cuda12.9@sha256:d26cd7a9489b53310296e86042de630ac947e25a71dd24b547b86ca9a0a3fc79",
-      "max_jobs": 1,
+      "max_jobs": 2,
       "nvcc_threads": 1,
       "sm_targets": ["9.0"],
       "validation": {
@@ -31,7 +31,7 @@
     "aarch64": {
       "runner": "ubuntu-24.04-arm",
       "build_base_image": "pytorch/manylinuxaarch64-builder:cuda12.9@sha256:a938397b8896d35d35edc86a402930cc55d12ffc67fe0b4d19a5dff21781d7f4",
-      "max_jobs": 1,
+      "max_jobs": 2,
       "nvcc_threads": 1,
       "sm_targets": ["10.0"],
       "validation": {

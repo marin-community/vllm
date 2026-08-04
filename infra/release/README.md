@@ -22,8 +22,10 @@ Each native wheel contains code for the GPU on which it is promoted: SM90 for
 the x86_64 H100 lane and SM100 for the aarch64 GB200 lane. These are Marin
 deployment artifacts rather than general-purpose vLLM wheels. Limiting the
 targets keeps native compilation within the memory available on GitHub-hosted
-runners; `MAX_JOBS` and `NVCC_THREADS` are both one for the same reason. Add a
-target only with corresponding Iris validation hardware.
+runners. Each runner builds two translation units at a time, with one NVCC
+thread per translation unit. Add a target or increase either concurrency limit
+only with a successful candidate build and corresponding Iris validation
+hardware.
 
 ## Candidate publication
 
