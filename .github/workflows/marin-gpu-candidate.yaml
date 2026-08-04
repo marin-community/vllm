@@ -64,7 +64,6 @@ jobs:
     env:
       DOCKER_BUILDKIT: "1"
       DOCKER_BUILD_SUMMARY: "false"
-      BUILD_IMAGE: marin-vllm-cu129-${{ matrix.architecture }}:${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -93,11 +92,6 @@ jobs:
           git fetch --quiet --no-tags upstream main
           UPSTREAM_BASE=$(git merge-base upstream/main "$GITHUB_SHA")
 
-          docker pull "${{ matrix.build_base_image }}"
-          BASE_IMAGE_DIGEST=$(docker image inspect \
-            --format '{{index .RepoDigests 0}}' \
-            "${{ matrix.build_base_image }}")
-
           VERSION_DATE=$(date -u -d "${{ needs.prepare.outputs.created_at }}" +%Y%m%d)
           VERSION_TAG="v0.0.0.dev${VERSION_DATE}+marin.$(git rev-parse --short=12 "$GITHUB_SHA")"
           while read -r tag; do
@@ -107,16 +101,16 @@ jobs:
 
           {
             echo "upstream_base=${UPSTREAM_BASE}"
-            echo "base_image_digest=${BASE_IMAGE_DIGEST}"
+            echo "base_image_digest=${{ matrix.build_base_image }}"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build the CUDA 12.9 wheel
+      - name: Build and export the CUDA 12.9 wheel
         run: |
+          mkdir -p artifacts
           docker buildx build \
-            --load \
-            --target build \
-            --tag "$BUILD_IMAGE" \
+            --target marin-wheel-export \
+            --output type=local,dest=artifacts \
             --build-arg BUILD_OS=manylinux \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
             --build-arg CUDA_VERSION=12.9.1 \
@@ -132,13 +126,8 @@ jobs:
             --progress plain \
             -f docker/Dockerfile .
 
-      - name: Extract and tag the wheel
+      - name: Tag the wheel
         run: |
-          mkdir -p artifacts/dist
-          CONTAINER_ID=$(docker create "$BUILD_IMAGE")
-          trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
-          docker cp "$CONTAINER_ID:/workspace/dist/." artifacts/dist
-
           source .buildkite/scripts/lib/manylinux.sh
           WHEELS=(artifacts/dist/*.whl)
           if [[ ${#WHEELS[@]} -ne 1 ]]; then

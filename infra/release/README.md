@@ -16,7 +16,9 @@ The x86_64 and aarch64 builds reuse the `build` target in
 [`docker/Dockerfile`](../../docker/Dockerfile). That is the same CUDA 12.9 path
 used by upstream's release pipeline. Release code does not edit
 `requirements/cuda.txt`, `requirements/build/cuda.txt`, or the `vllm`
-distribution metadata.
+distribution metadata. A final scratch stage contains only `/dist`; BuildKit
+exports that directory directly instead of loading the build image into the
+runner's Docker image store.
 
 Each native wheel contains code for the GPU on which it is promoted: SM90 for
 the x86_64 H100 lane and SM100 for the aarch64 GB200 lane. These are Marin
@@ -33,8 +35,10 @@ default because it includes the Blackwell FlashAttention extension; the release
 manifest records its exact byte size and SHA-256.
 
 The x86_64 candidate job removes unused Android, .NET, and GHC toolchains from
-its ephemeral hosted runner before compiling. Without that cleanup, the SM90
-build can exhaust the runner's root filesystem before the wheel is extracted.
+its ephemeral hosted runner before compiling. The wheel-only BuildKit export
+also avoids duplicating the build toolchains and intermediate objects in the
+runner's Docker image store. Together these keep compilation and artifact
+export within the hosted runners' root filesystems.
 
 ## Candidate publication
 
