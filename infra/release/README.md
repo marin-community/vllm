@@ -32,6 +32,10 @@ wheel-size checker. Marin's SM100 wheel exceeds the checker's 500 MiB PyPI
 default because it includes the Blackwell FlashAttention extension; the release
 manifest records its exact byte size and SHA-256.
 
+The x86_64 candidate job removes unused Android, .NET, and GHC toolchains from
+its ephemeral hosted runner before compiling. Without that cleanup, the SM90
+build can exhaust the runner's root filesystem before the wheel is extracted.
+
 ## Candidate publication
 
 [`marin-gpu-candidate.yaml`](../../.github/workflows/marin-gpu-candidate.yaml)
