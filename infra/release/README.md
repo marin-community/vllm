@@ -8,7 +8,7 @@ a moving `latest` alias.
 
 [`config.json`](config.json) is the release ABI contract. It pins CPython 3.12,
 Torch 2.11.0+cu129, CUDA 12.9.1, digest-pinned upstream manylinux builder
-images, SM targets, Iris validation hardware, and the digest-pinned
+images, deployment-specific SM targets, Iris validation hardware, and the digest-pinned
 multi-architecture validation image. Update the config and workflows in one PR
 when an ABI changes.
 
@@ -17,6 +17,13 @@ The x86_64 and aarch64 builds reuse the `build` target in
 used by upstream's release pipeline. Release code does not edit
 `requirements/cuda.txt`, `requirements/build/cuda.txt`, or the `vllm`
 distribution metadata.
+
+Each native wheel contains code for the GPU on which it is promoted: SM90 for
+the x86_64 H100 lane and SM100 for the aarch64 GB200 lane. These are Marin
+deployment artifacts rather than general-purpose vLLM wheels. Limiting the
+targets keeps native compilation within the memory available on GitHub-hosted
+runners; `MAX_JOBS` and `NVCC_THREADS` are both one for the same reason. Add a
+target only with corresponding Iris validation hardware.
 
 ## Candidate publication
 
