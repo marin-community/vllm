@@ -259,7 +259,7 @@ def test_build_matrix_targets_only_the_validated_gpu():
     for item in matrix["include"]:
         platform = config["platforms"][item["architecture"]]
         assert item["sm_targets"] == platform["validation"]["compute_capability"]
-        assert item["max_jobs"] == 1
+        assert item["max_jobs"] == 2
         assert item["nvcc_threads"] == 1
 
 
