@@ -27,6 +27,11 @@ thread per translation unit. Add a target or increase either concurrency limit
 only with a successful candidate build and corresponding Iris validation
 hardware.
 
+The release build permits wheels up to 800 MiB, the quota documented by vLLM's
+wheel-size checker. Marin's SM100 wheel exceeds the checker's 500 MiB PyPI
+default because it includes the Blackwell FlashAttention extension; the release
+manifest records its exact byte size and SHA-256.
+
 ## Candidate publication
 
 [`marin-gpu-candidate.yaml`](../../.github/workflows/marin-gpu-candidate.yaml)

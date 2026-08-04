@@ -117,6 +117,7 @@ jobs:
             --build-arg PYTHON_VERSION=3.12 \
             --build-arg torch_cuda_arch_list="${{ matrix.sm_targets }}" \
             --build-arg max_jobs="${{ matrix.max_jobs }}" \
+            --build-arg VLLM_MAX_SIZE_MB="${{ matrix.max_wheel_size_mb }}" \
             --build-arg nvcc_threads="${{ matrix.nvcc_threads }}" \
             --build-arg GIT_REPO_CHECK=1 \
             --build-arg RUN_WHEEL_CHECK=true \
