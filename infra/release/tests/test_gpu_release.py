@@ -16,6 +16,7 @@ from infra.release.gpu_release import (
     GRUG_ARCHITECTURE,
     ReleaseError,
     assemble_candidate,
+    build_matrix,
     extract_validation,
     finalize_release,
     inspect_wheel,
@@ -248,6 +249,18 @@ def test_validation_matrix_projects_iris_resources_from_release_config():
             for architecture, platform in config["platforms"].items()
         ]
     }
+
+
+def test_build_matrix_targets_only_the_validated_gpu():
+    config = load_json(CONFIG_PATH)
+
+    matrix = build_matrix(config)
+
+    for item in matrix["include"]:
+        platform = config["platforms"][item["architecture"]]
+        assert item["sm_targets"] == platform["validation"]["compute_capability"]
+        assert item["max_jobs"] == 1
+        assert item["nvcc_threads"] == 1
 
 
 def release_fixture(tmp_path: Path) -> tuple[dict, dict, list[dict], dict]:
