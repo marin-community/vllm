@@ -610,6 +610,7 @@ def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 "runner": platform["runner"],
                 "build_base_image": platform["build_base_image"],
                 "max_jobs": platform["max_jobs"],
+                "max_wheel_size_mb": platform["max_wheel_size_mb"],
                 "nvcc_threads": platform["nvcc_threads"],
                 "sm_targets": " ".join(platform["sm_targets"]),
             }
