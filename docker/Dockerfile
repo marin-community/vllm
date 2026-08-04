@@ -588,6 +588,11 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ]; then \
 
 #################### WHEEL BUILD IMAGE ####################
 
+# Export only the release artifact. Loading the full build stage into Docker
+# duplicates its toolchains and intermediate objects on the hosted runner.
+FROM scratch AS marin-wheel-export
+COPY --from=build /workspace/dist /dist
+
 #################### DEV IMAGE ####################
 FROM base AS dev
 
