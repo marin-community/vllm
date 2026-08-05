@@ -29,7 +29,14 @@ from infra.release.gpu_release import (
     verify_release_assets,
 )
 
+REPOSITORY_ROOT = Path(__file__).parents[3]
 CONFIG_PATH = Path(__file__).parents[1] / "config.json"
+GPU_CANDIDATE_WORKFLOW_PATH = (
+    REPOSITORY_ROOT / ".github/workflows/marin-gpu-candidate.yaml"
+)
+GPU_RELEASE_WORKFLOW_PATH = (
+    REPOSITORY_ROOT / ".github/workflows/marin-gpu-release.yaml"
+)
 FORK_COMMIT = "a" * 40
 UPSTREAM_BASE = "b" * 40
 BUILT_AT = "2026-08-03T12:00:00Z"
@@ -37,14 +44,38 @@ CANDIDATE_TAG = f"marin-vllm-gpu-candidate-{FORK_COMMIT[:12]}"
 
 
 def test_publish_uses_current_release_automation_for_an_older_candidate():
-    workflow_path = (
-        Path(__file__).parents[3] / ".github/workflows/marin-gpu-release.yaml"
-    )
-    workflow = yaml.safe_load(workflow_path.read_text())
+    workflow = yaml.safe_load(GPU_RELEASE_WORKFLOW_PATH.read_text())
     checkout = workflow["jobs"]["publish"]["steps"][0]
 
     assert checkout["uses"] == "actions/checkout@v4"
     assert "ref" not in checkout.get("with", {})
+
+
+def test_release_publishers_use_builtin_token_with_write_permission():
+    workflow_paths = (
+        GPU_CANDIDATE_WORKFLOW_PATH,
+        GPU_RELEASE_WORKFLOW_PATH,
+    )
+
+    for workflow_path in workflow_paths:
+        publish = yaml.safe_load(workflow_path.read_text())["jobs"]["publish"]
+        assert publish["permissions"]["contents"] == "write"
+        assert publish["env"]["GH_TOKEN"] == "${{ github.token }}"
+
+
+def test_candidate_build_ignores_release_only_changes():
+    workflow = yaml.load(
+        GPU_CANDIDATE_WORKFLOW_PATH.read_text(), Loader=yaml.BaseLoader
+    )
+    ignored_paths = set(workflow["on"]["push"]["paths-ignore"])
+
+    assert ignored_paths >= {
+        ".github/workflows/marin-ci.yaml",
+        ".github/workflows/marin-gpu-candidate.yaml",
+        ".github/workflows/marin-gpu-release.yaml",
+        "infra/release/gpu_validation.py",
+        "infra/release/tests/**",
+    }
 
 
 def test_server_command_pins_requested_attention_backend():
