@@ -40,6 +40,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import (
     Handle,
+    get_dcp_group,
+    get_dp_group,
+    get_ep_group,
     get_pp_group,
     get_tp_group,
 )
@@ -580,6 +583,9 @@ class Worker(WorkerBase):
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
 
+        if route_audit_mode := envs.VLLM_GRUGMOE_ROUTE_AUDIT:
+            self.model_runner.init_grugmoe_route_audit(str(route_audit_mode))
+
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.
@@ -968,6 +974,22 @@ class Worker(WorkerBase):
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return
+
+    def grugmoe_route_audit_snapshot(self) -> dict[str, object]:
+        result = self.model_runner.grugmoe_route_audit_snapshot()
+        result["worker"] = {
+            "global_rank": self.rank,
+            "local_rank": self.local_rank,
+            "dp_rank": get_dp_group().rank_in_group,
+            "pp_rank": get_pp_group().rank_in_group,
+            "tp_rank": get_tp_group().rank_in_group,
+            "dcp_rank": get_dcp_group().rank_in_group,
+            "ep_rank": get_ep_group().rank_in_group,
+        }
+        return result
+
+    def grugmoe_route_audit_reset(self) -> None:
+        self.model_runner.grugmoe_route_audit_reset()
 
     def save_sharded_state(
         self,

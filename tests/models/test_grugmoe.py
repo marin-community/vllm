@@ -818,6 +818,38 @@ def test_grug_moe_router_selects_biased_topk_and_normalized_unbiased_weights():
     )
 
 
+def test_grug_moe_router_balanced_fixture_changes_only_selected_experts(monkeypatch):
+    monkeypatch.setenv("VLLM_GRUGMOE_ROUTING_FIXTURE", "balanced")
+    router = GrugMoeRouter(
+        top_k=2,
+        global_num_experts=4,
+        bias=torch.tensor([10.0, 9.0, 8.0, 7.0], dtype=torch.float32),
+    )
+    router_logits = torch.tensor(
+        [
+            [0.4, 0.3, -0.1, 0.2],
+            [-0.2, 0.6, 0.1, 0.5],
+            [0.7, -0.3, 0.8, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    weights, ids = router.select_experts(
+        hidden_states=torch.empty(3, 4),
+        router_logits=router_logits,
+    )
+
+    expected_ids = torch.tensor([[0, 1], [2, 3], [0, 1]], dtype=torch.int32)
+    expected_weights = torch.sigmoid(
+        torch.gather(router_logits, dim=-1, index=expected_ids.long())
+    )
+    denom = expected_weights.sum(dim=-1, keepdim=True) + _ROUTER_COMBINE_WEIGHT_EPS
+    expected_weights = expected_weights * (_ROUTER_COMBINE_WEIGHT_SUM / denom)
+    torch.testing.assert_close(ids, expected_ids)
+    torch.testing.assert_close(weights, expected_weights)
+    assert torch.bincount(ids.flatten().long(), minlength=4).tolist() == [2, 2, 1, 1]
+
+
 def test_grug_moe_router_keeps_zero_weight_underflow_finite():
     router = GrugMoeRouter(
         top_k=2,

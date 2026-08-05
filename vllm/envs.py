@@ -143,6 +143,8 @@ if TYPE_CHECKING:
     VLLM_USE_RUST_FRONTEND: bool = False
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
+    VLLM_GRUGMOE_ROUTING_FIXTURE: Literal["", "balanced"] = ""
+    VLLM_GRUGMOE_ROUTE_AUDIT: Literal["", "noop", "record"] = ""
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1254,6 +1256,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
     "VLLM_SERVER_DEV_MODE": lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
+    # GrugMoE-only benchmark controls. The balanced fixture deliberately
+    # changes model outputs and is only suitable for routing controls. The
+    # route audit is read through the development collective-RPC endpoint.
+    "VLLM_GRUGMOE_ROUTING_FIXTURE": env_with_choices(
+        "VLLM_GRUGMOE_ROUTING_FIXTURE",
+        "",
+        ["", "balanced"],
+    ),
+    "VLLM_GRUGMOE_ROUTE_AUDIT": env_with_choices(
+        "VLLM_GRUGMOE_ROUTE_AUDIT",
+        "",
+        ["", "noop", "record"],
+    ),
     # Controls the maximum number of requests to handle in a
     # single asyncio task when processing per-token outputs in the
     # V1 AsyncLLM interface. It is applicable when handling a high

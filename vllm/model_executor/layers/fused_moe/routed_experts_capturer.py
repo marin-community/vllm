@@ -55,6 +55,49 @@ def get_num_experts(hf_config) -> int:
     )
 
 
+def _local_routed_experts(
+    topk_ids: torch.Tensor,
+    *,
+    dp_rank: int,
+    tp_size: int,
+) -> tuple[torch.Tensor, int]:
+    """Return the routing rows owned by one DP rank.
+
+    The router can see a concatenated DP batch, an already-local batch, or
+    one sequence-parallel shard. Keep this normalization in one place so the
+    generated-route carrier and the aggregate route audit count the same
+    logical token rows.
+    """
+    ctx = get_forward_context()
+    if ctx.dp_metadata is None:
+        return topk_ids, topk_ids.shape[0]
+
+    num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
+    token_num_per_dp = int(num_tokens_dp[dp_rank].item())
+    total = int(num_tokens_dp.sum().item())
+    n = topk_ids.shape[0]
+
+    if n == total:
+        cumsum = torch.cumsum(num_tokens_dp, dim=0)
+        end_loc = int(cumsum[dp_rank].item())
+        start_loc = end_loc - token_num_per_dp
+        return topk_ids[start_loc:end_loc, :], token_num_per_dp
+
+    if n == token_num_per_dp:
+        return topk_ids, token_num_per_dp
+
+    sp_expected = (token_num_per_dp + tp_size - 1) // tp_size if tp_size > 0 else -1
+    if tp_size > 1 and n == sp_expected:
+        gathered = get_tp_group().all_gather(topk_ids, dim=0)
+        return gathered[:token_num_per_dp, :], token_num_per_dp
+
+    raise AssertionError(
+        "RoutedExpertsCapturer: unexpected topk_ids batch "
+        f"dim {n} (expected {total}, {token_num_per_dp}, "
+        f"or {sp_expected} for dp_rank={dp_rank}, tp_size={tp_size})"
+    )
+
+
 class RoutedExpertsCapturer:
     """Worker-side capturer for routed experts, lives on GPU.
 
@@ -135,74 +178,18 @@ class RoutedExpertsCapturer:
             topk_ids: Tensor of shape (batch_size, num_routed_experts).
         """
 
-        ctx = get_forward_context()
-        if ctx.dp_metadata is None:  # single dp
-            start_loc = 0
-            end_loc = topk_ids.shape[0]
-            token_num_per_dp = topk_ids.shape[0]
-        else:  # multi dp
-            num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
-            token_num_per_dp = int(num_tokens_dp[self.dp_rank].item())
-            total = int(num_tokens_dp.sum().item())
-            n = topk_ids.shape[0]
-
-            if n == total:
-                # Naive dispatch: all DP ranks' tokens concatenated
-                # before routing. This rank owns tokens
-                # [end_loc - token_num_per_dp, end_loc).
-                cumsum = torch.cumsum(num_tokens_dp, dim=0)
-                end_loc = int(cumsum[self.dp_rank].item())
-                start_loc = end_loc - token_num_per_dp
-            elif n == token_num_per_dp:
-                # Modular-kernel path: DP combine happens inside
-                # quant_method.apply; select_experts only sees this
-                # rank's tokens, take the whole tensor.
-                start_loc = 0
-                end_loc = token_num_per_dp
-            elif (
-                self.tp_size > 1
-                and n != token_num_per_dp
-                and n == (token_num_per_dp + self.tp_size - 1) // self.tp_size
-            ):
-                # SP + modular-kernel path. All-gather across the TP
-                # group along dim=0 to reconstruct the full per-DP-rank
-                # tensor; keep only the first ``token_num_per_dp`` rows
-                # (trailing rows are SP ceil-div padding). The TP group
-                # is always initialized on real rollout workers, and
-                # every rank in the group reaches this branch in
-                # lockstep (bind is per-FusedMoE layer, SP is a global
-                # condition), so a bare all_gather here will not
-                # deadlock -- let it raise if the precondition is
-                # violated rather than skip silently.
-                #
-                # ``topk_ids`` is already whatever the router produced
-                # (typically int32/int64, both supported by NCCL); the
-                # downstream ``device_buffer[...] = topk_ids[...]``
-                # setitem narrows into int32 automatically.
-                topk_ids = get_tp_group().all_gather(topk_ids, dim=0)
-                start_loc = 0
-                end_loc = token_num_per_dp
-            else:
-                sp_expected = (
-                    (token_num_per_dp + self.tp_size - 1) // self.tp_size
-                    if self.tp_size > 0
-                    else -1
-                )
-                raise AssertionError(
-                    "RoutedExpertsCapturer: unexpected topk_ids batch "
-                    f"dim {n} (expected {total}, {token_num_per_dp}, "
-                    f"or {sp_expected} for dp_rank={self.dp_rank}, "
-                    f"tp_size={self.tp_size})"
-                )
+        local_topk_ids, token_num_per_dp = _local_routed_experts(
+            topk_ids,
+            dp_rank=self.dp_rank,
+            tp_size=self.tp_size,
+        )
 
         # Defensive: model may expose more layers than the capture buffer
         # was sized for (unusual, but guards against miss-config).
         if layer_id >= self.device_buffer.shape[1]:
             return
 
-        self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[
-            start_loc:end_loc, :
-        ]
+        self.device_buffer[:token_num_per_dp, layer_id, :] = local_topk_ids
 
     def clear_buffer(self) -> None:
         """Zero the device buffer. Called at the start of every step so
@@ -218,6 +205,88 @@ class RoutedExpertsCapturer:
         :meth:`clear_buffer`.
         """
         return self.device_buffer
+
+
+class GrugMoeRouteAuditCapturer:
+    """GPU-resident aggregate route counts for controlled GrugMoE runs.
+
+    This records only a fixed ``num_layers x num_experts`` int64 histogram.
+    Under expert parallelism, each worker masks the global selections to the
+    experts physically owned by that worker. Summing worker histograms then
+    counts every selected contribution once and also exposes per-rank load.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, mode: str) -> None:
+        if mode not in ("noop", "record"):
+            raise ValueError(f"Unsupported GrugMoE route audit mode: {mode!r}")
+
+        hf_config = vllm_config.model_config.hf_text_config
+        self.mode = mode
+        self.num_layers = int(hf_config.num_hidden_layers)
+        self.num_experts = int(get_num_experts(hf_config))
+        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.counts = torch.zeros(
+            (self.num_layers, self.num_experts),
+            dtype=torch.int64,
+            device=current_platform.device_type,
+        )
+        self.local_expert_mask = torch.ones_like(self.counts)
+
+    def set_expert_map(
+        self,
+        layer_id: int,
+        expert_map: torch.Tensor | None,
+    ) -> None:
+        if not 0 <= layer_id < self.num_layers:
+            raise AssertionError(
+                f"GrugMoE route audit layer {layer_id} is outside "
+                f"[0, {self.num_layers})"
+            )
+        if expert_map is None:
+            self.local_expert_mask[layer_id].fill_(1)
+            return
+        if expert_map.shape[0] < self.num_experts:
+            raise AssertionError(
+                "GrugMoE route audit expert map is smaller than the global "
+                f"expert count: {expert_map.shape[0]} < {self.num_experts}"
+            )
+        self.local_expert_mask[layer_id].copy_(
+            (expert_map[: self.num_experts] >= 0).to(dtype=torch.int64)
+        )
+
+    def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+        if self.mode == "noop":
+            return
+        if not 0 <= layer_id < self.num_layers:
+            raise AssertionError(
+                f"GrugMoE route audit layer {layer_id} is outside "
+                f"[0, {self.num_layers})"
+            )
+
+        local_topk_ids, _ = _local_routed_experts(
+            topk_ids,
+            dp_rank=self.dp_rank,
+            tp_size=self.tp_size,
+        )
+        flat_ids = local_topk_ids.reshape(-1).to(dtype=torch.long)
+        local_weights = self.local_expert_mask[layer_id].index_select(0, flat_ids)
+        self.counts[layer_id].scatter_add_(0, flat_ids, local_weights)
+
+    def reset(self) -> None:
+        self.counts.zero_()
+
+    def snapshot(self) -> dict[str, object]:
+        counts = self.counts.cpu().tolist()
+        local_expert_mask = self.local_expert_mask.cpu().tolist()
+        return {
+            "mode": self.mode,
+            "num_layers": self.num_layers,
+            "num_experts": self.num_experts,
+            "assignment_count": sum(sum(row) for row in counts),
+            "counts": counts,
+            "local_expert_mask": local_expert_mask,
+        }
 
 
 class RoutedExpertsManager:

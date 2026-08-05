@@ -59,6 +59,7 @@ from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    GrugMoeRouteAuditCapturer,
     RoutedExpertsCapturer,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
@@ -7353,6 +7354,52 @@ class GPUModelRunner(
             device=self.device,
         )
         self.routed_experts_initialized = True
+
+    def init_grugmoe_route_audit(self, mode: str) -> None:
+        if self.model_config.enable_return_routed_experts:
+            raise ValueError(
+                "VLLM_GRUGMOE_ROUTE_AUDIT cannot be combined with "
+                "enable_return_routed_experts; both use the router capture hook"
+            )
+        logger.info("Initializing GrugMoE route audit in %s mode", mode)
+        self.grugmoe_route_audit = GrugMoeRouteAuditCapturer(
+            vllm_config=self.vllm_config,
+            mode=mode,
+        )
+
+        from vllm.model_executor.layers.fused_moe.layer import MoERunner
+        from vllm.model_executor.layers.fused_moe.router.base_router import (
+            BaseRouter,
+        )
+
+        for module in self.compilation_config.static_forward_context.values():
+            if isinstance(module, MoERunner) and isinstance(module.router, BaseRouter):
+                layer_id = module.layer_id
+                self.grugmoe_route_audit.set_expert_map(
+                    layer_id,
+                    module.expert_map,
+                )
+
+                def _capture_fn(
+                    topk_ids,
+                    _layer_id=layer_id,
+                    _capturer=self.grugmoe_route_audit,
+                ):
+                    _capturer.capture(_layer_id, topk_ids)
+
+                module.router.set_capture_fn(_capture_fn)
+
+    def grugmoe_route_audit_snapshot(self) -> dict[str, object]:
+        capturer = getattr(self, "grugmoe_route_audit", None)
+        if capturer is None:
+            raise RuntimeError("GrugMoE route audit is not initialized")
+        return capturer.snapshot()
+
+    def grugmoe_route_audit_reset(self) -> None:
+        capturer = getattr(self, "grugmoe_route_audit", None)
+        if capturer is None:
+            raise RuntimeError("GrugMoE route audit is not initialized")
+        capturer.reset()
 
     def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
         from vllm.model_executor.layers.fused_moe.layer import MoERunner

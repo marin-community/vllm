@@ -10,6 +10,7 @@ import torch
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    GrugMoeRouteAuditCapturer,
     RoutedExpertsCapturer,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
@@ -38,6 +39,25 @@ def _capturer_with_buffer(
         -1,
         dtype=torch.int32,
     )
+    return c
+
+
+def _audit_capturer(
+    *,
+    mode: str = "record",
+    num_layers: int = 2,
+    num_experts: int = 4,
+    dp_rank: int = 0,
+    tp_size: int = 1,
+) -> GrugMoeRouteAuditCapturer:
+    c = GrugMoeRouteAuditCapturer.__new__(GrugMoeRouteAuditCapturer)
+    c.mode = mode
+    c.num_layers = num_layers
+    c.num_experts = num_experts
+    c.dp_rank = dp_rank
+    c.tp_size = tp_size
+    c.counts = torch.zeros((num_layers, num_experts), dtype=torch.int64)
+    c.local_expert_mask = torch.ones_like(c.counts)
     return c
 
 
@@ -249,3 +269,40 @@ def test_routed_experts_capturer_dp_unexpected_batch_raises():
     ):
         capturer.capture(layer_id=0, topk_ids=topk)
     assert capturer.device_buffer[0, 0, 0].item() == -1
+
+
+def test_grugmoe_route_audit_counts_only_worker_local_experts():
+    capturer = _audit_capturer()
+    capturer.set_expert_map(
+        layer_id=0,
+        expert_map=torch.tensor([0, -1, 1, -1], dtype=torch.int32),
+    )
+    topk = torch.tensor([[0, 1], [2, 3], [0, 2]], dtype=torch.int32)
+    ctx = SimpleNamespace(dp_metadata=None)
+    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+        capturer.capture(layer_id=0, topk_ids=topk)
+
+    assert capturer.counts[0].tolist() == [2, 0, 2, 0]
+    snapshot = capturer.snapshot()
+    assert snapshot["assignment_count"] == 4
+    assert snapshot["local_expert_mask"][0] == [1, 0, 1, 0]
+
+
+def test_grugmoe_route_audit_noop_installs_zero_work_callback():
+    capturer = _audit_capturer(mode="noop")
+    with patch(
+        f"{_REC_MODULE}.get_forward_context",
+        side_effect=AssertionError("noop must not inspect the forward context"),
+    ):
+        capturer.capture(
+            layer_id=0,
+            topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
+        )
+    assert capturer.counts.count_nonzero().item() == 0
+
+
+def test_grugmoe_route_audit_reset_clears_counts():
+    capturer = _audit_capturer()
+    capturer.counts.fill_(7)
+    capturer.reset()
+    assert capturer.counts.count_nonzero().item() == 0

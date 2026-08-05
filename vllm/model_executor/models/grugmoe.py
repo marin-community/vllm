@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -538,12 +539,32 @@ class GrugMoeRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del hidden_states, input_ids
-        _, selected = torch.topk(
-            router_logits.float() + self.bias.float(),
-            k=self.top_k + 1,
-            dim=-1,
-        )
-        selected = selected[:, : self.top_k]
+        if envs.VLLM_GRUGMOE_ROUTING_FIXTURE == "balanced":
+            # Deterministic batch-balanced control. Consecutive routed slots
+            # walk the expert ring, so every expert receives the same number
+            # of selections (within one when the slot count is not divisible
+            # by the expert count). Only selection changes: combine weights
+            # still come from the checkpoint's unbiased router logits.
+            token_offsets = torch.arange(
+                router_logits.shape[0],
+                device=router_logits.device,
+                dtype=torch.long,
+            )
+            slot_offsets = torch.arange(
+                self.top_k,
+                device=router_logits.device,
+                dtype=torch.long,
+            )
+            selected = (
+                token_offsets[:, None] * self.top_k + slot_offsets[None, :]
+            ) % self.global_num_experts
+        else:
+            _, selected = torch.topk(
+                router_logits.float() + self.bias.float(),
+                k=self.top_k + 1,
+                dim=-1,
+            )
+            selected = selected[:, : self.top_k]
         topk_weights = torch.sigmoid(
             torch.gather(router_logits.float(), dim=-1, index=selected)
         )
