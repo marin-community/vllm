@@ -222,18 +222,29 @@ jobs:
 
       - name: Wait for the federated validation record
         if: steps.iris.outcome == 'success'
+        env:
+          FORWARDED_LOG_POLL_ATTEMPTS: 60
+          FORWARDED_LOG_POLL_INTERVAL: 15
         run: |
-          if rg --quiet 'MARIN_GPU_VALIDATION_JSON=' validation.log; then
+          validation_record_ready() {
+            .venv/bin/python infra/release/gpu_release.py extract-validation \
+              --log "$1" --output validation-probe.json &&
+              .venv/bin/python infra/release/gpu_release.py validate-result \
+                --result validation-probe.json \
+                --candidate candidate/marin-vllm-gpu-manifest.json \
+                --config "$RELEASE_CONFIG" >/dev/null 2>&1
+          }
+          if validation_record_ready validation.log; then
             exit 0
           fi
-          for attempt in $(seq 1 60); do
-            sleep 15
+          for attempt in $(seq 1 "$FORWARDED_LOG_POLL_ATTEMPTS"); do
+            sleep "$FORWARDED_LOG_POLL_INTERVAL"
             iris --cluster marin job logs "/$JOB_USER/$JOB_NAME" > forwarded-validation.log 2>&1
-            if rg --quiet 'MARIN_GPU_VALIDATION_JSON=' forwarded-validation.log; then
+            if validation_record_ready forwarded-validation.log; then
               cat forwarded-validation.log >> validation.log
               exit 0
             fi
-            echo "Validation record has not reached the Marin Finelog hub (attempt ${attempt}/60)."
+            echo "Validation record has not reached the Marin Finelog hub (attempt ${attempt}/${FORWARDED_LOG_POLL_ATTEMPTS})."
           done
           cat forwarded-validation.log >> validation.log
           echo "Timed out waiting for the federated validation record." >&2
