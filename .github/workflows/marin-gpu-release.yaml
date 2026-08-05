@@ -184,7 +184,7 @@ jobs:
         id: iris
         continue-on-error: true
         env:
-          JOB_NAME: vllm-release-${{ matrix.hardware }}-${{ needs.resolve.outputs.source_commit }}
+          JOB_NAME: vllm-release-${{ matrix.hardware }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.resolve.outputs.source_commit }}
           MODEL: ${{ inputs.model || 'Qwen/Qwen3-0.6B' }}
         run: |
           TASK_IMAGE=$(jq -r '.validation_task_image' "$RELEASE_CONFIG")
