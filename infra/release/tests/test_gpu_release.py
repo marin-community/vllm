@@ -63,6 +63,21 @@ def test_release_publishers_use_builtin_token_with_write_permission():
         assert publish["env"]["GH_TOKEN"] == "${{ github.token }}"
 
 
+def test_candidate_build_ignores_release_only_changes():
+    workflow = yaml.load(
+        GPU_CANDIDATE_WORKFLOW_PATH.read_text(), Loader=yaml.BaseLoader
+    )
+    ignored_paths = set(workflow["on"]["push"]["paths-ignore"])
+
+    assert ignored_paths >= {
+        ".github/workflows/marin-ci.yaml",
+        ".github/workflows/marin-gpu-candidate.yaml",
+        ".github/workflows/marin-gpu-release.yaml",
+        "infra/release/gpu_validation.py",
+        "infra/release/tests/**",
+    }
+
+
 def test_server_command_pins_requested_attention_backend():
     command = server_command("Qwen/Qwen3-0.6B", 8000, "FLASH_ATTN")
 
