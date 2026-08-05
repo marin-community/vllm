@@ -361,7 +361,7 @@ def test_validation_log_records_missing_result_as_failure(tmp_path):
     assert result["failure"] == "Iris log did not contain a GPU validation record"
 
 
-def test_wheel_tests_preload_installed_package_before_adding_checkout(tmp_path):
+def test_wheel_tests_use_installed_package_and_apply_exclusions(tmp_path):
     site_packages = tmp_path / "site-packages"
     checkout = tmp_path / "checkout"
     (site_packages / "vllm").mkdir(parents=True)
@@ -382,6 +382,9 @@ def test_wheel_tests_preload_installed_package_before_adding_checkout(tmp_path):
         "        text=True, capture_output=True, check=True,\n"
         "    )\n"
         "    assert child.stdout.strip() == 'wheel'\n"
+        "\n"
+        "def test_excluded_failure():\n"
+        "    assert False\n"
     )
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(site_packages)
@@ -396,6 +399,8 @@ def test_wheel_tests_preload_installed_package_before_adding_checkout(tmp_path):
             str(checkout),
             "--validation-source-root",
             str(checkout),
+            "--exclude-test",
+            "test_excluded_failure",
             "--",
             "-q",
             str(test_path),
