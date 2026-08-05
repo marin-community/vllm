@@ -296,8 +296,6 @@ jobs:
       SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.resolve.outputs.source_commit }}
 
       - uses: astral-sh/setup-uv@v6
         with:
