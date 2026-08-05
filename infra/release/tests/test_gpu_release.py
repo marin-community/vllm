@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from infra.nightly.gpu_serve_smoke import server_command
 from infra.release.gpu_release import (
     GRUG_ARCHITECTURE,
     ReleaseError,
@@ -32,6 +33,12 @@ FORK_COMMIT = "a" * 40
 UPSTREAM_BASE = "b" * 40
 BUILT_AT = "2026-08-03T12:00:00Z"
 CANDIDATE_TAG = f"marin-vllm-gpu-candidate-{FORK_COMMIT[:12]}"
+
+
+def test_server_command_pins_requested_attention_backend():
+    command = server_command("Qwen/Qwen3-0.6B", 8000, "FLASH_ATTN")
+
+    assert command[-2:] == ["--attention-backend", "FLASH_ATTN"]
 
 
 def write_wheel(
@@ -143,6 +150,7 @@ def validation(candidate_manifest: dict, architecture: str) -> dict:
             "compute_capability": validation_config["compute_capability"],
         },
         "environment": {
+            "attention_backend": validation_config["attention_backend"],
             "python_version": config["python_version"] + ".8",
             "torch_version": config["torch_version"],
             "torch_cuda_runtime": config["cuda_runtime_version"],
@@ -313,6 +321,23 @@ def test_release_rejects_allocator_absence_from_gpu_result(tmp_path):
         )
 
 
+def test_release_rejects_wrong_serving_attention_backend(tmp_path):
+    config, candidate_manifest, validations, _ = release_fixture(tmp_path)
+    broken = copy.deepcopy(validations[1])
+    broken["environment"]["attention_backend"] = "FLASHINFER"
+    validations[1] = broken
+
+    with pytest.raises(ReleaseError, match="attention_backend='FLASHINFER'"):
+        finalize_release(
+            candidate_manifest,
+            validations,
+            config=config,
+            release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
+            published_at="2026-08-04T00:00:00Z",
+            provenance={"run_id": "456"},
+        )
+
+
 def write_validation_assets(tmp_path: Path, validations: list[dict]) -> None:
     for result in validations:
         hardware = result["hardware"]["requested"].lower()
@@ -346,7 +371,11 @@ def test_validation_log_extracts_machine_readable_result(tmp_path):
     expected = {"architecture": "aarch64", "result": "passed"}
     encoded = base64.b64encode(json.dumps(expected).encode()).decode()
     log_path = tmp_path / "validation.log"
-    log_path.write_text(f"setup\nMARIN_GPU_VALIDATION_JSON={encoded}\ndone\n")
+    log_path.write_text(
+        "setup\n"
+        f"Iris task=/vllm-ci/release/0 | MARIN_GPU_VALIDATION_JSON={encoded}\n"
+        "done\n"
+    )
 
     assert extract_validation(log_path) == expected
 
