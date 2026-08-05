@@ -47,6 +47,19 @@ def test_publish_uses_current_release_automation_for_an_older_candidate():
     assert "ref" not in checkout.get("with", {})
 
 
+def test_release_publishers_use_builtin_token_with_write_permission():
+    repository_root = Path(__file__).parents[3]
+    workflow_paths = (
+        repository_root / ".github/workflows/marin-gpu-candidate.yaml",
+        repository_root / ".github/workflows/marin-gpu-release.yaml",
+    )
+
+    for workflow_path in workflow_paths:
+        publish = yaml.safe_load(workflow_path.read_text())["jobs"]["publish"]
+        assert publish["permissions"]["contents"] == "write"
+        assert publish["env"]["GH_TOKEN"] == "${{ github.token }}"
+
+
 def test_server_command_pins_requested_attention_backend():
     command = server_command("Qwen/Qwen3-0.6B", 8000, "FLASH_ATTN")
 
