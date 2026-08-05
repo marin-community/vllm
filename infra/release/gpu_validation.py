@@ -437,6 +437,7 @@ def run_serving_smoke(
     validation_source_root: Path,
     model: str,
     spec: str,
+    attention_backend: str,
     environment: dict[str, str],
 ) -> dict[str, Any]:
     result_path = workdir / "serve-smoke.json"
@@ -448,6 +449,8 @@ def run_serving_smoke(
             model,
             "--spec",
             str(validation_source_root / spec),
+            "--attention-backend",
+            attention_backend,
             "--result-json",
             str(result_path),
         ],
@@ -520,6 +523,9 @@ def validate(args: argparse.Namespace) -> int:
                     "VLLM_USE_FLASHINFER_SAMPLER": "0",
                 }
             )
+            result["environment"]["attention_backend"] = expected_validation[
+                "attention_backend"
+            ]
             python = install_wheel_environment(
                 workdir, wheel, config, environment
             )
@@ -566,6 +572,7 @@ def validate(args: argparse.Namespace) -> int:
                     validation_source_root,
                     args.model,
                     expected_validation["spec"],
+                    expected_validation["attention_backend"],
                     environment,
                 )
             except ValidationFailure as exc:
