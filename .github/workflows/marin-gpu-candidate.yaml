@@ -6,8 +6,8 @@ name: Marin vLLM GPU Candidate
 on:
   push:
     branches: [main]
-    # These paths validate or promote existing wheel bytes. Candidate-workflow
-    # changes remain testable through workflow_dispatch.
+    # These paths do not alter packaged wheel bytes. Candidate-workflow changes
+    # remain testable through workflow_dispatch.
     paths-ignore:
       - ".github/workflows/marin-ci.yaml"
       - ".github/workflows/marin-gpu-candidate.yaml"
