@@ -372,9 +372,16 @@ def test_wheel_tests_preload_installed_package_before_adding_checkout(tmp_path):
     (checkout / "tests/__init__.py").write_text("")
     test_path = checkout / "tests/test_import_origin.py"
     test_path.write_text(
+        "import subprocess\n"
+        "import sys\n\n"
         "import vllm\n\n"
         "def test_import_origin():\n"
         "    assert vllm.ORIGIN == 'wheel'\n"
+        "    child = subprocess.run(\n"
+        "        [sys.executable, '-c', 'import vllm; print(vllm.ORIGIN)'],\n"
+        "        text=True, capture_output=True, check=True,\n"
+        "    )\n"
+        "    assert child.stdout.strip() == 'wheel'\n"
     )
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(site_packages)
@@ -385,7 +392,9 @@ def test_wheel_tests_preload_installed_package_before_adding_checkout(tmp_path):
             sys.executable,
             str(script),
             "run-wheel-tests",
-            "--source-root",
+            "--package-source-root",
+            str(checkout),
+            "--validation-source-root",
             str(checkout),
             "--",
             "-q",

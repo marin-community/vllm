@@ -122,15 +122,16 @@ def initial_result(
     }
 
 
-def installed_vllm_path(source_root: Path) -> Path:
+def installed_vllm_path(*source_roots: Path) -> Path:
     """Import vllm and require its package to live outside the checkout."""
     import vllm  # noqa: PLC0415
 
     package_path = Path(vllm.__file__).resolve()
-    if package_path.is_relative_to(source_root.resolve()):
-        raise ValidationFailure(
-            f"vllm imported from source checkout {package_path}, not the wheel"
-        )
+    for source_root in source_roots:
+        if package_path.is_relative_to(source_root.resolve()):
+            raise ValidationFailure(
+                f"vllm imported from source checkout {package_path}, not the wheel"
+            )
     return package_path
 
 
@@ -154,7 +155,9 @@ def probe_installed(args: argparse.Namespace) -> int:
     }
     failed = False
     try:
-        package_path = installed_vllm_path(args.source_root)
+        package_path = installed_vllm_path(
+            args.package_source_root, args.validation_source_root
+        )
         result["environment"]["vllm_package_path"] = str(package_path)
         distribution = metadata.distribution(args.distribution)
         actual_name = distribution.metadata["Name"]
@@ -255,9 +258,11 @@ def probe_installed(args: argparse.Namespace) -> int:
 
 def run_wheel_tests(args: argparse.Namespace) -> int:
     """Run checkout test modules against the already imported wheel package."""
-    source_root = args.source_root.resolve()
+    validation_source_root = args.validation_source_root.resolve()
     try:
-        package_path = installed_vllm_path(source_root)
+        package_path = installed_vllm_path(
+            args.package_source_root, validation_source_root
+        )
     except ValidationFailure as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -265,14 +270,25 @@ def run_wheel_tests(args: argparse.Namespace) -> int:
 
     # `vllm` is now fixed in sys.modules with its site-packages __path__. Add the
     # checkout only so pytest can import the candidate commit's `tests` package.
+    # Keep the process working directory outside the checkout: model inspection
+    # launches fresh Python processes, and their first import path is the working
+    # directory rather than this process's already-populated sys.modules.
     import pytest  # noqa: PLC0415
 
-    sys.path.insert(0, str(source_root))
-    os.chdir(source_root)
+    sys.path.insert(0, str(validation_source_root))
     pytest_args = args.pytest_args
     if pytest_args and pytest_args[0] == "--":
         pytest_args = pytest_args[1:]
     return pytest.main(pytest_args)
+
+
+def source_node_id(source_root: Path, node_id: str) -> str:
+    """Return a pytest node id whose file is absolute under ``source_root``."""
+    relative_path, separator, selection = node_id.partition("::")
+    absolute_path = source_root / relative_path
+    if not separator:
+        return str(absolute_path)
+    return f"{absolute_path}::{selection}"
 
 
 def emit_result(result: dict[str, Any]) -> None:
@@ -340,7 +356,8 @@ def install_wheel_environment(
 def run_installed_probe(
     python: Path,
     workdir: Path,
-    repo_root: Path,
+    package_source_root: Path,
+    validation_source_root: Path,
     candidate: dict[str, Any],
     config: dict[str, Any],
     expected_validation: dict[str, Any],
@@ -362,8 +379,10 @@ def run_installed_probe(
             config["cuda_runtime_version"],
             "--compute-capability",
             expected_validation["compute_capability"],
-            "--source-root",
-            str(repo_root),
+            "--package-source-root",
+            str(package_source_root),
+            "--validation-source-root",
+            str(validation_source_root),
             "--output",
             str(probe_path),
         ],
@@ -376,20 +395,28 @@ def run_installed_probe(
 
 
 def run_source_suite(
-    python: Path, workdir: Path, repo_root: Path, environment: dict[str, str]
+    python: Path,
+    workdir: Path,
+    package_source_root: Path,
+    validation_source_root: Path,
+    environment: dict[str, str],
 ) -> None:
     command = [
         str(python),
         str(Path(__file__).resolve()),
         "run-wheel-tests",
-        "--source-root",
-        str(repo_root),
+        "--package-source-root",
+        str(package_source_root),
+        "--validation-source-root",
+        str(validation_source_root),
         "--",
         "-v",
-        *SOURCE_TESTS,
+        *(source_node_id(validation_source_root, test) for test in SOURCE_TESTS),
     ]
     for test in SOURCE_TEST_DESELECTS:
-        command.extend(["--deselect", test])
+        command.extend(
+            ["--deselect", source_node_id(validation_source_root, test)]
+        )
     return_code = run_command(command, cwd=workdir, environment=environment)
     if return_code != 0:
         raise ValidationFailure(f"source behavior tests exited with code {return_code}")
@@ -398,7 +425,7 @@ def run_source_suite(
 def run_serving_smoke(
     python: Path,
     workdir: Path,
-    repo_root: Path,
+    validation_source_root: Path,
     model: str,
     spec: str,
     environment: dict[str, str],
@@ -407,11 +434,11 @@ def run_serving_smoke(
     return_code = run_command(
         [
             str(python),
-            str(repo_root / "infra/nightly/gpu_serve_smoke.py"),
+            str(validation_source_root / "infra/nightly/gpu_serve_smoke.py"),
             "--model",
             model,
             "--spec",
-            str(repo_root / spec),
+            str(validation_source_root / spec),
             "--result-json",
             str(result_path),
         ],
@@ -439,9 +466,15 @@ def validate(args: argparse.Namespace) -> int:
     platform_record = next(
         item for item in candidate["platforms"] if item["architecture"] == architecture
     )
-    repo_root = Path(__file__).resolve().parents[2]
+    package_source_root = Path(__file__).resolve().parents[2]
+    validation_source_root = args.validation_source_root.resolve()
 
     try:
+        if not validation_source_root.is_dir():
+            raise ValidationFailure(
+                "candidate validation source root does not exist: "
+                f"{validation_source_root}"
+            )
         if platform.machine() != architecture:
             raise ValidationFailure(
                 f"Iris task architecture is {platform.machine()}, "
@@ -484,7 +517,8 @@ def validate(args: argparse.Namespace) -> int:
             probe, probe_return_code = run_installed_probe(
                 python,
                 workdir,
-                repo_root,
+                package_source_root,
+                validation_source_root,
                 candidate,
                 config,
                 expected_validation,
@@ -500,7 +534,13 @@ def validate(args: argparse.Namespace) -> int:
 
             if expected_validation["run_source_tests"]:
                 try:
-                    run_source_suite(python, workdir, repo_root, environment)
+                    run_source_suite(
+                        python,
+                        workdir,
+                        package_source_root,
+                        validation_source_root,
+                        environment,
+                    )
                 except ValidationFailure as exc:
                     result["gates"][SOURCE_TESTS_GATE] = gate("failed", str(exc))
                     raise
@@ -514,7 +554,7 @@ def validate(args: argparse.Namespace) -> int:
                 serve_metrics = run_serving_smoke(
                     python,
                     workdir,
-                    repo_root,
+                    validation_source_root,
                     args.model,
                     expected_validation["spec"],
                     environment,
@@ -547,6 +587,9 @@ def parse_args() -> argparse.Namespace:
     validate_parser.add_argument("--hardware", required=True)
     validate_parser.add_argument("--task-image", required=True)
     validate_parser.add_argument("--model", required=True)
+    validate_parser.add_argument(
+        "--validation-source-root", type=Path, required=True
+    )
 
     probe_parser = subparsers.add_parser("probe-installed")
     probe_parser.add_argument("--distribution", required=True)
@@ -554,11 +597,13 @@ def parse_args() -> argparse.Namespace:
     probe_parser.add_argument("--torch-version", required=True)
     probe_parser.add_argument("--cuda-runtime", required=True)
     probe_parser.add_argument("--compute-capability", required=True)
-    probe_parser.add_argument("--source-root", type=Path, required=True)
+    probe_parser.add_argument("--package-source-root", type=Path, required=True)
+    probe_parser.add_argument("--validation-source-root", type=Path, required=True)
     probe_parser.add_argument("--output", type=Path, required=True)
 
     tests_parser = subparsers.add_parser("run-wheel-tests")
-    tests_parser.add_argument("--source-root", type=Path, required=True)
+    tests_parser.add_argument("--package-source-root", type=Path, required=True)
+    tests_parser.add_argument("--validation-source-root", type=Path, required=True)
     tests_parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     return parser.parse_args()
 
