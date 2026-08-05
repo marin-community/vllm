@@ -29,7 +29,14 @@ from infra.release.gpu_release import (
     verify_release_assets,
 )
 
+REPOSITORY_ROOT = Path(__file__).parents[3]
 CONFIG_PATH = Path(__file__).parents[1] / "config.json"
+GPU_CANDIDATE_WORKFLOW_PATH = (
+    REPOSITORY_ROOT / ".github/workflows/marin-gpu-candidate.yaml"
+)
+GPU_RELEASE_WORKFLOW_PATH = (
+    REPOSITORY_ROOT / ".github/workflows/marin-gpu-release.yaml"
+)
 FORK_COMMIT = "a" * 40
 UPSTREAM_BASE = "b" * 40
 BUILT_AT = "2026-08-03T12:00:00Z"
@@ -37,10 +44,7 @@ CANDIDATE_TAG = f"marin-vllm-gpu-candidate-{FORK_COMMIT[:12]}"
 
 
 def test_publish_uses_current_release_automation_for_an_older_candidate():
-    workflow_path = (
-        Path(__file__).parents[3] / ".github/workflows/marin-gpu-release.yaml"
-    )
-    workflow = yaml.safe_load(workflow_path.read_text())
+    workflow = yaml.safe_load(GPU_RELEASE_WORKFLOW_PATH.read_text())
     checkout = workflow["jobs"]["publish"]["steps"][0]
 
     assert checkout["uses"] == "actions/checkout@v4"
@@ -48,10 +52,9 @@ def test_publish_uses_current_release_automation_for_an_older_candidate():
 
 
 def test_release_publishers_use_builtin_token_with_write_permission():
-    repository_root = Path(__file__).parents[3]
     workflow_paths = (
-        repository_root / ".github/workflows/marin-gpu-candidate.yaml",
-        repository_root / ".github/workflows/marin-gpu-release.yaml",
+        GPU_CANDIDATE_WORKFLOW_PATH,
+        GPU_RELEASE_WORKFLOW_PATH,
     )
 
     for workflow_path in workflow_paths:
