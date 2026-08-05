@@ -78,10 +78,12 @@ setup failures and missing validation output also become explicit failed JSON
 records.
 
 The runtime probe and serving process run with the temporary venv outside the
-checkout. The H100 test runner imports and verifies `vllm` from that venv before
-adding the checkout to `sys.path` for the `tests` package. It rejects a `vllm`
-path under the checkout, so the tests exercise the wheel's Python modules and
-compiled extensions.
+checkout. The workflow extracts the candidate commit's tests and serving smoke
+into a separate validation-source tree, while the release harness comes from
+the workflow commit. The H100 test runner imports and verifies `vllm` from the
+venv before adding that tree to `sys.path` for the `tests` package. It keeps its
+working directory outside the tree as well, so model-inspection subprocesses
+also import the wheel instead of an unbuilt source package.
 
 Both results must pass before the workflow creates
 `marin-vllm-gpu-<UTC-date>-<12-character-sha>`. The final release contains the

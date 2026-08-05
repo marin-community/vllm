@@ -136,13 +136,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.source_commit }}
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
           name: marin-vllm-resolved-candidate
           path: candidate
+
+      - name: Materialize the candidate validation sources
+        env:
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+        run: |
+          mkdir candidate-source
+          set -o pipefail
+          git archive "$SOURCE_COMMIT" -- \
+            . ':(exclude)vllm' ':(exclude)docs' | \
+            tar -x -C candidate-source
 
       - uses: astral-sh/setup-uv@v6
         with:
@@ -201,7 +210,8 @@ jobs:
               --architecture "${{ matrix.architecture }}" \
               --hardware "${{ matrix.hardware }}" \
               --task-image "$TASK_IMAGE" \
-              --model "$MODEL" 2>&1 | tee validation.log
+              --model "$MODEL" \
+              --validation-source-root candidate-source 2>&1 | tee validation.log
 
       - name: Stop any Iris job left behind
         if: always()
