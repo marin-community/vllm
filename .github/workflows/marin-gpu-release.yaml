@@ -288,9 +288,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
-      contents: write
+      contents: read
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.MARIN_SYNC_TOKEN }}
       CANDIDATE_TAG: ${{ needs.resolve.outputs.candidate_tag }}
       RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
       SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
