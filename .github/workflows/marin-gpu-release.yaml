@@ -220,6 +220,25 @@ jobs:
             iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
           fi
 
+      - name: Wait for the federated validation record
+        if: steps.iris.outcome == 'success'
+        run: |
+          if rg --quiet 'MARIN_GPU_VALIDATION_JSON=' validation.log; then
+            exit 0
+          fi
+          for attempt in $(seq 1 60); do
+            sleep 15
+            iris --cluster marin job logs "/$JOB_USER/$JOB_NAME" > forwarded-validation.log 2>&1
+            if rg --quiet 'MARIN_GPU_VALIDATION_JSON=' forwarded-validation.log; then
+              cat forwarded-validation.log >> validation.log
+              exit 0
+            fi
+            echo "Validation record has not reached the Marin Finelog hub (attempt ${attempt}/60)."
+          done
+          cat forwarded-validation.log >> validation.log
+          echo "Timed out waiting for the federated validation record." >&2
+          exit 1
+
       - name: Extract the validation record
         if: always()
         run: |
