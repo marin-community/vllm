@@ -26,6 +26,7 @@
         "cpu": 8,
         "memory": "64GB",
         "run_source_tests": true,
+        "attention_backend": "FLASH_ATTN",
         "spec": "infra/nightly/specs/qwen3-0.6b-h100.json"
       }
     },
@@ -44,6 +45,7 @@
         "cpu": 16,
         "memory": "128GB",
         "run_source_tests": false,
+        "attention_backend": "FLASH_ATTN",
         "spec": "infra/nightly/specs/qwen3-0.6b-gb200.json"
       }
     }
