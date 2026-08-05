@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 from infra.nightly.gpu_serve_smoke import server_command
 from infra.release.gpu_release import (
@@ -33,6 +34,17 @@ FORK_COMMIT = "a" * 40
 UPSTREAM_BASE = "b" * 40
 BUILT_AT = "2026-08-03T12:00:00Z"
 CANDIDATE_TAG = f"marin-vllm-gpu-candidate-{FORK_COMMIT[:12]}"
+
+
+def test_publish_uses_current_release_automation_for_an_older_candidate():
+    workflow_path = (
+        Path(__file__).parents[3] / ".github/workflows/marin-gpu-release.yaml"
+    )
+    workflow = yaml.safe_load(workflow_path.read_text())
+    checkout = workflow["jobs"]["publish"]["steps"][0]
+
+    assert checkout["uses"] == "actions/checkout@v4"
+    assert "ref" not in checkout.get("with", {})
 
 
 def test_server_command_pins_requested_attention_backend():
