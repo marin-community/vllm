@@ -522,9 +522,11 @@ class GrugMoeRouter(BaseRouter):
         top_k: int,
         global_num_experts: int,
         bias: torch.Tensor,
+        balanced_offset: int = 0,
     ) -> None:
         super().__init__(top_k=top_k, global_num_experts=global_num_experts)
         self.bias = bias
+        self.balanced_offset = balanced_offset % global_num_experts
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -543,8 +545,10 @@ class GrugMoeRouter(BaseRouter):
             # Deterministic batch-balanced control. Consecutive routed slots
             # walk the expert ring, so every expert receives the same number
             # of selections (within one when the slot count is not divisible
-            # by the expert count). Only selection changes: combine weights
-            # still come from the checkpoint's unbiased router logits.
+            # by the expert count). Each layer rotates the start of that ring
+            # so the remainder does not favor the same EP rank throughout the
+            # model. Only selection changes: combine weights still come from
+            # the checkpoint's unbiased router logits.
             token_offsets = torch.arange(
                 router_logits.shape[0],
                 device=router_logits.device,
@@ -556,7 +560,9 @@ class GrugMoeRouter(BaseRouter):
                 dtype=torch.long,
             )
             selected = (
-                token_offsets[:, None] * self.top_k + slot_offsets[None, :]
+                token_offsets[:, None] * self.top_k
+                + slot_offsets[None, :]
+                + self.balanced_offset
             ) % self.global_num_experts
         else:
             _, selected = torch.topk(
@@ -595,10 +601,23 @@ class GrugMoeMLP(nn.Module):
             disable_tp=True,
             prefix=f"{prefix}.router",
         )
+        prefix_parts = prefix.split(".")
+        layer_index = next(
+            (
+                int(prefix_parts[index + 1])
+                for index, part in enumerate(prefix_parts[:-1])
+                if part == "layers" and prefix_parts[index + 1].isdigit()
+            ),
+            0,
+        )
         moe_router = GrugMoeRouter(
             top_k=cfg.num_experts_per_token,
             global_num_experts=cfg.num_experts,
             bias=self.router.bias,
+            # Every layer is individually as even as integer division allows.
+            # Rotate its unavoidable remainder so the 48-layer aggregate does
+            # not repeatedly favor the same experts or EP ranks.
+            balanced_offset=layer_index * max(1, cfg.num_experts // 16),
         )
         self.experts = FusedMoE(
             num_experts=cfg.num_experts,

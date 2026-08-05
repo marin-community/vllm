@@ -850,6 +850,24 @@ def test_grug_moe_router_balanced_fixture_changes_only_selected_experts(monkeypa
     assert torch.bincount(ids.flatten().long(), minlength=4).tolist() == [2, 2, 1, 1]
 
 
+def test_grug_moe_router_balanced_fixture_rotates_the_layer_remainder(monkeypatch):
+    monkeypatch.setenv("VLLM_GRUGMOE_ROUTING_FIXTURE", "balanced")
+    router = GrugMoeRouter(
+        top_k=2,
+        global_num_experts=8,
+        bias=torch.zeros(8),
+        balanced_offset=2,
+    )
+    router_logits = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+
+    _, ids = router.select_experts(
+        hidden_states=torch.empty(3, 8),
+        router_logits=router_logits,
+    )
+
+    assert ids.tolist() == [[2, 3], [4, 5], [6, 7]]
+
+
 def test_grug_moe_router_keeps_zero_weight_underflow_finite():
     router = GrugMoeRouter(
         top_k=2,
