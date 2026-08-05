@@ -42,9 +42,9 @@ SOURCE_TESTS = (
     "tests/engine/test_arg_utils.py::TestDpDeviceIdSharding",
     "tests/distributed/test_mq_connect_ip.py::test_mq_bind_with_local_ip",
 )
-SOURCE_TEST_DESELECTS = (
-    "tests/models/test_grugmoe.py::test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads",
-    "tests/v1/core/test_scheduler.py::test_async_scheduling_pp_allows_rescheduling_with_output_placeholders",
+SOURCE_TEST_EXCLUDES = (
+    "test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads",
+    "test_async_scheduling_pp_allows_rescheduling_with_output_placeholders",
 )
 
 
@@ -279,6 +279,10 @@ def run_wheel_tests(args: argparse.Namespace) -> int:
     pytest_args = args.pytest_args
     if pytest_args and pytest_args[0] == "--":
         pytest_args = pytest_args[1:]
+    if args.exclude_test:
+        pytest_args.extend(
+            ["-k", " and ".join(f"not {name}" for name in args.exclude_test)]
+        )
     return pytest.main(pytest_args)
 
 
@@ -409,14 +413,19 @@ def run_source_suite(
         str(package_source_root),
         "--validation-source-root",
         str(validation_source_root),
-        "--",
-        "-v",
-        *(source_node_id(validation_source_root, test) for test in SOURCE_TESTS),
     ]
-    for test in SOURCE_TEST_DESELECTS:
-        command.extend(
-            ["--deselect", source_node_id(validation_source_root, test)]
-        )
+    for test in SOURCE_TEST_EXCLUDES:
+        command.extend(["--exclude-test", test])
+    command.extend(
+        [
+            "--",
+            "-v",
+            *(
+                source_node_id(validation_source_root, test)
+                for test in SOURCE_TESTS
+            ),
+        ]
+    )
     return_code = run_command(command, cwd=workdir, environment=environment)
     if return_code != 0:
         raise ValidationFailure(f"source behavior tests exited with code {return_code}")
@@ -604,6 +613,7 @@ def parse_args() -> argparse.Namespace:
     tests_parser = subparsers.add_parser("run-wheel-tests")
     tests_parser.add_argument("--package-source-root", type=Path, required=True)
     tests_parser.add_argument("--validation-source-root", type=Path, required=True)
+    tests_parser.add_argument("--exclude-test", action="append", default=[])
     tests_parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     return parser.parse_args()
 
