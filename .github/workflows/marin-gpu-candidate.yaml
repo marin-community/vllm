@@ -6,6 +6,14 @@ name: Marin vLLM GPU Candidate
 on:
   push:
     branches: [main]
+    # These paths do not alter packaged wheel bytes. Candidate-workflow changes
+    # remain testable through workflow_dispatch.
+    paths-ignore:
+      - ".github/workflows/marin-ci.yaml"
+      - ".github/workflows/marin-gpu-candidate.yaml"
+      - ".github/workflows/marin-gpu-release.yaml"
+      - "infra/release/gpu_validation.py"
+      - "infra/release/tests/**"
   workflow_dispatch:
 
 concurrency:
