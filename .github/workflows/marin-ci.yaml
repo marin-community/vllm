@@ -83,5 +83,5 @@ jobs:
 
       - name: Test GPU release metadata and promotion gates
         run: >-
-          uv run --python 3.12 --no-project --with pytest
+          uv run --python 3.12 --no-project --with pytest --with pyyaml
           python -m pytest infra/release/tests -v
