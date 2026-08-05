@@ -508,6 +508,7 @@ def validate_validation_result(
         raise ReleaseError(f"{architecture} validation used a different wheel")
     environment = result.get("environment", {})
     expected_environment = {
+        "attention_backend": expected_validation["attention_backend"],
         "machine": architecture,
         "torch_version": config["torch_version"],
         "torch_cuda_runtime": config["cuda_runtime_version"],
@@ -639,8 +640,8 @@ def extract_validation(log_path: Path) -> dict[str, Any]:
     encoded_payload = None
     with log_path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
-            if line.startswith(VALIDATION_SENTINEL):
-                encoded_payload = line.removeprefix(VALIDATION_SENTINEL).strip()
+            if VALIDATION_SENTINEL in line:
+                encoded_payload = line.partition(VALIDATION_SENTINEL)[2].strip()
     if encoded_payload is None:
         return {
             "schema_version": 1,
