@@ -82,9 +82,10 @@ jobs:
         run: |
           git remote add upstream https://github.com/vllm-project/vllm.git
           git fetch --quiet --no-tags upstream main
+          short_sha=$(git rev-parse --short=9 HEAD)
           {
             echo "VLLM_PRECOMPILED_WHEEL_COMMIT=$(git merge-base upstream/main HEAD)"
-            echo "SETUPTOOLS_SCM_PRETEND_VERSION=$(uvx --from setuptools-scm python -c 'from setuptools_scm import get_version; print(get_version())')"
+            echo "SETUPTOOLS_SCM_PRETEND_VERSION=0.0.dev0+g$short_sha"
           } >> "$GITHUB_ENV"
 
       - name: Authenticate to Google Cloud
@@ -117,6 +118,7 @@ jobs:
         # the GPU. A healthy run is ~8 minutes end to end (install ~3, tests ~1.5, serve and
         # gate ~2), so 25 minutes is generous without being open-ended.
         run: |
+          set -o pipefail
           iris --cluster marin job run \
             --target-cluster "$TARGET_CLUSTER" \
             --job-name "$JOB_NAME" \
