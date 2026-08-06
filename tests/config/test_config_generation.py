@@ -9,6 +9,7 @@ from vllm.engine.arg_utils import EngineArgs, _runtime_env_for_nested_ray_init
 from vllm.model_executor.layers.quantization.quark.utils import deep_compare
 
 
+@pytest.mark.skip_global_cleanup
 def test_nested_ray_runtime_env_removes_only_inherited_setup_hook():
     runtime_env = RuntimeEnv(
         worker_process_setup_hook="outer.module.setup",
@@ -107,6 +108,7 @@ def test_ray_runtime_env(monkeypatch: pytest.MonkeyPatch):
     ray.shutdown()
 
 
+@pytest.mark.skip_global_cleanup
 def test_ray_runtime_env_strips_inherited_setup_hook(tmp_path):
     sentinel = tmp_path / "hook-calls.txt"
 

@@ -238,8 +238,9 @@ def test_scheduler_stats_route_to_existing_output_client():
     assert len(engine_core_outputs[1].outputs) == 1
 
 
+@pytest.mark.skip_global_cleanup
 def test_schedule_held_running_request_skips_and_resumes():
-    scheduler = create_scheduler()
+    scheduler = create_scheduler(device="cpu")
     requests = create_requests(num_requests=2, num_tokens=4, req_ids=["held", "live"])
     for request in requests:
         scheduler.add_request(request)
@@ -3390,8 +3391,9 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     assert engine_core_output.finish_reason == FinishReason.ERROR
 
 
+@pytest.mark.skip_global_cleanup
 def test_runner_routed_experts_ignored_when_feature_disabled():
-    scheduler = create_scheduler()
+    scheduler = create_scheduler(device="cpu")
     request = create_requests(num_requests=1, max_tokens=1)[0]
     scheduler.add_request(request)
 

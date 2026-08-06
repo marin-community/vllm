@@ -23,9 +23,7 @@ from vllm.engine.arg_utils import (
     optional_type,
     parse_type,
 )
-from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.v1.engine.utils import get_physical_gpu_ids_for_local_dp_rank
 
 
 @pytest.mark.parametrize(
@@ -847,7 +845,13 @@ class TestDeviceIds:
 
 
 class TestDpDeviceIdSharding:
-    def test_explicit_zero_dp_start_rank_overrides_inferred_node_rank(self):
+    @pytest.mark.skip_global_cleanup
+    def test_explicit_zero_dp_start_rank_overrides_inferred_node_rank(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from vllm.platforms import current_platform
+
+        monkeypatch.setattr(current_platform, "device_type", "cpu")
         args = EngineArgs(
             model="facebook/opt-125m",
             tensor_parallel_size=1,
@@ -894,6 +898,9 @@ class TestDpDeviceIdSharding:
     def test_dp_rank_shards_user_assigned_gpu_ids(self):
         """get_physical_gpu_ids_for_local_dp_rank slices the user-provided
         --device-ids list instead of recomputing from the env var."""
+        from vllm.platforms import current_platform
+        from vllm.v1.engine.utils import get_physical_gpu_ids_for_local_dp_rank
+
         evar = current_platform.device_control_env_var
         assert get_physical_gpu_ids_for_local_dp_rank(
             evar, local_dp_rank=1, world_size=2, user_assigned_gpu_ids=[4, 5, 6, 7]
@@ -903,7 +910,11 @@ class TestDpDeviceIdSharding:
                 evar, local_dp_rank=2, world_size=2, user_assigned_gpu_ids=[4, 5, 6, 7]
             )
 
+    @pytest.mark.skip_global_cleanup
     def test_dp_rank_shards_one_local_pipeline_stage_per_gpu(self):
+        from vllm.platforms import current_platform
+        from vllm.v1.engine.utils import get_physical_gpu_ids_for_local_dp_rank
+
         assert get_physical_gpu_ids_for_local_dp_rank(
             current_platform.device_control_env_var,
             local_dp_rank=5,

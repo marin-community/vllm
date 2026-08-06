@@ -19,6 +19,8 @@ import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.utils.network_utils import get_ip
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 def test_mq_bind_with_local_ip():
     """MessageQueue with remote readers should successfully bind

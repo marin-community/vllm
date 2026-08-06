@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 _REC_MODULE = "vllm.model_executor.layers.fused_moe.routed_experts_capturer"
 

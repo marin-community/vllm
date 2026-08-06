@@ -4,6 +4,7 @@
 from typing import cast
 
 import numpy as np
+import pytest
 
 from vllm.config import VllmConfig
 from vllm.v1.executor.ray_utils import (
@@ -12,6 +13,8 @@ from vllm.v1.executor.ray_utils import (
 )
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 class _ConfigRecordingWorker:
