@@ -98,7 +98,12 @@ def post_json(url: str, payload: dict, timeout: float) -> dict:
         return json.loads(response.read())
 
 
-def server_command(model: str, port: int, attention_backend: str | None) -> list[str]:
+def server_command(
+    model: str,
+    port: int,
+    attention_backend: str | None,
+    disable_trtllm_attention: bool = False,
+) -> list[str]:
     """Build the OpenAI server command for this smoke."""
     command = [
         sys.executable,
@@ -113,6 +118,8 @@ def server_command(model: str, port: int, attention_backend: str | None) -> list
     ]
     if attention_backend is not None:
         command.extend(("--attention-backend", attention_backend))
+    if disable_trtllm_attention:
+        command.append("--attention-config.use_trtllm_attention=0")
     return command
 
 
@@ -122,6 +129,7 @@ def serve(
     port: int,
     startup_timeout: float,
     attention_backend: str | None,
+    disable_trtllm_attention: bool,
 ) -> Iterator[str]:
     """Run `vllm serve` for the duration of the block, yielding its base URL.
 
@@ -131,6 +139,8 @@ def serve(
         startup_timeout: Seconds to wait for the server to report ready.
         attention_backend: Explicit vLLM attention backend, or auto-selection when
             unset.
+        disable_trtllm_attention: Use the backend's native attention kernels instead
+            of its TRTLLM attention path.
 
     Yields:
         The server's OpenAI base URL.
@@ -138,7 +148,12 @@ def serve(
     Raises:
         RuntimeError: If the server exits or fails to become ready in time.
     """
-    command = server_command(model, port, attention_backend)
+    command = server_command(
+        model,
+        port,
+        attention_backend,
+        disable_trtllm_attention,
+    )
     logger.info("starting server: %s", " ".join(command))
     server = subprocess.Popen(command)
     try:
@@ -273,6 +288,11 @@ def main() -> int:
         help="Pass an explicit attention backend to vLLM instead of auto-selecting.",
     )
     parser.add_argument(
+        "--disable-trtllm-attention",
+        action="store_true",
+        help="Use native backend kernels instead of TRTLLM attention.",
+    )
+    parser.add_argument(
         "--startup-timeout",
         type=float,
         default=900.0,
@@ -299,6 +319,7 @@ def main() -> int:
         args.port,
         args.startup_timeout,
         args.attention_backend,
+        args.disable_trtllm_attention,
     ) as base_url:
         result = run_prompts(base_url, model)
 

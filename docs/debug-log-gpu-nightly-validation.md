@@ -75,9 +75,26 @@ Install `ray[cgraph,default]==2.48.0`, matching the repository's CUDA test
 requirements, and rerun the same GB200 lane. This preserves the rank-remap test
 instead of weakening or deselecting it.
 
+The rerun passed 178 tests with 2 documented single-GPU deselections, then
+served Qwen3-0.6B through FlashAttention 4 on GB200 and passed the correctness
+gate. Iris did not drain the final prompt metrics, so this run does not provide
+a trustworthy GB200 throughput measurement.
+
+## Hypothesis 4
+
+H100/FlashInfer also passed 178 tests with 2 deselections and selected the
+requested FlashInfer backend. FlashInfer then chose its TRTLLM XQA decode path,
+which tried to JIT an extension and failed because the slim Iris image has no
+discoverable `nvcc` or CUDA development tree.
+
+The repository documents `--attention-config.use_trtllm_attention=0` as the
+supported native-FlashInfer selector. Rerun with native FlashInfer to qualify
+that backend without hiding the separate XQA/CUDA-toolchain gap.
+
 ## Future work
 
-- [ ] Run the generalized non-publishing lane on GB200/FlashAttention and
-  H100/FlashInfer.
+- [x] Run the generalized non-publishing lane on GB200/FlashAttention.
+- [ ] Run H100/native-FlashInfer; XQA remains a release-image qualification
+  gate.
 - [ ] Qualify real multi-GPU PP/DP/EP and SkyRL checkpoint/weight-sync
   lifecycle behavior outside this single-accelerator lane.

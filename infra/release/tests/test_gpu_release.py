@@ -84,6 +84,21 @@ def test_server_command_pins_requested_attention_backend():
     assert command[-2:] == ["--attention-backend", "FLASH_ATTN"]
 
 
+def test_server_command_can_select_native_flashinfer_attention():
+    command = server_command(
+        "Qwen/Qwen3-0.6B",
+        8000,
+        "FLASHINFER",
+        disable_trtllm_attention=True,
+    )
+
+    assert command[-3:] == [
+        "--attention-backend",
+        "FLASHINFER",
+        "--attention-config.use_trtllm_attention=0",
+    ]
+
+
 def write_wheel(
     path: Path,
     *,
