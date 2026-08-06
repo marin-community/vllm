@@ -98,10 +98,28 @@ removed from the final branch: neither native FlashInfer nor XQA can be
 meaningfully qualified in this slim image. A validation image with a coherent
 CUDA toolkit and discoverable `CUDA_HOME`/`nvcc` is required.
 
+## Final exact-head qualification
+
+[H100/FlashAttention run 31067421923](https://github.com/marin-community/vllm/actions/runs/31067421923)
+qualified commit `566686f02`: 178 tests passed with the same two documented
+single-GPU deselections. The server selected `FLASH_ATTN` and FlashAttention 3,
+then produced four Qwen3-0.6B completions with at least 65 tokens at 606.2 output
+tokens/second. The H100 gate and Iris job both passed.
+
+The server emitted an `EngineDeadError` while the harness shut it down after the
+four completed requests. The result and passing gate were emitted afterward,
+and the job returned `JOB_STATE_SUCCEEDED`; this is shutdown noise rather than a
+failed request or engine startup. The fixed Iris job name causes its artifact to
+include older attempts, so the package version `v0.0.dev0+g566686f02` identifies
+the exact-head segment.
+
 ## Future work
 
 - [x] Run the generalized non-publishing lane on GB200/FlashAttention.
+- [x] Rerun H100/FlashAttention against the final executable branch shape.
 - [ ] Qualify H100 FlashInfer native attention and XQA in a coherent CUDA JIT
   image.
+- [ ] Serve and generate from a real Grug checkpoint on H100 and GB200; the
+  registry's current Grug fixture is not publicly downloadable.
 - [ ] Qualify real multi-GPU PP/DP/EP and SkyRL checkpoint/weight-sync
   lifecycle behavior outside this single-accelerator lane.
