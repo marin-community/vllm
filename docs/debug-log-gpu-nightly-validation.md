@@ -64,6 +64,17 @@ test needed Hugging Face network access, three hit empty-accelerator cleanup,
 and the local sandbox denied a ZeroMQ IPC bind. The accelerator jobs remain the
 authoritative gate for these targets.
 
+## Hypothesis 3
+
+The first GB200 run built the aarch64 package and reported 177 passed, 1
+failed, and 2 deselected. The only failure was the Ray rank-remap test:
+`RayWorkerWrapper` was `None` because Ray is an optional dependency and the
+lightweight runner had not installed it. The serving/backend gate did not run.
+
+Install `ray[cgraph,default]==2.48.0`, matching the repository's CUDA test
+requirements, and rerun the same GB200 lane. This preserves the rank-remap test
+instead of weakening or deselecting it.
+
 ## Future work
 
 - [ ] Run the generalized non-publishing lane on GB200/FlashAttention and

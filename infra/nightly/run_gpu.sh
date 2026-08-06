@@ -24,7 +24,9 @@ echo "::: installing vLLM with upstream's prebuilt kernels"
 # ones and nothing needs compiling here.
 uv venv --python 3.12
 VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-uv pip install pytest tblib
+# Ray is an optional runtime dependency, but its rank-remapping contract is part of this
+# fork's SkyRL-facing delta. Match the version pinned by requirements/test/cuda.txt.
+uv pip install pytest tblib "ray[cgraph,default]==2.48.0"
 
 echo "::: running the delta's behavior tests on the accelerator"
 # Two tests are deselected because they cannot run on a single GPU, not because they are

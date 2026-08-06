@@ -56,4 +56,5 @@ def test_gpu_runner_covers_required_delta_contracts_and_selected_backend():
         "tests/v1/executor/test_ray_utils.py",
     ):
         assert test_target in command
+    assert '"ray[cgraph,default]==2.48.0"' in command
     assert '--attention-backend "$ATTENTION_BACKEND"' in command
