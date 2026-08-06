@@ -49,15 +49,7 @@ echo "::: serving ${MODEL} with ${ATTENTION_BACKEND} and gating against ${SPEC}"
 # sampler. Explicit FLASHINFER dispatches still exercise FlashInfer attention; they do not
 # claim coverage of the separate FlashInfer sampling path.
 export VLLM_USE_FLASHINFER_SAMPLER=0
-serve_args=(
-  --model "$MODEL"
-  --spec "$SPEC"
+.venv/bin/python infra/nightly/gpu_serve_smoke.py \
+  --model "$MODEL" \
+  --spec "$SPEC" \
   --attention-backend "$ATTENTION_BACKEND"
-)
-# On H100, FlashInfer otherwise selects its TRTLLM XQA path, which JIT-compiles a
-# machine-specific extension. The slim source-validation image deliberately has no CUDA
-# development tree, so exercise native FlashInfer here and leave XQA to the release image.
-if [[ "$ATTENTION_BACKEND" == FLASHINFER ]]; then
-  serve_args+=(--disable-trtllm-attention)
-fi
-.venv/bin/python infra/nightly/gpu_serve_smoke.py "${serve_args[@]}"

@@ -58,5 +58,3 @@ def test_gpu_runner_covers_required_delta_contracts_and_selected_backend():
         assert test_target in command
     assert '"ray[cgraph,default]==2.48.0"' in command
     assert '--attention-backend "$ATTENTION_BACKEND"' in command
-    assert 'if [[ "$ATTENTION_BACKEND" == FLASHINFER ]]' in command
-    assert "serve_args+=(--disable-trtllm-attention)" in command

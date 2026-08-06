@@ -91,10 +91,17 @@ The repository documents `--attention-config.use_trtllm_attention=0` as the
 supported native-FlashInfer selector. Rerun with native FlashInfer to qualify
 that backend without hiding the separate XQA/CUDA-toolchain gap.
 
+The native-FlashInfer rerun passed the same 178 tests and selected native
+FlashInfer, then its batch-prefill module also attempted runtime JIT compilation
+and failed on the missing CUDA development tree. The experimental selector was
+removed from the final branch: neither native FlashInfer nor XQA can be
+meaningfully qualified in this slim image. A validation image with a coherent
+CUDA toolkit and discoverable `CUDA_HOME`/`nvcc` is required.
+
 ## Future work
 
 - [x] Run the generalized non-publishing lane on GB200/FlashAttention.
-- [ ] Run H100/native-FlashInfer; XQA remains a release-image qualification
-  gate.
+- [ ] Qualify H100 FlashInfer native attention and XQA in a coherent CUDA JIT
+  image.
 - [ ] Qualify real multi-GPU PP/DP/EP and SkyRL checkpoint/weight-sync
   lifecycle behavior outside this single-accelerator lane.
