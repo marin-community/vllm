@@ -50,9 +50,23 @@ without taking the intervening Torch 2.13 dependency change.
 The module compiles and imports with an initialized logger. The focused CPU
 pytest invocation did not reach its assertions in the sandbox: scheduler setup
 needed Hugging Face network access, and the empty-device build cannot run the
-suite's accelerator cleanup. The next H100 rerun is the behavior gate.
+suite's accelerator cleanup.
+
+The next fail-closed H100 run passed: 158 tests passed and the two documented
+multi-GPU cases were deselected. The Grug suite exercised its CUDA fused-MoE
+path. Qwen3-0.6B selected FlashAttention 3, answered all four prompts, and
+decoded at 555.3 output tokens/second against the 306.1 floor.
+
+The generalized runner's four configuration tests pass locally. Of the 23
+newly selected focused test outcomes, 18 passed in the empty-device sandbox;
+the other five were environment failures rather than assertion failures: one
+test needed Hugging Face network access, three hit empty-accelerator cleanup,
+and the local sandbox denied a ZeroMQ IPC bind. The accelerator jobs remain the
+authoritative gate for these targets.
 
 ## Future work
 
-- [ ] Generalize the non-publishing validation lane for GB200 and explicit
-  attention backends after H100 is genuinely green.
+- [ ] Run the generalized non-publishing lane on GB200/FlashAttention and
+  H100/FlashInfer.
+- [ ] Qualify real multi-GPU PP/DP/EP and SkyRL checkpoint/weight-sync
+  lifecycle behavior outside this single-accelerator lane.

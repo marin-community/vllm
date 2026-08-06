@@ -3,11 +3,11 @@ name: Marin Nightly
 # Marin fork only. Upstream's workflows are untouched and this does not invoke them.
 #
 # The real end-to-end test for this fork: build vLLM from the commit under test on one
-# H100, run the Marin delta's own tests there (tests/models/test_grugmoe.py has a
-# CUDA-gated case no CPU runner can reach, and the scheduler test covers the
-# held-request skip), then serve Qwen/Qwen3-0.6B through the OpenAI server and gate the
-# answers and decode throughput. infra/nightly/run_h100.sh is what actually runs on the
-# GPU; this workflow provisions it and tears it down.
+# accelerator, run the Marin delta's behavior tests there, then serve Qwen/Qwen3-0.6B
+# through the OpenAI server and gate the answers and decode throughput.
+# infra/nightly/run_gpu.sh is what actually runs on the accelerator; this workflow
+# provisions it and tears it down. Scheduled runs retain the H100/FlashAttention lane;
+# dispatches can qualify GB200 or FlashInfer without invoking a publishing workflow.
 #
 # Auth is keyless via Workload Identity Federation: the job's GitHub OIDC token
 # (permissions.id-token: write) is exchanged to impersonate github-iris@hai-gcp-models --
@@ -28,9 +28,23 @@ on:
       model:
         description: "HF model id to serve"
         default: Qwen/Qwen3-0.6B
+      hardware:
+        description: "Accelerator lane"
+        type: choice
+        options:
+          - H100
+          - GB200
+        default: H100
+      attention_backend:
+        description: "Attention backend used by the serving gate"
+        type: choice
+        options:
+          - FLASH_ATTN
+          - FLASHINFER
+        default: FLASH_ATTN
       target_cluster:
-        description: "Iris cluster to federate the job to"
-        default: cw-rno2a
+        description: "Optional Iris target-cluster override"
+        default: ""
 
 concurrency:
   group: marin-nightly
@@ -49,7 +63,9 @@ jobs:
       # /<user>/<job> and raises on a bare name. Without pinning it, the id would depend on
       # whichever identity CI authenticated as.
       JOB_USER: vllm-ci
-      TARGET_CLUSTER: ${{ github.event.inputs.target_cluster || 'cw-rno2a' }}
+      HARDWARE: ${{ github.event.inputs.hardware || 'H100' }}
+      ATTENTION_BACKEND: ${{ github.event.inputs.attention_backend || 'FLASH_ATTN' }}
+      TARGET_CLUSTER_OVERRIDE: ${{ github.event.inputs.target_cluster }}
       MODEL: ${{ github.event.inputs.model || 'Qwen/Qwen3-0.6B' }}
     steps:
       - uses: actions/checkout@v4
@@ -88,6 +104,40 @@ jobs:
             echo "SETUPTOOLS_SCM_PRETEND_VERSION=0.0.dev0+g$short_sha"
           } >> "$GITHUB_ENV"
 
+      - name: Resolve the accelerator lane
+        run: |
+          case "$HARDWARE" in
+            H100)
+              gpu_resource=H100x1
+              target_cluster=cw-rno2a
+              cpu=8
+              memory=64GB
+              spec=infra/nightly/specs/qwen3-0.6b-h100.json
+              ;;
+            GB200)
+              gpu_resource=GB200x1
+              target_cluster=cw-us-east-08a
+              cpu=16
+              memory=128GB
+              spec=infra/nightly/specs/qwen3-0.6b-gb200.json
+              ;;
+            *)
+              echo "unsupported accelerator lane: $HARDWARE" >&2
+              exit 2
+              ;;
+          esac
+          if [[ -n "$TARGET_CLUSTER_OVERRIDE" ]]; then
+            target_cluster="$TARGET_CLUSTER_OVERRIDE"
+          fi
+          {
+            echo "GPU_RESOURCE=$gpu_resource"
+            echo "TARGET_CLUSTER=$target_cluster"
+            echo "GPU_CPU=$cpu"
+            echo "GPU_MEMORY=$memory"
+            echo "SPEC=$spec"
+            echo "SMOKE_HARDWARE=$gpu_resource on $target_cluster via iris"
+          } >> "$GITHUB_ENV"
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
@@ -108,9 +158,9 @@ jobs:
           uv tool install --prerelease allow "marin-core>=0.2.46.dev202607131620"
           echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
 
-      - name: Serve and gate on one H100
+      - name: Serve and gate on one accelerator
         # --gpu is gated behind --enable-extra-resources by iris. --no-sync stops iris from
-        # syncing the bundled workspace; run_h100.sh builds its own venv. `iris job run`
+        # syncing the bundled workspace; run_gpu.sh builds its own venv. `iris job run`
         # blocks, streams the job's logs, and exits non-zero unless the job succeeded, so
         # the gate's exit code inside the job is this step's exit code.
         #
@@ -123,16 +173,18 @@ jobs:
             --target-cluster "$TARGET_CLUSTER" \
             --job-name "$JOB_NAME" \
             --user "$JOB_USER" \
-            --gpu H100x1 --enable-extra-resources \
-            --cpu 8 --memory 64GB --disk 200GB \
+            --gpu "$GPU_RESOURCE" --enable-extra-resources \
+            --cpu "$GPU_CPU" --memory "$GPU_MEMORY" --disk 200GB \
             --no-sync \
             --timeout 1500 \
             -e VLLM_PRECOMPILED_WHEEL_COMMIT "$VLLM_PRECOMPILED_WHEEL_COMMIT" \
             -e SETUPTOOLS_SCM_PRETEND_VERSION "$SETUPTOOLS_SCM_PRETEND_VERSION" \
             -e MODEL "$MODEL" \
+            -e SPEC "$SPEC" \
+            -e ATTENTION_BACKEND "$ATTENTION_BACKEND" \
             -e VLLM_COMMIT "$GITHUB_SHA" \
-            -e SMOKE_HARDWARE "H100x1 on $TARGET_CLUSTER via iris" \
-            -- bash infra/nightly/run_h100.sh 2>&1 | tee nightly.log
+            -e SMOKE_HARDWARE "$SMOKE_HARDWARE" \
+            -- bash infra/nightly/run_gpu.sh 2>&1 | tee nightly.log
 
       - name: Stop any Iris job the run left behind
         if: always()
@@ -170,6 +222,6 @@ jobs:
           trigger-token: ${{ secrets.LOOM_TRIGGER_GH_TOKEN }}
           slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
           triage-notes: >-
-            The nightly is an H100 serve smoke via a WIF-authenticated Iris job on the
-            CoreWeave cluster. This fork tracks upstream vLLM: only the Marin delta is in
-            scope for fixes here.
+            The scheduled nightly is an H100/FlashAttention serve smoke via a
+            WIF-authenticated Iris job on the CoreWeave cluster. This fork tracks
+            upstream vLLM: only the Marin delta is in scope for fixes here.
