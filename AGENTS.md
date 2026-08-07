@@ -23,8 +23,11 @@ Everything Marin adds on top of upstream is small and deliberate:
   `vllm/transformers_utils/config.py`, and
   `vllm/transformers_utils/configs/__init__.py`.
 - **Surgical edits** — a scheduler held-request skip (`vllm/v1/core/sched/scheduler.py`),
-  TPU/macOS build tweaks (`setup.py`), a logger tweak (`vllm/logger.py`), and
-  requirements pins.
+  TPU head-padding validation (`vllm/config/model.py`), TPU/macOS build tweaks
+  (`setup.py`), a logger tweak (`vllm/logger.py`), and requirements pins.
+
+The TPU head-padding validation is paired with tpu-inference's arbitrary-GQA
+padding and should leave this delta when the generic support lands upstream.
 
 `git diff $(git merge-base upstream/main HEAD)..HEAD` prints the whole delta. Keep
 it that way.
