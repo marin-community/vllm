@@ -33,6 +33,7 @@ from vllm.model_executor.models.grugmoe import (
     GrugMoeMLP,
     GrugMoeRouter,
     GrugMoeRuntimeConfig,
+    _raise_for_unsupported_modes,
     _try_load_grug_expert_weight,
     get_grug_moe_runtime_info,
 )
@@ -352,15 +353,17 @@ def _minimal_model_config_for_parallel_check(
     return model_config
 
 
-def test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads():
+def test_parallel_config_allows_tpu_heads_but_preserves_gpu_checks(
+    monkeypatch,
+):
     parallel_config = ParallelConfig(tensor_parallel_size=8)
 
     grug_model_config = _minimal_model_config_for_parallel_check(
         ["GrugMoeForCausalLM"],
         "grug_moe",
     )
-    with pytest.raises(ValueError, match="Total number of attention heads"):
-        ModelConfig.verify_with_parallel_config(grug_model_config, parallel_config)
+    monkeypatch.setattr("vllm.config.model.current_platform.is_tpu", lambda: True)
+    ModelConfig.verify_with_parallel_config(grug_model_config, parallel_config)
 
     generic_model_config = _minimal_model_config_for_parallel_check(
         ["LlamaForCausalLM"],
@@ -368,6 +371,73 @@ def test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads():
     )
     with pytest.raises(ValueError, match="Total number of attention heads"):
         ModelConfig.verify_with_parallel_config(generic_model_config, parallel_config)
+
+    monkeypatch.setattr("vllm.config.model.current_platform.is_tpu", lambda: False)
+    with pytest.raises(ValueError, match="Total number of attention heads"):
+        ModelConfig.verify_with_parallel_config(grug_model_config, parallel_config)
+
+
+def _minimal_vllm_config_for_mode_check(
+    *,
+    tensor_parallel_size=1,
+    quantization_method=None,
+):
+    quant_config = (
+        None
+        if quantization_method is None
+        else SimpleNamespace(get_name=lambda: quantization_method)
+    )
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=tensor_parallel_size),
+        lora_config=None,
+        quant_config=quant_config,
+    )
+
+
+def _patch_grug_parallel_runtime(monkeypatch, fake_config, *, is_tpu):
+    monkeypatch.setattr(
+        "vllm.model_executor.models.grugmoe.get_tensor_model_parallel_world_size",
+        lambda: fake_config.parallel_config.tensor_parallel_size,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.grugmoe.current_platform.is_tpu",
+        lambda: is_tpu,
+    )
+
+
+def test_grug_moe_preserves_gpu_tensor_parallel_restriction(monkeypatch):
+    fake_config = _minimal_vllm_config_for_mode_check(tensor_parallel_size=8)
+    _patch_grug_parallel_runtime(monkeypatch, fake_config, is_tpu=False)
+
+    with pytest.raises(NotImplementedError, match="tensor_parallel_size=1"):
+        _raise_for_unsupported_modes(fake_config)
+
+
+@pytest.mark.parametrize(
+    ("is_tpu", "quantization_method", "supported"),
+    [
+        (True, "unquantized", True),
+        (True, "fp8", False),
+        (False, "unquantized", False),
+    ],
+)
+def test_grug_moe_tpu_accepts_only_unquantized_backend(
+    monkeypatch,
+    is_tpu,
+    quantization_method,
+    supported,
+):
+    fake_config = _minimal_vllm_config_for_mode_check(
+        tensor_parallel_size=8 if is_tpu else 1,
+        quantization_method=quantization_method,
+    )
+    _patch_grug_parallel_runtime(monkeypatch, fake_config, is_tpu=is_tpu)
+
+    if supported:
+        _raise_for_unsupported_modes(fake_config)
+    else:
+        with pytest.raises(NotImplementedError, match="does not support quantization"):
+            _raise_for_unsupported_modes(fake_config)
 
 
 def test_grug_gated_norm_matches_reference_math():
@@ -435,7 +505,9 @@ def test_grug_moe_uses_qb_bias_for_selection_and_normalized_unbiased_weights():
     )
     with torch.no_grad():
         mlp.router.weight.copy_(router_weight)
-        mlp.router.bias.copy_(router_bias)
+        # Match TPU functional_call, which substitutes the registered bias
+        # after the custom router has captured its initial Parameter.
+        mlp.router.bias = torch.nn.Parameter(router_bias.clone())
         routed_experts = mlp.experts.routed_experts
         routed_experts.w13_weight[:, : cfg.intermediate_dim, :].copy_(gate_weight)
         routed_experts.w13_weight[:, cfg.intermediate_dim :, :].copy_(up_weight)

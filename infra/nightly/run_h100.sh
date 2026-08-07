@@ -33,7 +33,7 @@ echo "::: running the delta's tests on the GPU"
 .venv/bin/python -m pytest -v \
   tests/models/test_grugmoe.py \
   tests/v1/core/test_scheduler.py \
-  --deselect tests/models/test_grugmoe.py::test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads \
+  --deselect tests/models/test_grugmoe.py::test_parallel_config_allows_tpu_heads_but_preserves_gpu_checks \
   --deselect tests/v1/core/test_scheduler.py::test_async_scheduling_pp_allows_rescheduling_with_output_placeholders
 
 echo "::: serving ${MODEL} and gating against ${SPEC}"

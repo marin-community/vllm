@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Correctness-first GPU implementation of Marin GrugMoE."""
+"""Correctness-first GPU and TPU implementation of Marin GrugMoE."""
 
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -37,6 +37,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.grugmoe import (
     grug_moe_layer_types,
@@ -52,6 +53,7 @@ logger = init_logger(__name__)
 _GATED_NORM_RANK = 128
 _ROUTER_COMBINE_WEIGHT_SUM = 2.5
 _ROUTER_COMBINE_WEIGHT_EPS = 1e-9
+_UNQUANTIZED_METHOD = "unquantized"
 
 
 def _config_attr(config: Any, names: tuple[str, ...], default: Any = None) -> Any:
@@ -314,6 +316,7 @@ class GrugMoeGatedNorm(nn.Module):
         self,
         hidden_dim: int,
         params_dtype: torch.dtype,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -322,7 +325,7 @@ class GrugMoeGatedNorm(nn.Module):
             _GATED_NORM_RANK,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
             prefix=f"{prefix}.down_proj",
         )
@@ -331,16 +334,16 @@ class GrugMoeGatedNorm(nn.Module):
             hidden_dim,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
             prefix=f"{prefix}.up_proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
-        gate_hidden = F.linear(x, self.down_proj.weight)
+        gate_hidden = _apply_grug_linear(self.down_proj, x)
         gate_hidden = F.silu(gate_hidden)
-        gate = F.linear(gate_hidden, self.up_proj.weight)
+        gate = _apply_grug_linear(self.up_proj, gate_hidden)
         return x * torch.sigmoid(gate).to(dtype)
 
 
@@ -350,6 +353,7 @@ class GrugMoeDenseMLP(nn.Module):
         hidden_dim: int,
         intermediate_dim: int,
         params_dtype: torch.dtype,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -358,7 +362,7 @@ class GrugMoeDenseMLP(nn.Module):
             intermediate_dim,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
             prefix=f"{prefix}.gate_proj",
         )
@@ -367,7 +371,7 @@ class GrugMoeDenseMLP(nn.Module):
             intermediate_dim,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
             prefix=f"{prefix}.up_proj",
         )
@@ -376,7 +380,7 @@ class GrugMoeDenseMLP(nn.Module):
             hidden_dim,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
             prefix=f"{prefix}.down_proj",
         )
@@ -428,6 +432,14 @@ class GrugMoeRouter(BaseRouter):
         return topk_weights, topk_ids
 
 
+def _apply_grug_linear(layer: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor:
+    """Apply a Grug projection without adding its separately handled bias."""
+    if current_platform.is_tpu():
+        output, _ = layer(x)
+        return output
+    return F.linear(x, layer.weight)
+
+
 class GrugMoeMLP(nn.Module):
     """QB-routed MoE with normalized sigmoid combine weights."""
 
@@ -435,6 +447,7 @@ class GrugMoeMLP(nn.Module):
         self,
         cfg: GrugMoeRuntimeConfig,
         params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -445,8 +458,9 @@ class GrugMoeMLP(nn.Module):
             cfg.num_experts,
             bias=True,
             params_dtype=torch.float32,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
+            skip_bias_add=True,
             prefix=f"{prefix}.router",
         )
         moe_router = GrugMoeRouter(
@@ -461,14 +475,14 @@ class GrugMoeMLP(nn.Module):
             intermediate_size=cfg.intermediate_dim,
             params_dtype=params_dtype,
             renormalize=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.experts",
             router=moe_router,
             router_logits_dtype=torch.float32,
         )
 
     def _forward_torch_reference(self, x_flat: torch.Tensor) -> torch.Tensor:
-        router_logits = F.linear(x_flat.float(), self.router.weight.float())
+        router_logits = _apply_grug_linear(self.router, x_flat.float())
         combine_weights, selected = self.experts.router.select_experts(
             hidden_states=x_flat,
             router_logits=router_logits,
@@ -504,10 +518,14 @@ class GrugMoeMLP(nn.Module):
         orig_shape = x.shape
         hidden_dim = orig_shape[-1]
         x_flat = x.reshape(-1, hidden_dim)
-        if not x_flat.is_cuda:
+        # TPU functional_call replaces registered parameters with sharded
+        # tensors. Keep the non-Module custom router bound to that current
+        # bias rather than the CPU Parameter captured during construction.
+        self.experts.router.bias = self.router.bias
+        if not x_flat.is_cuda and not current_platform.is_tpu():
             out = self._forward_torch_reference(x_flat)
             return out.to(x.dtype).reshape(orig_shape)
-        router_logits = F.linear(x_flat.float(), self.router.weight.float())
+        router_logits = _apply_grug_linear(self.router, x_flat.float())
         out = self.experts(
             hidden_states=x_flat,
             router_logits=router_logits,
@@ -524,6 +542,7 @@ class GrugMoeAttention(nn.Module):
         sliding_window: int | None,
         use_rope: bool,
         qk_mult_scale: float,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -539,7 +558,7 @@ class GrugMoeAttention(nn.Module):
             self.q_size,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
             prefix=f"{prefix}.q_proj",
         )
@@ -548,7 +567,7 @@ class GrugMoeAttention(nn.Module):
             self.kv_size,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
             prefix=f"{prefix}.k_proj",
         )
@@ -557,7 +576,7 @@ class GrugMoeAttention(nn.Module):
             self.kv_size,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
             prefix=f"{prefix}.v_proj",
         )
@@ -566,7 +585,7 @@ class GrugMoeAttention(nn.Module):
             cfg.hidden_dim,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
             prefix=f"{prefix}.o_proj",
         )
@@ -575,7 +594,7 @@ class GrugMoeAttention(nn.Module):
             cfg.num_heads,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             disable_tp=True,
             prefix=f"{prefix}.attn_gate",
         )
@@ -594,7 +613,7 @@ class GrugMoeAttention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=cfg.num_kv_heads,
             cache_config=cache_config,
-            quant_config=None,
+            quant_config=quant_config,
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=AttentionType.DECODER,
@@ -616,7 +635,7 @@ class GrugMoeAttention(nn.Module):
         dot = torch.sum(attn_heads * aligned_value, dim=-1, keepdim=True)
         value_norm_sq = torch.sum(aligned_value * aligned_value, dim=-1, keepdim=True)
         attn_heads = attn_heads - (dot / (value_norm_sq + 1e-6)) * aligned_value
-        gate = F.linear(hidden_states, self.attn_gate.weight)
+        gate = _apply_grug_linear(self.attn_gate, hidden_states)
         gate = 2 * torch.sigmoid(gate)
         attn_heads = gate[..., None].to(attn_heads.dtype) * attn_heads
         return attn_heads.reshape(num_tokens, self.q_size)
@@ -652,6 +671,7 @@ class GrugMoeDecoderLayer(nn.Module):
         cache_config: CacheConfig | None,
         params_dtype: torch.dtype,
         layer_index: int = 0,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -661,6 +681,7 @@ class GrugMoeDecoderLayer(nn.Module):
         self.attn_gated_norm = GrugMoeGatedNorm(
             cfg.hidden_dim,
             params_dtype,
+            quant_config=quant_config,
             prefix=f"{prefix}.attn_gated_norm",
         )
         self.self_attn = GrugMoeAttention(
@@ -670,6 +691,7 @@ class GrugMoeDecoderLayer(nn.Module):
             sliding_window,
             use_rope=not (is_long and cfg.disable_long_rope),
             qk_mult_scale=cfg.qk_mult_long_scale if is_long else 1.0,
+            quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
         self.post_attention_layernorm = RMSNorm(
@@ -679,11 +701,13 @@ class GrugMoeDecoderLayer(nn.Module):
         self.mlp_gated_norm = GrugMoeGatedNorm(
             cfg.hidden_dim,
             params_dtype,
+            quant_config=quant_config,
             prefix=f"{prefix}.mlp_gated_norm",
         )
         self.mlp = GrugMoeMLP(
             cfg,
             params_dtype,
+            quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
         self.shared_expert = (
@@ -691,6 +715,7 @@ class GrugMoeDecoderLayer(nn.Module):
                 cfg.hidden_dim,
                 cfg.shared_expert_intermediate_dim,
                 params_dtype,
+                quant_config=quant_config,
                 prefix=f"{prefix}.shared_expert",
             )
             if cfg.shared_expert_intermediate_dim > 0
@@ -726,6 +751,7 @@ class GrugMoeModel(nn.Module):
                 "with disable_pko=true"
             )
         self.params_dtype = vllm_config.model_config.dtype
+        self.quant_config = vllm_config.quant_config
 
         if get_pp_group().is_first_rank or (
             self.config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -734,7 +760,7 @@ class GrugMoeModel(nn.Module):
                 self.config.vocab_size,
                 self.config.hidden_dim,
                 params_dtype=self.params_dtype,
-                quant_config=None,
+                quant_config=self.quant_config,
                 prefix=f"{prefix}.embed_tokens",
             )
         else:
@@ -747,6 +773,7 @@ class GrugMoeModel(nn.Module):
             self.embed_gated_norm = GrugMoeGatedNorm(
                 self.config.hidden_dim,
                 self.params_dtype,
+                quant_config=self.quant_config,
                 prefix=f"{prefix}.embed_gated_norm",
             )
         else:
@@ -759,6 +786,7 @@ class GrugMoeModel(nn.Module):
                 vllm_config.cache_config,
                 self.params_dtype,
                 layer_index=extract_layer_index(prefix),
+                quant_config=self.quant_config,
                 prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
@@ -771,6 +799,7 @@ class GrugMoeModel(nn.Module):
             self.final_gated_norm = GrugMoeGatedNorm(
                 self.config.hidden_dim,
                 self.params_dtype,
+                quant_config=self.quant_config,
                 prefix=f"{prefix}.final_gated_norm",
             )
         else:
@@ -813,15 +842,23 @@ class GrugMoeModel(nn.Module):
 
 def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
+    is_tpu = current_platform.is_tpu()
     if vllm_config.lora_config is not None:
         raise NotImplementedError("GrugMoE does not support LoRA")
-    if vllm_config.quant_config is not None:
+    quant_config = vllm_config.quant_config
+    if quant_config is not None and (
+        not is_tpu or quant_config.get_name() != _UNQUANTIZED_METHOD
+    ):
         raise NotImplementedError("GrugMoE does not support quantization")
-    if parallel_config.tensor_parallel_size != 1:
+    if not is_tpu and parallel_config.tensor_parallel_size != 1:
         raise NotImplementedError(
             "GrugMoE expert-parallel GPU serving requires tensor_parallel_size=1"
         )
-    if parallel_config.tensor_parallel_size != get_tensor_model_parallel_world_size():
+    if (
+        not is_tpu
+        and parallel_config.tensor_parallel_size
+        != get_tensor_model_parallel_world_size()
+    ):
         raise RuntimeError(
             "GrugMoE tensor_parallel_size does not match the initialized "
             "tensor-parallel world size: "
@@ -897,7 +934,7 @@ class GrugMoeForCausalLM(nn.Module, SupportsPP):
             hf_config = vllm_config.model_config.hf_config
         self.config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
         self.tie_word_embeddings = self.config.tie_word_embeddings
-        self.quant_config: QuantizationConfig | None = None
+        self.quant_config = vllm_config.quant_config
         self.model = GrugMoeModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -908,7 +945,7 @@ class GrugMoeForCausalLM(nn.Module, SupportsPP):
                 self.config.vocab_size,
                 self.config.hidden_dim,
                 params_dtype=vllm_config.model_config.dtype,
-                quant_config=None,
+                quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
             if self.tie_word_embeddings:
