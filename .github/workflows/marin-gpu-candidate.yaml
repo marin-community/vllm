@@ -291,12 +291,20 @@ jobs:
       - name: Read exact package sources
         id: pair
         run: |
+          vllm_commit=$(jq -er '.packages.vllm.source_commit' "$TPU_RELEASE_CONFIG")
+          tpu_commit=$(jq -er '.packages["tpu-inference"].source_commit' "$TPU_RELEASE_CONFIG")
+          for commit in "$vllm_commit" "$tpu_commit"; do
+            if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Expected a full lowercase Git commit, found: $commit" >&2
+              exit 1
+            fi
+          done
           {
-            echo "vllm_commit=$(jq -r '.packages.vllm.source_commit' "$TPU_RELEASE_CONFIG")"
-            echo "tpu_commit=$(jq -r '.packages[\"tpu-inference\"].source_commit' "$TPU_RELEASE_CONFIG")"
-            echo "exclude_newer=$(jq -r '.exclude_newer' "$TPU_RELEASE_CONFIG")"
-            echo "python_version=$(jq -r '.python_version' "$TPU_RELEASE_CONFIG")"
-            echo "target_device=$(jq -r '.vllm_target_device' "$TPU_RELEASE_CONFIG")"
+            echo "vllm_commit=$vllm_commit"
+            echo "tpu_commit=$tpu_commit"
+            echo "exclude_newer=$(jq -er '.exclude_newer' "$TPU_RELEASE_CONFIG")"
+            echo "python_version=$(jq -er '.python_version' "$TPU_RELEASE_CONFIG")"
+            echo "target_device=$(jq -er '.vllm_target_device' "$TPU_RELEASE_CONFIG")"
           } >> "$GITHUB_OUTPUT"
 
       - uses: astral-sh/setup-uv@v6
@@ -321,6 +329,20 @@ jobs:
           fetch-depth: 0
           path: sources/tpu-inference
           persist-credentials: false
+
+      - name: Verify exact package sources
+        env:
+          VLLM_COMMIT: ${{ steps.pair.outputs.vllm_commit }}
+          TPU_COMMIT: ${{ steps.pair.outputs.tpu_commit }}
+        run: |
+          actual_vllm=$(git -C sources/vllm rev-parse HEAD)
+          actual_tpu=$(git -C sources/tpu-inference rev-parse HEAD)
+          if [[ "$actual_vllm" != "$VLLM_COMMIT" || "$actual_tpu" != "$TPU_COMMIT" ]]; then
+            echo "Checked-out sources do not match the release config." >&2
+            echo "vLLM: expected $VLLM_COMMIT, found $actual_vllm" >&2
+            echo "tpu-inference: expected $TPU_COMMIT, found $actual_tpu" >&2
+            exit 1
+          fi
 
       - name: Build both Python 3.12 wheels
         run: |
