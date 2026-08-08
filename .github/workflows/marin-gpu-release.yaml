@@ -1,15 +1,24 @@
-name: Marin vLLM GPU Release
+name: Marin vLLM GPU Release and TPU Promotion
 
-# Validate exact candidate wheel bytes on both Marin GPU platforms, then publish
-# them under a new immutable release tag. No moving nightly alias is created.
+# The GPU lane validates exact candidate bytes on both Marin GPU platforms.
+# The manual TPU lane only relabels a previously qualified paired candidate.
+# Neither lane creates a moving nightly alias.
 
 on:
   schedule:
     - cron: "30 12 * * *"
   workflow_dispatch:
     inputs:
+      lane:
+        description: "Release lane"
+        required: true
+        default: gpu
+        type: choice
+        options:
+          - gpu
+          - tpu
       candidate_tag:
-        description: "Exact candidate tag; empty selects the newest candidate"
+        description: "Exact candidate tag; GPU may leave this empty"
         required: false
         type: string
       model:
@@ -19,16 +28,18 @@ on:
         type: string
 
 concurrency:
-  group: marin-vllm-gpu-release
+  group: marin-vllm-${{ inputs.lane || 'gpu' }}-release
   cancel-in-progress: false
 
 env:
   RELEASE_CONFIG: infra/release/config.json
+  TPU_RELEASE_CONFIG: infra/release/tpu_config.json
   UV_VERSION: "0.11.21"
 
 jobs:
   resolve:
     name: Resolve candidate
+    if: github.event_name == 'schedule' || inputs.lane == 'gpu'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -372,3 +383,99 @@ jobs:
             --manifest published/marin-vllm-gpu-manifest.json \
             --directory published \
             --config "$RELEASE_CONFIG"
+
+  promote-tpu:
+    name: Promote exact TPU candidate bytes
+    if: github.event_name == 'workflow_dispatch' && inputs.lane == 'tpu'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.12"
+
+      - name: Download the exact candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -z "$CANDIDATE_TAG" ]]; then
+            echo "The TPU lane requires an exact candidate_tag." >&2
+            exit 1
+          fi
+          mkdir candidate release-assets
+          gh release download "$CANDIDATE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir candidate
+
+      - name: Verify the exact candidate
+        run: |
+          python infra/release/tpu_release.py verify-candidate \
+            --config "$TPU_RELEASE_CONFIG" \
+            --manifest candidate/marin-vllm-tpu-manifest.json \
+            --directory candidate \
+            --expected-tag "$CANDIDATE_TAG"
+          cp candidate/*.whl release-assets/
+
+      - name: Relabel the unchanged candidate bytes
+        id: release
+        run: |
+          RELEASE_TAG=$(python infra/release/tpu_release.py release-tag \
+            --candidate candidate/marin-vllm-tpu-manifest.json)
+          python infra/release/tpu_release.py finalize-release \
+            --config "$TPU_RELEASE_CONFIG" \
+            --candidate candidate/marin-vllm-tpu-manifest.json \
+            --release-tag "$RELEASE_TAG" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --output release-assets/marin-vllm-tpu-manifest.json
+          python infra/release/tpu_release.py verify-release \
+            --config "$TPU_RELEASE_CONFIG" \
+            --manifest release-assets/marin-vllm-tpu-manifest.json \
+            --directory release-assets
+          python infra/release/tpu_release.py release-notes \
+            --manifest release-assets/marin-vllm-tpu-manifest.json \
+            --output release-notes.md
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the promoted pair once
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release $RELEASE_TAG" >&2
+            exit 1
+          fi
+          SOURCE_COMMIT=$(jq -r '.source.vllm.commit' release-assets/marin-vllm-tpu-manifest.json)
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_COMMIT" \
+            --title "Marin vLLM TPU ${RELEASE_TAG#marin-vllm-tpu-}" \
+            --notes-file release-notes.md \
+            release-assets/*.whl \
+            release-assets/marin-vllm-tpu-manifest.json
+
+      - name: Redownload the promoted assets
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir published
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir published
+
+      - name: Verify the promoted assets
+        run: |
+          python infra/release/tpu_release.py verify-release \
+            --config "$TPU_RELEASE_CONFIG" \
+            --manifest published/marin-vllm-tpu-manifest.json \
+            --directory published

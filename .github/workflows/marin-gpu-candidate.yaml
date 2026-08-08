@@ -1,7 +1,7 @@
-name: Marin vLLM GPU Candidate
+name: Marin vLLM GPU Candidate and TPU Pair
 
-# Marin fork only. Build one immutable candidate from every merged main commit.
-# GPU validation and release promotion live in marin-gpu-release.yaml.
+# Marin fork only. GPU candidates follow main. The TPU lane is manual and
+# packages the exact source pair pinned in infra/release/tpu_config.json.
 
 on:
   push:
@@ -15,9 +15,18 @@ on:
       - "infra/release/gpu_validation.py"
       - "infra/release/tests/**"
   workflow_dispatch:
+    inputs:
+      lane:
+        description: "Candidate lane"
+        required: true
+        default: gpu
+        type: choice
+        options:
+          - gpu
+          - tpu
 
 concurrency:
-  group: marin-vllm-gpu-candidate-${{ github.sha }}
+  group: marin-vllm-${{ inputs.lane || 'gpu' }}-candidate-${{ github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -25,11 +34,13 @@ permissions:
 
 env:
   RELEASE_CONFIG: infra/release/config.json
+  TPU_RELEASE_CONFIG: infra/release/tpu_config.json
   UV_VERSION: "0.11.21"
 
 jobs:
   prepare:
     name: Resolve build matrix
+    if: github.event_name == 'push' || inputs.lane == 'gpu'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -255,3 +266,187 @@ jobs:
             --manifest published/marin-vllm-gpu-manifest.json \
             --directory published \
             --config "$RELEASE_CONFIG"
+
+  publish-tpu:
+    name: Build and publish exact TPU wheel pair
+    if: github.event_name == 'workflow_dispatch' && inputs.lane == 'tpu'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      TPU_ACCELERATOR_TYPE: v6e-8
+      TPU_NAME: ci
+      TPU_WORKER_ID: "0"
+    steps:
+      - name: Checkout workflow revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read exact package sources
+        id: pair
+        run: |
+          {
+            echo "vllm_commit=$(jq -r '.packages.vllm.source_commit' "$TPU_RELEASE_CONFIG")"
+            echo "tpu_commit=$(jq -r '.packages[\"tpu-inference\"].source_commit' "$TPU_RELEASE_CONFIG")"
+            echo "exclude_newer=$(jq -r '.exclude_newer' "$TPU_RELEASE_CONFIG")"
+            echo "python_version=$(jq -r '.python_version' "$TPU_RELEASE_CONFIG")"
+            echo "target_device=$(jq -r '.vllm_target_device' "$TPU_RELEASE_CONFIG")"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ steps.pair.outputs.python_version }}
+
+      - name: Checkout exact vLLM source
+        uses: actions/checkout@v4
+        with:
+          repository: marin-community/vllm
+          ref: ${{ steps.pair.outputs.vllm_commit }}
+          fetch-depth: 0
+          path: sources/vllm
+          persist-credentials: false
+
+      - name: Checkout exact tpu-inference source
+        uses: actions/checkout@v4
+        with:
+          repository: marin-community/tpu-inference
+          ref: ${{ steps.pair.outputs.tpu_commit }}
+          fetch-depth: 0
+          path: sources/tpu-inference
+          persist-credentials: false
+
+      - name: Build both Python 3.12 wheels
+        run: |
+          mkdir candidate
+          (
+            cd sources/vllm
+            uv venv --python "${{ steps.pair.outputs.python_version }}" .tpu-wheel-build
+            uv pip install \
+              --python .tpu-wheel-build/bin/python \
+              --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
+              --index-strategy unsafe-best-match \
+              --requirements requirements/build/tpu.txt
+            VLLM_TARGET_DEVICE="${{ steps.pair.outputs.target_device }}" \
+              uv build --wheel \
+                --no-build-isolation \
+                --python .tpu-wheel-build/bin/python \
+                --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
+                --out-dir "$GITHUB_WORKSPACE/candidate"
+          )
+          (
+            cd sources/tpu-inference
+            uv build --wheel \
+              --python "${{ steps.pair.outputs.python_version }}" \
+              --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
+              --out-dir "$GITHUB_WORKSPACE/candidate"
+            python -m py_compile tpu_inference/runner/tpu_runner.py
+          )
+          WHEELS=(candidate/*.whl)
+          if [[ ${#WHEELS[@]} -ne 2 ]]; then
+            echo "Expected two wheels, found ${#WHEELS[@]}" >&2
+            exit 1
+          fi
+
+      - name: Assemble and verify pair manifest
+        id: manifest
+        run: |
+          CANDIDATE_TAG=$(python infra/release/tpu_release.py candidate-tag \
+            --config "$TPU_RELEASE_CONFIG" \
+            --workflow-commit "$GITHUB_SHA")
+          CREATED_AT=$(git show -s --format=%cI "$GITHUB_SHA")
+          WHEEL_ARGS=()
+          while IFS= read -r wheel; do
+            WHEEL_ARGS+=(--wheel "$wheel")
+          done < <(find candidate -maxdepth 1 -name '*.whl' -print | sort)
+          python infra/release/tpu_release.py assemble-candidate \
+            --config "$TPU_RELEASE_CONFIG" \
+            "${WHEEL_ARGS[@]}" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-commit "$GITHUB_SHA" \
+            --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --created-at "$CREATED_AT" \
+            --output candidate/marin-vllm-tpu-manifest.json
+          python infra/release/tpu_release.py verify-candidate \
+            --config "$TPU_RELEASE_CONFIG" \
+            --manifest candidate/marin-vllm-tpu-manifest.json \
+            --directory candidate
+          python infra/release/tpu_release.py release-notes \
+            --manifest candidate/marin-vllm-tpu-manifest.json \
+            --output candidate-notes.md
+          echo "candidate_tag=$CANDIDATE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Clean-install the locally built pair
+        run: |
+          uv venv --python "${{ steps.pair.outputs.python_version }}" .tpu-pair-smoke
+          uv pip install \
+            --python .tpu-pair-smoke/bin/python \
+            --prerelease allow \
+            --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
+            candidate/*.whl
+          .tpu-pair-smoke/bin/python -c \
+            "import vllm; from tpu_inference.runner.tpu_runner import TPUModelRunner"
+
+      - name: Publish candidate assets once
+        id: publish
+        env:
+          CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            gh release create "$CANDIDATE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Marin vLLM TPU candidate ${CANDIDATE_TAG#marin-vllm-tpu-candidate-}" \
+              --notes-file candidate-notes.md \
+              --prerelease \
+              candidate/*.whl \
+              candidate/marin-vllm-tpu-manifest.json
+          fi
+
+      - name: Redownload the published pair
+        env:
+          CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir published
+          gh release download "$CANDIDATE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir published
+
+      - name: Verify, hash, and clean-install the published URL pair
+        env:
+          CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
+        run: |
+          python infra/release/tpu_release.py verify-candidate \
+            --config "$TPU_RELEASE_CONFIG" \
+            --manifest published/marin-vllm-tpu-manifest.json \
+            --directory published \
+            --expected-tag "$CANDIDATE_TAG"
+          VLLM_URL=$(jq -r '.packages[] | select(.distribution == "vllm") | .wheel.url' \
+            published/marin-vllm-tpu-manifest.json)
+          TPU_URL=$(jq -r '.packages[] | select(.distribution == "tpu-inference") | .wheel.url' \
+            published/marin-vllm-tpu-manifest.json)
+          uv venv --python "${{ steps.pair.outputs.python_version }}" .tpu-url-smoke
+          uv pip install \
+            --python .tpu-url-smoke/bin/python \
+            --prerelease allow \
+            --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
+            "vllm @ $VLLM_URL" \
+            "tpu-inference @ $TPU_URL"
+          .tpu-url-smoke/bin/python -c \
+            "import vllm; from tpu_inference.runner.tpu_runner import TPUModelRunner"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marin-vllm-tpu-candidate-${{ github.run_id }}
+          path: candidate/marin-vllm-tpu-manifest.json
+          if-no-files-found: ignore
+          retention-days: 14
