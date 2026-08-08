@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "brand": "Marin vLLM TPU",
+  "python_version": "3.12",
+  "platform": "linux_x86_64",
+  "vllm_target_device": "tpu",
+  "exclude_newer": "2026-08-08T00:00:00Z",
+  "runtime_requirements": {
+    "jax": "0.10.1",
+    "jaxlib": "0.10.1",
+    "libtpu": "0.0.41"
+  },
+  "packages": {
+    "vllm": {
+      "repository": "marin-community/vllm",
+      "source_commit": "50602953946bdc13da50d0a16db374bd4949eec0"
+    },
+    "tpu-inference": {
+      "repository": "marin-community/tpu-inference",
+      "source_commit": "ef095a45a8354ef4b7629ad116ecaf18f02dd540"
+    }
+  }
+}

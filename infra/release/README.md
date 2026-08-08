@@ -1,8 +1,28 @@
-# Marin vLLM GPU releases
+# Marin vLLM releases
 
 The GPU release flow publishes `vllm` wheels under commit-addressed Marin vLLM
 GitHub release tags. It does not publish a `marin-vllm` distribution or maintain
 a moving `latest` alias.
+
+## TPU paired candidates
+
+The manual `tpu` lane in `marin-gpu-candidate.yaml` builds one Python 3.12
+`vllm`/`tpu-inference` pair. [`tpu_config.json`](tpu_config.json) pins both
+landed source commits, the TPU runtime versions, and the resolver cutoff. The
+candidate tag also includes the workflow commit, so a workflow change cannot
+silently replace a qualified pair.
+
+The prerelease contains both wheels and `marin-vllm-tpu-manifest.json`. The
+manifest records the two source commits, workflow revision, distribution
+versions, compatibility contract, tag-addressed URLs, and SHA-256 digests. A
+rerun verifies an existing tag instead of overwriting it. The workflow also
+redownloads the release assets and imports both packages from a clean URL-based
+installation.
+
+The matching manual `tpu` lane in `marin-gpu-release.yaml` can later promote a
+specified candidate. Promotion copies the same two wheel files and changes only
+the release metadata and tag-addressed URLs. Candidate creation never invokes
+promotion.
 
 ## Build configuration
 
