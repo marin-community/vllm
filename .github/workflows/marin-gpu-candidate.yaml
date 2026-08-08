@@ -13,6 +13,9 @@ on:
       - ".github/workflows/marin-gpu-candidate.yaml"
       - ".github/workflows/marin-gpu-release.yaml"
       - "infra/release/gpu_validation.py"
+      - "infra/release/README.md"
+      - "infra/release/tpu_config.json"
+      - "infra/release/tpu_release.py"
       - "infra/release/tests/**"
   workflow_dispatch:
     inputs:
