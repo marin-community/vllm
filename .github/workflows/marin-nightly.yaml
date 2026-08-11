@@ -60,6 +60,10 @@ jobs:
           fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v6
+        with:
+          # Pin uv to avoid setup-uv's flaky GitHub /releases/latest lookup, which
+          # queries the API for "latest" and is rate-limited and outage prone.
+          version: "0.11.21"
 
       - name: Trim the Iris bundle
         # Iris bundles the working directory and caps the zip at 25MB; this tree zips to
@@ -141,3 +145,29 @@ jobs:
           name: nightly-run-log
           path: nightly.log
           if-no-files-found: ignore
+
+  # Failure reporting: file or update the [nightly-serve-smoke] tracking issue, ask
+  # weaverbot to triage (launches a weaver session), and ping Slack. The trigger
+  # and Slack channels each skip with a notice until the LOOM_TRIGGER_GH_TOKEN /
+  # SLACK_WEBHOOK_URL org secrets are provisioned; the issue trail accrues either way.
+  report-failure:
+    needs: [serve-smoke]
+    # cancelled matters: a job that hits its timeout-minutes reports cancelled, not failure
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write    # file/update the tracking issue
+      actions: read    # pull failed-job logs for the excerpt
+      contents: read
+    steps:
+      - uses: marin-community/marin-style/actions/report-failure@ccbf03e7ca58486d61fff7a4e73031673d7fd8a4  # v0.3.0
+        with:
+          lane: serve-smoke
+          trigger-token: ${{ secrets.LOOM_TRIGGER_GH_TOKEN }}
+          slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          triage-notes: >-
+            The nightly is an H100 serve smoke via a WIF-authenticated Iris job on the
+            CoreWeave cluster. This fork tracks upstream vLLM: only the Marin delta is in
+            scope for fixes here.
