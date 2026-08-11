@@ -1,0 +1,171 @@
+name: Marin Nightly
+
+# Marin fork only. Upstream's workflows are untouched and this does not invoke them.
+#
+# The real end-to-end test for this fork: build vLLM from the commit under test on one
+# H100, run the Marin delta's own tests there (tests/models/test_grugmoe.py has a
+# CUDA-gated case no CPU runner can reach, and the scheduler test covers the
+# held-request skip), then serve Qwen/Qwen3-0.6B through the OpenAI server and gate the
+# answers and decode throughput. infra/nightly/run_h100.sh is what actually runs on the
+# GPU; this workflow provisions it and tears it down.
+#
+# Auth is keyless via Workload Identity Federation: the job's GitHub OIDC token
+# (permissions.id-token: write) is exchanged to impersonate github-iris@hai-gcp-models --
+# no stored service-account key, and no cluster credentials on the runner. CoreWeave's
+# Iris controllers are IP-locked to the Marin egress and a hosted runner cannot reach
+# them, so the job is submitted to the `marin` cluster and federated to CoreWeave with
+# --target-cluster, which is the supported route from CI.
+#
+# A leaked H100 is expensive, so teardown is threefold: `iris job run` blocks and stops
+# its job when it exits, --timeout is a server-side backstop, and the always() step below
+# stops the job by name if the runner was hard-killed.
+
+on:
+  schedule:
+    - cron: "0 10 * * *"   # 10:00 UTC, staggered off the other Marin nightlies
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "HF model id to serve"
+        default: Qwen/Qwen3-0.6B
+      target_cluster:
+        description: "Iris cluster to federate the job to"
+        default: cw-rno2a
+
+concurrency:
+  group: marin-nightly
+  cancel-in-progress: false   # never interrupt a run holding an H100
+
+jobs:
+  serve-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write   # mint the OIDC token that WIF exchanges for github-iris
+    env:
+      JOB_NAME: vllm-nightly-serve-smoke
+      # --user pins the job's canonical id, which `iris job stop` requires: it takes
+      # /<user>/<job> and raises on a bare name. Without pinning it, the id would depend on
+      # whichever identity CI authenticated as.
+      JOB_USER: vllm-ci
+      TARGET_CLUSTER: ${{ github.event.inputs.target_cluster || 'cw-rno2a' }}
+      MODEL: ${{ github.event.inputs.model || 'Qwen/Qwen3-0.6B' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history and tags: setuptools-scm derives the package version from the
+          # nearest tag, and the merge-base below needs the shared history with upstream.
+          # A shallow checkout yields neither, and the version silently becomes 0.1.dev1.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # Pin uv to avoid setup-uv's flaky GitHub /releases/latest lookup, which
+          # queries the API for "latest" and is rate-limited and outage prone.
+          version: "0.11.21"
+
+      - name: Resolve the upstream base commit and the package version
+        # The bundle ships without .git, so the two things setup.py would ask git for are
+        # computed here, where the real checkout is, and passed into the job.
+        # VLLM_PRECOMPILED_WHEEL_COMMIT is the upstream commit this fork sits on, so the
+        # prebuilt kernels match its base rather than falling back to upstream's nightlies.
+        run: |
+          git remote add upstream https://github.com/vllm-project/vllm.git
+          git fetch --quiet --no-tags upstream main
+          {
+            echo "VLLM_PRECOMPILED_WHEEL_COMMIT=$(git merge-base upstream/main HEAD)"
+            echo "SETUPTOOLS_SCM_PRETEND_VERSION=$(uvx --from setuptools-scm python -c 'from setuptools_scm import get_version; print(get_version())')"
+          } >> "$GITHUB_ENV"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: hai-gcp-models
+          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
+          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: hai-gcp-models
+
+      - name: Install the Iris client
+        # marin-core depends on marin-iris, but uv only symlinks the named package's own
+        # scripts, so the tool's bin dir goes on PATH to make `iris` resolve. The floor is
+        # the first dev build carrying `iris job run --exclude` (marin#8255), which the serve
+        # step relies on to trim the bundle; it subsumes the earlier WIF/IAP auth floor
+        # (marin#7144). 0.2.79 was the last release before #8255, so the next daily marin-core
+        # dev build (0.2.80.dev*, cut from main) is the first that has the flag.
+        run: |
+          uv tool install --prerelease allow "marin-core>=0.2.80.dev0"
+          echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
+
+      - name: Serve and gate on one H100
+        # --gpu is gated behind --enable-extra-resources by iris. --no-sync stops iris from
+        # syncing the bundled workspace; run_h100.sh builds its own venv. --exclude '^docs/'
+        # drops docs/ from the workspace bundle -- it is nearly all of this tree's 38MB and
+        # would otherwise blow Iris's 25MB zip cap -- so the bundler skips it instead of the
+        # checkout being mutated by `git rm`. `iris job run` blocks, streams the job's logs,
+        # and exits non-zero unless the job succeeded, so the gate's exit code inside the job
+        # is this step's exit code.
+        #
+        # --timeout is the server-side backstop that bounds how long a wedged run can hold
+        # the GPU. A healthy run is ~8 minutes end to end (install ~3, tests ~1.5, serve and
+        # gate ~2), so 25 minutes is generous without being open-ended.
+        run: |
+          iris --cluster marin job run \
+            --target-cluster "$TARGET_CLUSTER" \
+            --job-name "$JOB_NAME" \
+            --user "$JOB_USER" \
+            --gpu H100x1 --enable-extra-resources \
+            --cpu 8 --memory 64GB --disk 200GB \
+            --no-sync \
+            --exclude '^docs/' \
+            --timeout 1500 \
+            -e VLLM_PRECOMPILED_WHEEL_COMMIT "$VLLM_PRECOMPILED_WHEEL_COMMIT" \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION "$SETUPTOOLS_SCM_PRETEND_VERSION" \
+            -e MODEL "$MODEL" \
+            -e VLLM_COMMIT "$GITHUB_SHA" \
+            -e SMOKE_HARDWARE "H100x1 on $TARGET_CLUSTER via iris" \
+            -- bash infra/nightly/run_h100.sh 2>&1 | tee nightly.log
+
+      - name: Stop any Iris job the run left behind
+        if: always()
+        # Only matters if the runner was hard-killed; `iris job run` already stops its own
+        # job on exit. The id must be canonical: `job stop` raises on a bare name, and with
+        # the `|| true` below that would fail silently and leak the GPU.
+        run: iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-run-log
+          path: nightly.log
+          if-no-files-found: ignore
+
+  # Failure reporting: file or update the [nightly-serve-smoke] tracking issue, ask
+  # weaverbot to triage (launches a weaver session), and ping Slack. The trigger
+  # and Slack channels each skip with a notice until the LOOM_TRIGGER_GH_TOKEN /
+  # SLACK_WEBHOOK_URL org secrets are provisioned; the issue trail accrues either way.
+  report-failure:
+    needs: [serve-smoke]
+    # cancelled matters: a job that hits its timeout-minutes reports cancelled, not failure
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write    # file/update the tracking issue
+      actions: read    # pull failed-job logs for the excerpt
+      contents: read
+    steps:
+      - uses: marin-community/marin-style/actions/report-failure@64ceb7ac07a4f66bba134cae814f6928f9e6af62  # v0.3.1
+        with:
+          lane: serve-smoke
+          trigger-token: ${{ secrets.LOOM_TRIGGER_GH_TOKEN }}
+          slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          triage-notes: >-
+            The nightly is an H100 serve smoke via a WIF-authenticated Iris job on the
+            CoreWeave cluster. This fork tracks upstream vLLM: only the Marin delta is in
+            scope for fixes here.

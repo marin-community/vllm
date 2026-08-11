@@ -1,0 +1,70 @@
+name: Marin CI
+
+# Marin fork only: CPU-only, no accelerators, no cluster access, a few minutes.
+#
+# It gates the Marin delta and nothing else. Upstream's own workflows and pre-commit
+# matrix still run as upstream wrote them; this deliberately does not invoke them, and
+# the marin-style checks are scoped by [tool.marin-style] to Marin-authored files so
+# they can never reformat upstream code.
+#
+# What the delta smoke can and cannot cover: vLLM cannot infer a device from a
+# python-only build, so the behavior tests in tests/models/test_grugmoe.py (which need a
+# VllmConfig) cannot run on a CPU runner at all -- a compiled VLLM_TARGET_DEVICE=cpu
+# build takes far longer than a PR gate should. Those tests, and the serving path, run
+# on a real H100 in marin-nightly.yaml. What is left here is the check that matters most
+# for a fork: after an upstream refresh, does the delta still import and resolve?
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: marin-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  marin-precommit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # Pin uv so setup-uv resolves the version locally. Unpinned, it queries the
+          # GitHub /releases/latest API for "latest", which is rate-limited and outage
+          # prone and has flaked this job ("Could not determine uv version ... Falling
+          # back to latest. Getting latest version from GitHub API").
+          version: "0.11.21"
+
+      - name: Lint the Marin delta
+        run: uv run infra/pre-commit.py --all-files
+
+      - name: Check the vendored marin-style tree is not stale
+        run: >-
+          uvx --from
+          git+https://github.com/marin-community/marin-style@64ceb7ac07a4f66bba134cae814f6928f9e6af62
+          marin-style sync --check
+
+  delta-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # Pin uv to avoid setup-uv's flaky GitHub /releases/latest lookup (see the
+          # marin-precommit job above).
+          version: "0.11.21"
+          enable-cache: true
+
+      - name: Install vLLM (python-only, CPU)
+        # VLLM_TARGET_DEVICE=empty is upstream's documented python-only build: no kernels
+        # are compiled, which is what keeps this in the minutes range.
+        run: |
+          uv venv --python 3.12
+          VLLM_TARGET_DEVICE=empty uv pip install -e . --torch-backend=cpu
+
+      - name: Check the GrugMoE delta resolves against this base
+        run: .venv/bin/python infra/ci/delta_smoke.py
