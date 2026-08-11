@@ -129,8 +129,8 @@ jobs:
             --build-arg nvcc_threads="${{ matrix.nvcc_threads }}" \
             --build-arg GIT_REPO_CHECK=1 \
             --build-arg RUN_WHEEL_CHECK=true \
-            --cache-from type=gha,scope=marin-vllm-cu129-${{ matrix.architecture }} \
-            --cache-to type=gha,mode=max,ignore-error=true,scope=marin-vllm-cu129-${{ matrix.architecture }} \
+            --cache-from type=gha,scope=marin-vllm-cu130-${{ matrix.architecture }} \
+            --cache-to type=gha,mode=max,ignore-error=true,scope=marin-vllm-cu130-${{ matrix.architecture }} \
             --progress plain \
             -f docker/Dockerfile .
 
