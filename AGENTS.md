@@ -1,4 +1,105 @@
-# Agent Instructions for vLLM
+# Marin fork of vLLM
+
+@.agents/marin-style/AGENTS-core.md
+
+This repository is `marin-community/vllm`, a fork of `vllm-project/vllm` that is
+refreshed from upstream regularly. Two rulebooks apply, and which one governs
+depends on where the change is headed:
+
+- **Marin-authored changes that stay in this fork** follow the Marin standards
+  linked above (and `.agents/marin-style/TESTING-core.md`): no DCO sign-off, no
+  `Co-authored-by`/`Generated-with` trailers, no self-crediting, and agent-opened
+  PRs carry the `agent-generated` label.
+- **Changes destined for upstream** follow the upstream instructions retained
+  below, including their DCO and trailer conventions.
+
+## The Marin delta
+
+Everything Marin adds on top of upstream is small and deliberate:
+
+- **GrugMoE support** — `vllm/model_executor/models/grugmoe.py`,
+  `vllm/transformers_utils/configs/grugmoe.py`, `tests/models/test_grugmoe.py`,
+  plus one registry line in each of `vllm/model_executor/models/registry.py`,
+  `vllm/transformers_utils/config.py`, and
+  `vllm/transformers_utils/configs/__init__.py`.
+- **Surgical edits** — a scheduler held-request skip (`vllm/v1/core/sched/scheduler.py`),
+  TPU/macOS build tweaks (`setup.py`), a logger tweak (`vllm/logger.py`), and
+  requirements pins.
+
+`git diff $(git merge-base upstream/main HEAD)..HEAD` prints the whole delta. Keep
+it that way.
+
+## Minimize the upstream diff
+
+Every upstream-owned file this fork touches is merge pain on the next refresh, so:
+
+- **Never reformat, re-lint, or "clean up" upstream code**, and do not edit
+  `.pre-commit-config.yaml` or the upstream workflows in `.github/workflows/`.
+  Upstream keeps its own pre-commit stack (ruff, mypy, clang-format, DCO); it
+  still runs, unchanged, and it is what lints upstream code.
+- Put new Marin files in low-conflict paths: `infra/`,
+  `.github/workflows/marin-*.yaml`, `.agents/`, and the existing delta files.
+- Marin's lint entry point is `infra/pre-commit.py`, a shim over the shared
+  `marin-style` checks. The `[tool.marin-style]` block in `pyproject.toml` scopes
+  it to Marin-authored files only, so it can never touch upstream code.
+
+```bash
+infra/pre-commit.py --all-files        # what CI runs
+infra/pre-commit.py --changed-files    # diff-scoped, for local iteration
+```
+
+## Refreshes
+
+Marin pins this fork by exact SHA in `marin`'s root `pyproject.toml`, alongside a
+matching `tpu-inference` SHA; the two move together. Refreshes rebase the delta
+onto a newer upstream base and re-pin both, driven by marin's
+`.agents/skills/refresh-tpu-vllm-forks/SKILL.md`. A smaller delta is a cheaper
+refresh.
+
+## Install, test, run
+
+Use `uv` and `.venv/bin/python` — never system `python3` or bare `pip`.
+
+```bash
+uv venv --python 3.12
+
+# Python-only build: no kernels, imports work, installs in ~2 minutes. Enough for
+# infra/ci/delta_smoke.py, and it is what PR CI uses.
+VLLM_TARGET_DEVICE=empty uv pip install -e . --torch-backend=cpu
+
+# GPU build reusing upstream's prebuilt kernels (Python-only changes):
+VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+```
+
+The delta's tests need a GPU. vLLM infers its platform from the build, and a
+python-only build resolves to no device at all, so constructing the `VllmConfig`
+that these tests depend on fails on a CPU box; a compiled `VLLM_TARGET_DEVICE=cpu`
+build takes far too long to be a PR gate. Run them on an accelerator:
+
+```bash
+.venv/bin/python -m pytest tests/models/test_grugmoe.py -v
+.venv/bin/python -m pytest tests/v1/core/test_scheduler.py -v
+```
+
+## CI
+
+- `.github/workflows/marin-ci.yaml` — per-PR, CPU-only, minutes: the delta-scoped
+  `marin-style` lint, a `marin-style sync --check` drift gate, and a smoke
+  asserting the GrugMoE model and config still import and resolve against the
+  upstream base underneath them (the failure an upstream refresh actually causes).
+  It deliberately does **not** run upstream's test suites or pre-commit matrix.
+- `.github/workflows/marin-nightly.yaml` — nightly (10:00 UTC) and on demand:
+  builds this fork's commit on one CoreWeave H100 via Iris, runs the delta's GPU
+  tests, serves `Qwen/Qwen3-0.6B` through the OpenAI server, and gates the answers
+  and decode throughput against `infra/nightly/specs/qwen3-0.6b-h100.json`.
+
+---
+
+## Agent Instructions for vLLM (upstream)
+
+The rest of this file is upstream's, and applies to contributions sent to
+`vllm-project/vllm`. Where it conflicts with the Marin standards above, the Marin
+standards win for changes that stay in this fork.
 
 > These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
 > Breaching these guidelines can result in automatic banning.
