@@ -161,7 +161,11 @@ jobs:
         run: uv venv --python 3.12
 
       - name: Trim the Iris bundle
-        run: git rm -r --quiet docs
+        # The Iris job installs the published wheel and reads validation sources from
+        # candidate-source/, so the tracked source tree in the bundle root is redundant.
+        # Drop the largest of it to keep the bundle under the 25MB cap (the rebase onto a
+        # newer upstream base grew vllm/ and tests/ past it).
+        run: git rm -r --quiet docs vllm tests csrc rust benchmarks examples
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
