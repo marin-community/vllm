@@ -68,7 +68,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 360
+    timeout-minutes: 480
     env:
       DOCKER_BUILDKIT: "1"
       DOCKER_BUILD_SUMMARY: "false"
@@ -77,11 +77,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Reclaim x86_64 runner disk
+      - name: Reclaim x86_64 runner disk and add swap
         if: matrix.architecture == 'x86_64'
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          # The CUDA-13 compile peaks past the runner's ~16GB RAM and OOM-kills the
+          # runner agent mid-build (frozen step, no logs). Free disk and back the
+          # memory spikes with a large swapfile so the build fits the standard runner.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 32G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
           df -h /
+          free -h
 
       - uses: docker/setup-buildx-action@v3
 
@@ -113,6 +123,29 @@ jobs:
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } >> "$GITHUB_OUTPUT"
 
+      # Persist the compiler cache (compact object outputs, not the multi-GB base
+      # layers) across runs. Our overlay only touches Python, so at a fixed base an
+      # overlay-only rebuild is an all-hit ccache pass that finishes in minutes; the
+      # first build at a new base is a full cold compile that seeds the cache. Both
+      # steps are best-effort so a cache hiccup never fails the pin-critical build.
+      - name: Restore the CUDA compile cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ccache-cache
+          key: marin-vllm-cu130-ccache-${{ matrix.architecture }}-${{ github.sha }}
+          restore-keys: |
+            marin-vllm-cu130-ccache-${{ matrix.architecture }}-
+
+      - name: Load the compile cache into the builder
+        continue-on-error: true
+        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+        with:
+          cache-map: |
+            {
+              "ccache-cache": "/root/.cache/ccache"
+            }
+
       - name: Build and export the CUDA 13.0 wheel
         run: |
           mkdir -p artifacts
@@ -121,16 +154,14 @@ jobs:
             --output type=local,dest=artifacts \
             --build-arg BUILD_OS=manylinux \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
-            --build-arg CUDA_VERSION=13.0.3 \
-            --build-arg PYTHON_VERSION=3.12 \
+            --build-arg CUDA_VERSION="${{ matrix.cuda_version }}" \
+            --build-arg PYTHON_VERSION="${{ matrix.python_version }}" \
             --build-arg torch_cuda_arch_list="${{ matrix.sm_targets }}" \
             --build-arg max_jobs="${{ matrix.max_jobs }}" \
             --build-arg VLLM_MAX_SIZE_MB="${{ matrix.max_wheel_size_mb }}" \
             --build-arg nvcc_threads="${{ matrix.nvcc_threads }}" \
             --build-arg GIT_REPO_CHECK=1 \
             --build-arg RUN_WHEEL_CHECK=true \
-            --cache-from type=gha,scope=marin-vllm-cu130-${{ matrix.architecture }} \
-            --cache-to type=gha,mode=max,ignore-error=true,scope=marin-vllm-cu130-${{ matrix.architecture }} \
             --progress plain \
             -f docker/Dockerfile .
 
