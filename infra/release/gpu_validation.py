@@ -112,7 +112,7 @@ def initial_result(
         "gates": {
             WHEEL_SHA_GATE: gate("not_run"),
             DISTRIBUTION_GATE: gate("not_run"),
-            "vllm._C": gate("not_run"),
+            "vllm._C_stable_libtorch": gate("not_run"),
             GRUG_ARCHITECTURE: gate("not_run"),
             CUMEM_GATE: gate("not_run"),
             SOURCE_TESTS_GATE: gate("not_run"),
@@ -148,7 +148,7 @@ def probe_installed(args: argparse.Namespace) -> int:
         "hardware": {},
         "gates": {
             DISTRIBUTION_GATE: gate("not_run"),
-            "vllm._C": gate("not_run"),
+            "vllm._C_stable_libtorch": gate("not_run"),
             GRUG_ARCHITECTURE: gate("not_run"),
             CUMEM_GATE: gate("not_run"),
         },
@@ -197,11 +197,11 @@ def probe_installed(args: argparse.Namespace) -> int:
             result["hardware"]["status"] = "passed"
 
     try:
-        importlib.import_module("vllm._C")
-        result["gates"]["vllm._C"] = gate("passed")
+        importlib.import_module("vllm._C_stable_libtorch")
+        result["gates"]["vllm._C_stable_libtorch"] = gate("passed")
     except Exception as exc:
         failed = True
-        result["gates"]["vllm._C"] = gate("failed", repr(exc))
+        result["gates"]["vllm._C_stable_libtorch"] = gate("failed", repr(exc))
 
     try:
         module = importlib.import_module("vllm.model_executor.models.grugmoe")

@@ -89,7 +89,7 @@ def write_wheel(
     *,
     architecture: str,
     include_cumem: bool = True,
-    version: str = "0.0.0.dev20260803+marin.test.cu129",
+    version: str = "0.0.0.dev20260803+marin.test.cu130",
 ) -> None:
     dist_info = f"vllm-{version}.dist-info"
     metadata = (
@@ -97,7 +97,7 @@ def write_wheel(
         "Name: vllm\n"
         f"Version: {version}\n"
         "Requires-Python: >=3.10,<3.15\n"
-        "Requires-Dist: torch==2.11.0\n"
+        "Requires-Dist: torch==2.13.0\n"
         "Requires-Dist: transformers>=4.56.0\n"
         "\n"
     )
@@ -111,7 +111,7 @@ def write_wheel(
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(f"{dist_info}/METADATA", metadata)
         archive.writestr(f"{dist_info}/WHEEL", wheel_metadata)
-        archive.writestr("vllm/_C.cpython-312-test.so", b"compiled")
+        archive.writestr("vllm/_C_stable_libtorch.cpython-312-test.so", b"compiled")
         if include_cumem:
             archive.writestr(
                 "vllm/cumem_allocator.cpython-312-test.so", b"compiled"
@@ -130,7 +130,7 @@ def fragment(
 ) -> dict:
     config = load_json(CONFIG_PATH)
     wheel = tmp_path / (
-        "vllm-0.0.0.dev20260803+marin.test.cu129-cp38-abi3-"
+        "vllm-0.0.0.dev20260803+marin.test.cu130-cp38-abi3-"
         f"manylinux_2_28_{architecture}.whl"
     )
     write_wheel(wheel, architecture=architecture, include_cumem=include_cumem)
@@ -206,7 +206,7 @@ def validation(candidate_manifest: dict, architecture: str) -> dict:
         "gates": {
             "wheel_sha256": {"status": "passed"},
             "distribution_metadata": {"status": "passed"},
-            "vllm._C": {"status": "passed"},
+            "vllm._C_stable_libtorch": {"status": "passed"},
             GRUG_ARCHITECTURE: {"status": "passed"},
             "cumem_allocator": {
                 "status": "passed",
@@ -233,15 +233,15 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
 
     assert record["distribution"] == {
         "name": "vllm",
-        "version": "0.0.0.dev20260803+marin.test.cu129",
+        "version": "0.0.0.dev20260803+marin.test.cu130",
         "requires_python": ">=3.10,<3.15",
-        "torch_metadata_requirement": "torch==2.11.0",
+        "torch_metadata_requirement": "torch==2.13.0",
     }
     assert record["source"]["fork_commit"] == FORK_COMMIT
     assert record["source"]["upstream_base"] == UPSTREAM_BASE
     assert record["build"]["python_version"] == "3.12"
-    assert record["build"]["torch_version"] == "2.11.0+cu129"
-    assert record["build"]["cuda_toolkit_version"] == "12.9.1"
+    assert record["build"]["torch_version"] == "2.13.0+cu130"
+    assert record["build"]["cuda_toolkit_version"] == "13.0.3"
     assert record["platform"]["wheel_tags"] == [
         "cp38-abi3-linux_x86_64"
     ]
@@ -249,7 +249,7 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
         "cp38-abi3-manylinux_2_28_x86_64"
     )
     assert record["platform"]["packaged"] == {
-        "vllm._C": "included",
+        "vllm._C_stable_libtorch": "included",
         "vllm.cumem_allocator": "included",
         GRUG_ARCHITECTURE: "included",
     }
