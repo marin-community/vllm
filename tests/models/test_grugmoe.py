@@ -38,7 +38,7 @@ from vllm.model_executor.models.grugmoe import (
     get_grug_moe_runtime_info,
 )
 from vllm.model_executor.models.registry import ModelRegistry
-from vllm.transformers_utils.config import get_config, is_interleaved
+from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -285,7 +285,7 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
         assert cfg.layer_types[3] == "full_attention"
         assert cfg.layer_types[24] == "sliding_attention"
         assert cfg.layer_types[25] == "full_attention"
-        assert is_interleaved(cfg)
+        assert set(cfg.layer_types) == {"full_attention", "sliding_attention"}
         assert cfg.rms_norm_eps == 1e-6
         assert cfg.initializer_range == 0.01
         assert cfg.qk_mult == 0.5
