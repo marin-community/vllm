@@ -26,7 +26,7 @@ VALIDATION_SENTINEL = "MARIN_GPU_VALIDATION_JSON="
 RELEASE_REPOSITORY = "marin-community/vllm"
 SOURCE_REPOSITORY = "https://github.com/marin-community/vllm"
 UPSTREAM_REPOSITORY = "https://github.com/vllm-project/vllm"
-REQUIRED_EXTENSIONS = ("vllm._C", "vllm.cumem_allocator")
+REQUIRED_EXTENSIONS = ("vllm._C_stable_libtorch", "vllm.cumem_allocator")
 GRUG_ARCHITECTURE = "GrugMoeForCausalLM"
 CANDIDATE_TAG_PREFIX = "marin-vllm-gpu-candidate-"
 RELEASE_TAG_PREFIX = "marin-vllm-gpu-"
@@ -46,7 +46,7 @@ SERVE_GATE = "serve_smoke"
 REQUIRED_RUNTIME_GATES = (
     WHEEL_SHA_GATE,
     DISTRIBUTION_GATE,
-    "vllm._C",
+    "vllm._C_stable_libtorch",
     GRUG_ARCHITECTURE,
     CUMEM_GATE,
     SERVE_GATE,
@@ -131,10 +131,10 @@ def _wheel_document(wheel: Path) -> WheelDocument:
             if b"class GrugMoeForCausalLM" in source:
                 grug_state = "included"
         packaged = {
-            "vllm._C": (
+            "vllm._C_stable_libtorch": (
                 "included"
                 if any(
-                    re.fullmatch(r"vllm/_C(?:\.[^/]*)?\.so", name)
+                    re.fullmatch(r"vllm/_C_stable_libtorch(?:\.[^/]*)?\.so", name)
                     for name in members
                 )
                 else "absent"
