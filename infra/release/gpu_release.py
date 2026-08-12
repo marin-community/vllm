@@ -610,6 +610,10 @@ def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 "architecture": architecture,
                 "runner": platform["runner"],
                 "build_base_image": platform["build_base_image"],
+                # Build-arg values are sourced from config.json so the workflow
+                # holds no toolchain literals that can drift from the base image.
+                "cuda_version": config["cuda_toolkit_version"],
+                "python_version": config["python_version"],
                 "max_jobs": platform["max_jobs"],
                 "max_wheel_size_mb": platform["max_wheel_size_mb"],
                 "nvcc_threads": platform["nvcc_threads"],
