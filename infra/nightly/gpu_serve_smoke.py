@@ -21,6 +21,8 @@ import contextlib
 import json
 import logging
 import os
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -116,6 +118,30 @@ def server_command(model: str, port: int, attention_backend: str | None) -> list
     return command
 
 
+def pick_free_port() -> int:
+    """Return a currently-free localhost TCP port.
+
+    The GB200 validation lane runs with host networking, so a fixed serve port
+    collides with anything already bound on the node (including a prior run's
+    server that outlived its job). Letting the kernel assign a free port avoids
+    that class of "address already in use" startup failure.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _terminate_process_group(server: subprocess.Popen) -> None:
+    """Stop the server and every process in its group, escalating to SIGKILL."""
+    for sig, timeout in ((signal.SIGTERM, 60), (signal.SIGKILL, 60)):
+        if server.poll() is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(os.getpgid(server.pid), sig)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            server.wait(timeout=timeout)
+
+
 @contextlib.contextmanager
 def serve(
     model: str,
@@ -140,18 +166,16 @@ def serve(
     """
     command = server_command(model, port, attention_backend)
     logger.info("starting server: %s", " ".join(command))
-    server = subprocess.Popen(command)
+    # Own a fresh process group so cleanup reaps vLLM's API-server and engine-core
+    # children, not just the launcher. A leaked child keeps the serve port bound and
+    # makes the next run on the same node fail with "address already in use".
+    server = subprocess.Popen(command, start_new_session=True)
     try:
         base_url = f"http://127.0.0.1:{port}/v1"
         wait_until_ready(server, base_url, startup_timeout)
         yield base_url
     finally:
-        server.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            server.wait(timeout=60)
-        if server.poll() is None:
-            server.kill()
-            server.wait(timeout=60)
+        _terminate_process_group(server)
 
 
 def wait_until_ready(server: subprocess.Popen, base_url: str, timeout: float) -> None:
@@ -267,7 +291,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec", type=Path, required=True, help="Path to the spec.")
     parser.add_argument("--model", help="Override the model id in the spec.")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Serve port; 0 (default) lets the kernel pick a free one.",
+    )
     parser.add_argument(
         "--attention-backend",
         help="Pass an explicit attention backend to vLLM instead of auto-selecting.",
@@ -293,10 +322,11 @@ def main() -> int:
 
     spec = GateSpec.load(args.spec)
     model = args.model or spec.model
+    port = args.port or pick_free_port()
 
     with serve(
         model,
-        args.port,
+        port,
         args.startup_timeout,
         args.attention_backend,
     ) as base_url:
