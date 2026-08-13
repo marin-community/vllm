@@ -1,11 +1,11 @@
 name: Marin vLLM GPU Candidate
 
-# Marin fork only. Build one immutable candidate from every merged main commit.
+# Marin fork only. Build one immutable candidate from every merged gpu commit.
 # GPU validation and release promotion live in marin-gpu-release.yaml.
 
 on:
   push:
-    branches: [main]
+    branches: [gpu]
     # These paths do not alter packaged wheel bytes. Candidate-workflow changes
     # remain testable through workflow_dispatch.
     paths-ignore:

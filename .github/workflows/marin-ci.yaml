@@ -17,7 +17,7 @@ name: Marin CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [gpu]
   workflow_dispatch:
 
 concurrency:
