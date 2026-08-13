@@ -356,6 +356,10 @@ def _minimal_model_config_for_parallel_check(
 def test_parallel_config_allows_tpu_heads_but_preserves_gpu_checks(
     monkeypatch,
 ):
+    # ParallelConfig now eagerly rejects world_size > device_count on CUDA at
+    # construction, so pretend the node has enough GPUs to build the 8-way TP
+    # config this test uses only as a fixture for verify_with_parallel_config.
+    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 8)
     parallel_config = ParallelConfig(tensor_parallel_size=8)
 
     grug_model_config = _minimal_model_config_for_parallel_check(
