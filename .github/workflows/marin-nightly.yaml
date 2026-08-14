@@ -65,15 +65,6 @@ jobs:
           # queries the API for "latest" and is rate-limited and outage prone.
           version: "0.11.21"
 
-      - name: Trim the Iris bundle
-        # Iris bundles the working directory and caps the zip at 25MB; this tree zips to
-        # 38MB, nearly all of it docs/. `git rm -r docs` (not --cached) has to drop them
-        # from the working tree too: the bundler enumerates
-        # `git ls-files --cached --others --exclude-standard`, so files merely removed from
-        # the index come back as untracked. Without docs the bundle is 14MB. The checkout
-        # is throwaway, so this never touches anything real.
-        run: git rm -r --quiet docs
-
       - name: Resolve the upstream base commit and the package version
         # The bundle ships without .git, so the two things setup.py would ask git for are
         # computed here, where the real checkout is, and passed into the job.
@@ -102,16 +93,22 @@ jobs:
       - name: Install the Iris client
         # marin-core depends on marin-iris, but uv only symlinks the named package's own
         # scripts, so the tool's bin dir goes on PATH to make `iris` resolve. The floor is
-        # the first build carrying the WIF/IAP auth fix (marin#7144).
+        # the first dev build carrying `iris job run --exclude` (marin#8255), which the serve
+        # step relies on to trim the bundle; it subsumes the earlier WIF/IAP auth floor
+        # (marin#7144). 0.2.79 was the last release before #8255, so the next daily marin-core
+        # dev build (0.2.80.dev*, cut from main) is the first that has the flag.
         run: |
-          uv tool install --prerelease allow "marin-core>=0.2.46.dev202607131620"
+          uv tool install --prerelease allow "marin-core>=0.2.80.dev0"
           echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
 
       - name: Serve and gate on one H100
         # --gpu is gated behind --enable-extra-resources by iris. --no-sync stops iris from
-        # syncing the bundled workspace; run_h100.sh builds its own venv. `iris job run`
-        # blocks, streams the job's logs, and exits non-zero unless the job succeeded, so
-        # the gate's exit code inside the job is this step's exit code.
+        # syncing the bundled workspace; run_h100.sh builds its own venv. --exclude '^docs/'
+        # drops docs/ from the workspace bundle -- it is nearly all of this tree's 38MB and
+        # would otherwise blow Iris's 25MB zip cap -- so the bundler skips it instead of the
+        # checkout being mutated by `git rm`. `iris job run` blocks, streams the job's logs,
+        # and exits non-zero unless the job succeeded, so the gate's exit code inside the job
+        # is this step's exit code.
         #
         # --timeout is the server-side backstop that bounds how long a wedged run can hold
         # the GPU. A healthy run is ~8 minutes end to end (install ~3, tests ~1.5, serve and
@@ -124,6 +121,7 @@ jobs:
             --gpu H100x1 --enable-extra-resources \
             --cpu 8 --memory 64GB --disk 200GB \
             --no-sync \
+            --exclude '^docs/' \
             --timeout 1500 \
             -e VLLM_PRECOMPILED_WHEEL_COMMIT "$VLLM_PRECOMPILED_WHEEL_COMMIT" \
             -e SETUPTOOLS_SCM_PRETEND_VERSION "$SETUPTOOLS_SCM_PRETEND_VERSION" \
