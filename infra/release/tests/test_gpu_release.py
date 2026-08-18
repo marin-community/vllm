@@ -84,6 +84,12 @@ def test_server_command_pins_requested_attention_backend():
     assert command[-2:] == ["--attention-backend", "FLASH_ATTN"]
 
 
+def test_server_command_uses_requested_tensor_parallel_size():
+    command = server_command("Qwen/Qwen3-0.6B", 8000, None, 8)
+
+    assert command[-2:] == ["--tensor-parallel-size", "8"]
+
+
 def write_wheel(
     path: Path,
     *,
