@@ -56,7 +56,10 @@ def test_placed_tpu_rejects_empty_metadata(
         lambda *_args, **_kwargs: _MetadataResponse(b""),
     )
 
-    with pytest.raises(tpu_validation.ValidationFailure, match="empty physical TPU type"):
+    with pytest.raises(
+        tpu_validation.ValidationFailure,
+        match="empty physical TPU type",
+    ):
         tpu_validation.placed_tpu()
 
 
