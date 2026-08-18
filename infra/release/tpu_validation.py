@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import os
 import tempfile
 import traceback
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -30,19 +31,30 @@ from tpu_release import (
     write_json,
 )
 
+GCP_TPU_TYPE_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/"
+    "accelerator-type"
+)
+
 
 def placed_tpu() -> str:
-    device = json.loads(os.environ["IRIS_WORKER_DEVICE"])
-    tpu = device.get("tpu")
-    if (
-        not isinstance(tpu, dict)
-        or not isinstance(tpu.get("variant"), str)
-        or not tpu["variant"]
-    ):
+    """Return the physical TPU type reported by GCP instance metadata."""
+    request = urllib.request.Request(
+        GCP_TPU_TYPE_URL,
+        headers={"Metadata-Flavor": "Google"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            tpu = response.read().decode().strip()
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
         raise ValidationFailure(
-            "IRIS_WORKER_DEVICE does not contain a TPU variant"
+            "could not read the physical TPU type from GCP metadata"
+        ) from exc
+    if not tpu:
+        raise ValidationFailure(
+            "GCP metadata returned an empty physical TPU type"
         )
-    return tpu["variant"]
+    return tpu
 
 
 def initial_result(
