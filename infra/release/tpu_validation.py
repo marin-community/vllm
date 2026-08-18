@@ -118,8 +118,10 @@ def validate(args: argparse.Namespace) -> int:
                 f"Iris placed {selected_tpu}, expected {expected_tpu}"
             )
 
+        # Iris mounts /tmp noexec. Keep the installed environment under its
+        # executable task workdir so native libraries can be mapped.
         with tempfile.TemporaryDirectory(
-            prefix="marin-vllm-tpu-release-"
+            prefix="marin-vllm-tpu-release-", dir=Path.cwd()
         ) as directory:
             workdir = Path(directory)
             environment["UV_CACHE_DIR"] = str(workdir / "uv-cache")
