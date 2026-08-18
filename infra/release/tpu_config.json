@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "brand": "Marin vLLM TPU",
+  "python_version": "3.12",
+  "platform": "linux_x86_64",
+  "vllm_target_device": "tpu",
+  "package_versions": {
+    "vllm": {"base": "0.20.1rc1.dev0", "suffix": ".tpu"},
+    "tpu-inference": {"base": "0.26.0", "suffix": ""}
+  },
+  "required_runtime_distributions": ["jax", "jaxlib", "libtpu"],
+  "validation": {
+    "hardware": "v6e-8",
+    "region": "us-east5",
+    "tensor_parallel_size": 8,
+    "spec": "infra/nightly/specs/qwen3-0.6b-tpu.json"
+  },
+  "repositories": {
+    "vllm": "marin-community/vllm",
+    "tpu-inference": "marin-community/tpu-inference"
+  }
+}

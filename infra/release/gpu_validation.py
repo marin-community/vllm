@@ -49,7 +49,7 @@ SOURCE_TEST_EXCLUDES = (
 
 
 class ValidationFailure(RuntimeError):
-    """A GPU release validation phase failed."""
+    """A release validation phase failed."""
 
 
 def gate(status: str, detail: str = "") -> dict[str, str]:
@@ -295,9 +295,11 @@ def source_node_id(source_root: Path, node_id: str) -> str:
     return f"{absolute_path}::{selection}"
 
 
-def emit_result(result: dict[str, Any]) -> None:
+def emit_result(
+    result: dict[str, Any], *, sentinel: str = VALIDATION_SENTINEL
+) -> None:
     payload = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
-    print(VALIDATION_SENTINEL + base64.b64encode(payload).decode(), flush=True)
+    print(sentinel + base64.b64encode(payload).decode(), flush=True)
 
 
 def install_wheel_environment(

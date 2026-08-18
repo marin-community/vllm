@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Serve a model with this fork's OpenAI server and gate the result.
 
-Runs inside an Iris GPU job against either a vLLM built from the fork commit under
-test or a cleanly installed release wheel. Boots `vllm serve`, waits for the server
-to report ready, sends a fixed prompt set, and compares the run against a checked-in
-spec: every prompt must come back with a non-empty answer of at least
-`min_completion_tokens`, and decode throughput must clear the spec's floor.
+Runs inside an Iris accelerator job against either a vLLM built from the fork
+commit under test or a cleanly installed release wheel. Boots `vllm serve`, waits
+for the server to report ready, sends a fixed prompt set, and compares the run
+against a checked-in spec: every prompt must return a non-empty answer of at
+least `min_completion_tokens`, and decode throughput must clear the spec's floor.
 
 Deliberately stdlib-only and it never imports vllm: it talks to the server over HTTP,
 so a broken import in the model code surfaces as a serve failure rather than as a
@@ -100,7 +100,12 @@ def post_json(url: str, payload: dict, timeout: float) -> dict:
         return json.loads(response.read())
 
 
-def server_command(model: str, port: int, attention_backend: str | None) -> list[str]:
+def server_command(
+    model: str,
+    port: int,
+    attention_backend: str | None,
+    tensor_parallel_size: int = 1,
+) -> list[str]:
     """Build the OpenAI server command for this smoke."""
     command = [
         sys.executable,
@@ -112,6 +117,8 @@ def server_command(model: str, port: int, attention_backend: str | None) -> list
         str(port),
         "--max-model-len",
         "4096",
+        "--tensor-parallel-size",
+        str(tensor_parallel_size),
     ]
     if attention_backend is not None:
         command.extend(("--attention-backend", attention_backend))
@@ -148,6 +155,7 @@ def serve(
     port: int,
     startup_timeout: float,
     attention_backend: str | None,
+    tensor_parallel_size: int,
 ) -> Iterator[str]:
     """Run `vllm serve` for the duration of the block, yielding its base URL.
 
@@ -157,6 +165,7 @@ def serve(
         startup_timeout: Seconds to wait for the server to report ready.
         attention_backend: Explicit vLLM attention backend, or auto-selection when
             unset.
+        tensor_parallel_size: Number of accelerator devices used by the server.
 
     Yields:
         The server's OpenAI base URL.
@@ -164,7 +173,9 @@ def serve(
     Raises:
         RuntimeError: If the server exits or fails to become ready in time.
     """
-    command = server_command(model, port, attention_backend)
+    command = server_command(
+        model, port, attention_backend, tensor_parallel_size
+    )
     logger.info("starting server: %s", " ".join(command))
     # Own a fresh process group so cleanup reaps vLLM's API-server and engine-core
     # children, not just the launcher. A leaked child keeps the serve port bound and
@@ -308,6 +319,12 @@ def main() -> int:
         help="Seconds to wait for the server to become ready.",
     )
     parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Number of accelerator devices used by the server.",
+    )
+    parser.add_argument(
         "--record",
         action="store_true",
         help="Rewrite the spec from this run instead of gating against it.",
@@ -329,6 +346,7 @@ def main() -> int:
         port,
         args.startup_timeout,
         args.attention_backend,
+        args.tensor_parallel_size,
     ) as base_url:
         result = run_prompts(base_url, model)
 
