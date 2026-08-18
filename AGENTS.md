@@ -38,8 +38,10 @@ Every upstream-owned file this fork touches is merge pain on the next refresh, s
 
 - **Never reformat, re-lint, or "clean up" upstream code**, and do not edit
   `.pre-commit-config.yaml` or the upstream workflows in `.github/workflows/`.
-  Upstream keeps its own pre-commit stack (ruff, mypy, clang-format, DCO); it
-  still runs, unchanged, and it is what lints upstream code.
+  The workflow files stay byte-for-byte upstream to keep refreshes cheap, but
+  every non-`marin-*` workflow is disabled in this fork's GitHub settings.
+  Upstream keeps its own pre-commit stack (ruff, mypy, clang-format, DCO) for
+  changes submitted to `vllm-project/vllm`.
 - Put new Marin files in low-conflict paths: `infra/`,
   `.github/workflows/marin-*.yaml`, `.agents/`, and the existing delta files.
 - Marin's lint entry point is `infra/pre-commit.py`, a shim over the shared
@@ -85,6 +87,10 @@ build takes far too long to be a PR gate. Run them on an accelerator:
 ```
 
 ## CI
+
+Only `.github/workflows/marin-*.yaml` workflows are enabled in
+`marin-community/vllm`. Upstream workflows remain disabled through GitHub
+settings so refreshes can retain their files without running them on the fork.
 
 - `.github/workflows/marin-ci.yaml` — per-PR, CPU-only, minutes: the delta-scoped
   `marin-style` lint, a `marin-style sync --check` drift gate, and a smoke
