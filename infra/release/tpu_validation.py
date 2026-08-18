@@ -24,6 +24,7 @@ from gpu_validation import (
 from tpu_release import (
     VALIDATION_SENTINEL,
     load_json,
+    local_flat_index,
     sha256_file,
     validate_candidate,
     write_json,
@@ -136,30 +137,31 @@ def validate(args: argparse.Namespace) -> int:
                 phase="uv venv",
             )
             python = virtual_environment / "bin/python"
-            require_command(
-                [
-                    "uv",
-                    "pip",
-                    "install",
-                    "--python",
-                    str(python),
-                    "--prerelease",
-                    "allow",
-                    "--exclude-newer",
-                    candidate["compatibility"]["exclude_newer"],
-                    "--torch-backend",
-                    "cpu",
-                    "--find-links",
-                    str(index_path),
-                    *(
-                        f"{package['distribution']}=={package['version']}"
-                        for package in candidate["packages"]
-                    ),
-                ],
-                cwd=workdir,
-                environment=environment,
-                phase="wheel pair install",
-            )
+            with local_flat_index(index_path) as index_url:
+                require_command(
+                    [
+                        "uv",
+                        "pip",
+                        "install",
+                        "--python",
+                        str(python),
+                        "--prerelease",
+                        "allow",
+                        "--exclude-newer",
+                        candidate["compatibility"]["exclude_newer"],
+                        "--torch-backend",
+                        "cpu",
+                        "--find-links",
+                        index_url,
+                        *(
+                            f"{package['distribution']}=={package['version']}"
+                            for package in candidate["packages"]
+                        ),
+                    ],
+                    cwd=workdir,
+                    environment=environment,
+                    phase="wheel pair install",
+                )
             require_command(
                 [
                     str(python),

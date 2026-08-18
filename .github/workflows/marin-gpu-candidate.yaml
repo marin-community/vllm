@@ -508,14 +508,16 @@ jobs:
             published/marin-vllm-tpu-manifest.json)
           INDEX_FILENAME=$(jq -r '.index.filename' published/marin-vllm-tpu-manifest.json)
           uv venv --python "${{ steps.pair.outputs.python_version }}" .tpu-url-smoke
-          UV_CACHE_DIR="$GITHUB_WORKSPACE/.tpu-public-cache" uv pip install \
-            --python .tpu-url-smoke/bin/python \
-            --prerelease allow \
-            --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-            --torch-backend cpu \
-            --find-links "published/$INDEX_FILENAME" \
-            "vllm==$VLLM_VERSION" \
-            "tpu-inference==$TPU_VERSION"
+          UV_CACHE_DIR="$GITHUB_WORKSPACE/.tpu-public-cache" \
+            .metadata/bin/python infra/release/tpu_release.py run-with-index \
+              --index "published/$INDEX_FILENAME" -- \
+              uv pip install \
+                --python .tpu-url-smoke/bin/python \
+                --prerelease allow \
+                --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
+                --torch-backend cpu \
+                "vllm==$VLLM_VERSION" \
+                "tpu-inference==$TPU_VERSION"
           .tpu-url-smoke/bin/python -c \
             "import vllm; from tpu_inference.runner.tpu_runner import TPUModelRunner"
 

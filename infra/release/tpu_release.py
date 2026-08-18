@@ -7,16 +7,24 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import copy
+import functools
 import hashlib
 import html
+import http.server
 import json
+import os
 import re
+import subprocess
 import sys
+import threading
 import zipfile
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 try:
     from infra.release.gpu_release import (
@@ -54,6 +62,27 @@ COMPATIBILITY_KEYS = (
     "platform",
     "vllm_target_device",
 )
+
+
+class _QuietIndexHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+@contextlib.contextmanager
+def local_flat_index(index: Path) -> Iterator[str]:
+    """Expose one verified HTML index to uv over loopback."""
+    if not index.is_file():
+        raise ReleaseError(f"flat index does not exist: {index}")
+    handler = functools.partial(_QuietIndexHandler, directory=str(index.parent))
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}/{quote(index.name)}"
+        finally:
+            server.shutdown()
+            thread.join()
 
 
 def _is_lower_hex(value: str, length: int) -> bool:
@@ -634,6 +663,10 @@ def _parser() -> argparse.ArgumentParser:
     result.add_argument("--result", type=Path, required=True)
     result.add_argument("--candidate", type=Path, required=True)
     result.add_argument("--config", type=Path, required=True)
+
+    run = commands.add_parser("run-with-index")
+    run.add_argument("--index", type=Path, required=True)
+    run.add_argument("argv", nargs=argparse.REMAINDER)
     return parser
 
 
@@ -700,6 +733,13 @@ def main() -> int:
                 load_json(args.candidate),
                 load_json(args.config),
             )
+        elif args.command == "run-with-index":
+            command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+            if not command:
+                raise ReleaseError("run-with-index requires a command after --")
+            with local_flat_index(args.index.resolve()) as index_url:
+                environment = {**os.environ, "UV_FIND_LINKS": index_url}
+                return subprocess.run(command, env=environment, check=False).returncode
         return 0
     except (KeyError, OSError, ReleaseError, zipfile.BadZipFile) as exc:
         print(f"error: {exc}", file=sys.stderr)
