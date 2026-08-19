@@ -14,20 +14,18 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from gpu_validation import (
+from release_common import load_json, sha256_file, write_json
+from tpu_release import (
+    VALIDATION_SENTINEL,
+    local_flat_index,
+    validate_candidate,
+)
+from validation_common import (
     ValidationFailure,
     download_wheel,
     emit_result,
     gate,
     require_command,
-)
-from tpu_release import (
-    VALIDATION_SENTINEL,
-    load_json,
-    local_flat_index,
-    sha256_file,
-    validate_candidate,
-    write_json,
 )
 
 GCP_TPU_TYPE_URL = (
