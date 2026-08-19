@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from infra.release.gpu_release import ReleaseError, load_json, sha256_file
+from infra.release.release_common import ReleaseError, load_json, sha256_file
 from infra.release.tpu_release import (
     assemble_candidate,
     candidate_tag,

@@ -26,28 +26,28 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-try:
-    from infra.release.gpu_release import (
+if __package__:
+    from .release_common import (
         RELEASE_REPOSITORY,
         ReleaseError,
-        _wheel_document,
         load_json,
         normalized_distribution_name,
         release_asset_url,
         requirement_name,
         sha256_file,
+        wheel_metadata,
         write_json,
     )
-except ModuleNotFoundError:  # Direct script execution sets sys.path to this directory.
-    from gpu_release import (  # type: ignore[no-redef]
+else:
+    from release_common import (  # type: ignore[no-redef]
         RELEASE_REPOSITORY,
         ReleaseError,
-        _wheel_document,
         load_json,
         normalized_distribution_name,
         release_asset_url,
         requirement_name,
         sha256_file,
+        wheel_metadata,
         write_json,
     )
 
@@ -197,7 +197,7 @@ def expected_package_version(
 
 def inspect_wheel(wheel: Path, config: dict[str, Any]) -> dict[str, Any]:
     """Read the public identity and dependency contract from one wheel."""
-    document = _wheel_document(wheel)
+    document = wheel_metadata(wheel)
     metadata = document.metadata
     distribution = normalized_distribution_name(metadata.get("Name", ""))
     if distribution not in REQUIRED_DISTRIBUTIONS:
