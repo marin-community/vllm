@@ -81,6 +81,7 @@ def test_candidate_build_ignores_release_only_changes():
 def test_server_command_pins_requested_attention_backend():
     command = server_command("Qwen/Qwen3-0.6B", 8000, "FLASH_ATTN")
 
+    assert "--tensor-parallel-size" not in command
     assert command[-2:] == ["--attention-backend", "FLASH_ATTN"]
 
 

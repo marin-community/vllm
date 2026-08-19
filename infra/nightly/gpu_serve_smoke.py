@@ -104,7 +104,7 @@ def server_command(
     model: str,
     port: int,
     attention_backend: str | None,
-    tensor_parallel_size: int = 1,
+    tensor_parallel_size: int | None = None,
 ) -> list[str]:
     """Build the OpenAI server command for this smoke."""
     command = [
@@ -117,9 +117,9 @@ def server_command(
         str(port),
         "--max-model-len",
         "4096",
-        "--tensor-parallel-size",
-        str(tensor_parallel_size),
     ]
+    if tensor_parallel_size is not None:
+        command.extend(("--tensor-parallel-size", str(tensor_parallel_size)))
     if attention_backend is not None:
         command.extend(("--attention-backend", attention_backend))
     return command
@@ -155,7 +155,7 @@ def serve(
     port: int,
     startup_timeout: float,
     attention_backend: str | None,
-    tensor_parallel_size: int,
+    tensor_parallel_size: int | None,
 ) -> Iterator[str]:
     """Run `vllm serve` for the duration of the block, yielding its base URL.
 
@@ -165,7 +165,8 @@ def serve(
         startup_timeout: Seconds to wait for the server to report ready.
         attention_backend: Explicit vLLM attention backend, or auto-selection when
             unset.
-        tensor_parallel_size: Number of accelerator devices used by the server.
+        tensor_parallel_size: Number of accelerator devices used by the server;
+            unset preserves the server default.
 
     Yields:
         The server's OpenAI base URL.
@@ -321,8 +322,7 @@ def main() -> int:
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=1,
-        help="Number of accelerator devices used by the server.",
+        help="Number of accelerator devices used by the server when explicitly set.",
     )
     parser.add_argument(
         "--record",

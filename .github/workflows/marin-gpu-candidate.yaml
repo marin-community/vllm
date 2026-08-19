@@ -327,6 +327,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Create the metadata environment
+        run: uv venv --python "$(jq -r '.python_version' "$TPU_RELEASE_CONFIG")" .metadata
+
       - name: Read exact package sources
         id: pair
         run: |
@@ -340,11 +347,11 @@ jobs:
             echo "exclude_newer must be a whole-second UTC timestamp." >&2
             exit 1
           fi
-          VLLM_VERSION=$(python3 infra/release/tpu_release.py package-version \
+          VLLM_VERSION=$(.metadata/bin/python infra/release/tpu_release.py package-version \
             --config "$TPU_RELEASE_CONFIG" \
             --distribution vllm \
             --source-commit "${{ inputs.vllm_commit }}")
-          TPU_VERSION=$(python3 infra/release/tpu_release.py package-version \
+          TPU_VERSION=$(.metadata/bin/python infra/release/tpu_release.py package-version \
             --config "$TPU_RELEASE_CONFIG" \
             --distribution tpu-inference \
             --source-commit "${{ inputs.tpu_inference_commit }}")
@@ -359,14 +366,6 @@ jobs:
             echo "vllm_version=${VLLM_VERSION}"
             echo "tpu_version=${TPU_VERSION}"
           } >> "$GITHUB_OUTPUT"
-
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: ${{ env.UV_VERSION }}
-          python-version: ${{ steps.pair.outputs.python_version }}
-
-      - name: Create the metadata environment
-        run: uv venv --python "${{ steps.pair.outputs.python_version }}" .metadata
 
       - name: Checkout exact vLLM source
         uses: actions/checkout@v4
