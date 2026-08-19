@@ -10,7 +10,6 @@ import contextlib
 import os
 import tempfile
 import traceback
-import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -37,19 +36,14 @@ GCP_TPU_TYPE_URL = (
 )
 
 
-def placed_tpu() -> str:
+def physical_tpu_type() -> str:
     """Return the physical TPU type reported by GCP instance metadata."""
     request = urllib.request.Request(
         GCP_TPU_TYPE_URL,
         headers={"Metadata-Flavor": "Google"},
     )
-    try:
-        with urllib.request.urlopen(request, timeout=2) as response:
-            tpu = response.read().decode().strip()
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-        raise ValidationFailure(
-            "could not read the physical TPU type from GCP metadata"
-        ) from exc
+    with urllib.request.urlopen(request, timeout=2) as response:
+        tpu = response.read().decode().strip()
     if not tpu:
         raise ValidationFailure(
             "GCP metadata returned an empty physical TPU type"
@@ -110,7 +104,7 @@ def validate(args: argparse.Namespace) -> int:
 
     try:
         validate_candidate(candidate, config)
-        selected_tpu = placed_tpu()
+        selected_tpu = physical_tpu_type()
         expected_tpu = config["validation"]["hardware"]
         result["hardware"] = {"selected": selected_tpu}
         if selected_tpu != expected_tpu:
