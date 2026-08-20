@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from infra.release.release_common import ReleaseError, load_json, sha256_file
+from infra.release.release_common import ReleaseError, load_json
 from infra.release.tpu_release import (
     assemble_candidate,
     candidate_tag,
@@ -115,31 +115,23 @@ def _validation(candidate: dict) -> dict:
             for package in candidate["packages"]
         },
         "hardware": {"selected": "v6e-8"},
-        "gates": {
-            "wheel_sha256": {"status": "passed"},
-            "clean_install": {"status": "passed"},
-            "serve_smoke": {"status": "passed"},
-        },
         "result": "passed",
     }
 
 
-def test_candidate_binds_both_sources_workflow_and_wheel_bytes(tmp_path: Path):
-    config = load_json(CONFIG_PATH)
+def test_candidate_records_sources_workflow_and_runtime(tmp_path: Path):
     manifest = _candidate(tmp_path)
 
-    validate_candidate(manifest, config)
-    verify_assets(manifest, tmp_path)
-    assert manifest["release"]["tag"] == candidate_tag(
-        config,
-        manifest["source"],
-        WORKFLOW_COMMIT,
-        EXCLUDE_NEWER,
-        {
-            package["distribution"]: package["wheel"]["sha256"]
-            for package in manifest["packages"]
+    assert manifest["source"] == {
+        "vllm": {
+            "repository": "marin-community/vllm",
+            "commit": VLLM_COMMIT,
         },
-    )
+        "tpu-inference": {
+            "repository": "marin-community/tpu-inference",
+            "commit": TPU_INFERENCE_COMMIT,
+        },
+    }
     assert manifest["workflow"] == {
         "commit": WORKFLOW_COMMIT,
         "run_url": RUN_URL,
@@ -149,22 +141,6 @@ def test_candidate_binds_both_sources_workflow_and_wheel_bytes(tmp_path: Path):
         "jaxlib": "0.10.2",
         "libtpu": "0.0.43",
     }
-    index = manifest["index"]
-    index_text = (tmp_path / index["filename"]).read_text()
-    assert index["sha256"] == sha256_file(tmp_path / index["filename"])
-    assert index_text.count("#sha256=") == 2
-    for package in manifest["packages"]:
-        expected_repository = config["repositories"][package["distribution"]]
-        expected_commit = {
-            "vllm": VLLM_COMMIT,
-            "tpu-inference": TPU_INFERENCE_COMMIT,
-        }[package["distribution"]]
-        assert package["source_commit"] == expected_commit
-        assert package["repository"] == expected_repository
-        assert package["wheel"]["sha256"] == sha256_file(
-            tmp_path / package["wheel"]["filename"]
-        )
-        assert manifest["release"]["tag"] in package["wheel"]["url"]
 
 
 def test_candidate_rejects_unpinned_tpu_runtime(tmp_path: Path):

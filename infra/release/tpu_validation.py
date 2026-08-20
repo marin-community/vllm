@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 import tempfile
 import traceback
@@ -24,7 +23,6 @@ from validation_common import (
     ValidationFailure,
     download_wheel,
     emit_result,
-    gate,
     require_command,
 )
 
@@ -64,11 +62,6 @@ def initial_result(
             for package in candidate["packages"]
         },
         "hardware": {},
-        "gates": {
-            "wheel_sha256": gate("not_run"),
-            "clean_install": gate("not_run"),
-            "serve_smoke": gate("not_run"),
-        },
         "result": "failed",
     }
 
@@ -90,8 +83,6 @@ def validate(args: argparse.Namespace) -> int:
     serve_smoke = args.serve_smoke.resolve()
     spec = args.spec.resolve()
     result = initial_result(candidate, args.qualification_run_url)
-    active_gate: str | None = None
-    smoke_result: Path | None = None
     environment = os.environ.copy()
     environment.update(
         {
@@ -117,7 +108,6 @@ def validate(args: argparse.Namespace) -> int:
         ) as directory:
             workdir = Path(directory)
             environment["UV_CACHE_DIR"] = str(workdir / "uv-cache")
-            active_gate = "wheel_sha256"
             for package in candidate["packages"]:
                 wheel = package["wheel"]
                 download_and_verify(
@@ -126,9 +116,7 @@ def validate(args: argparse.Namespace) -> int:
             index = candidate["index"]
             index_path = workdir / index["filename"]
             download_and_verify(index["url"], index_path, index["sha256"])
-            result["gates"]["wheel_sha256"] = gate("passed")
 
-            active_gate = "clean_install"
             virtual_environment = workdir / "venv"
             require_command(
                 [
@@ -182,9 +170,7 @@ def validate(args: argparse.Namespace) -> int:
                 environment=environment,
                 phase="installed pair import",
             )
-            result["gates"]["clean_install"] = gate("passed")
 
-            active_gate = "serve_smoke"
             smoke_result = workdir / "serve-smoke.json"
             validation = config["validation"]
             require_command(
@@ -204,23 +190,8 @@ def validate(args: argparse.Namespace) -> int:
                 environment=environment,
                 phase="serve smoke",
             )
-            result["gates"]["serve_smoke"] = {
-                "status": "passed",
-                "metrics": load_json(smoke_result),
-            }
-            active_gate = None
         result["result"] = "passed"
     except Exception as exc:
-        if (
-            active_gate is not None
-            and result["gates"][active_gate]["status"] == "not_run"
-        ):
-            result["gates"][active_gate] = gate("failed", str(exc))
-            if active_gate == "serve_smoke" and smoke_result is not None:
-                with contextlib.suppress(OSError, ValueError):
-                    result["gates"][active_gate]["metrics"] = load_json(
-                        smoke_result
-                    )
         result["failure"] = str(exc)
         traceback.print_exc()
 
