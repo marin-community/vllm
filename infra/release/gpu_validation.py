@@ -30,7 +30,7 @@ from gpu_release import (
 from release_common import load_json, sha256_file, write_json
 from validation_common import (
     ValidationFailure,
-    download_wheel,
+    download_url,
     emit_result,
     gate,
     require_command,
@@ -457,7 +457,7 @@ def validate(args: argparse.Namespace) -> int:
             workdir = Path(directory)
             wheel = workdir / platform_record["wheel"]["filename"]
             print(f"::: downloading {platform_record['wheel']['url']}", flush=True)
-            download_wheel(platform_record["wheel"]["url"], wheel)
+            download_url(platform_record["wheel"]["url"], wheel)
             actual_digest = sha256_file(wheel)
             expected_digest = platform_record["wheel"]["sha256"]
             if actual_digest != expected_digest:

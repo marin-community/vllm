@@ -48,7 +48,7 @@ def require_command(
         raise ValidationFailure(f"{phase} exited with code {return_code}")
 
 
-def download_wheel(url: str, destination: Path) -> None:
+def download_url(url: str, destination: Path) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": "marin-vllm-release"})
     with (
         urllib.request.urlopen(request, timeout=900) as response,

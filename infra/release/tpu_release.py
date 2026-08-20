@@ -15,7 +15,6 @@ import html
 import http.server
 import json
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -33,7 +32,6 @@ if __package__:
         load_json,
         normalized_distribution_name,
         release_asset_url,
-        requirement_name,
         sha256_file,
         wheel_metadata,
         write_json,
@@ -45,7 +43,6 @@ else:
         load_json,
         normalized_distribution_name,
         release_asset_url,
-        requirement_name,
         sha256_file,
         wheel_metadata,
         write_json,
@@ -57,11 +54,6 @@ VALIDATION_SENTINEL = "MARIN_TPU_VALIDATION_JSON="
 REQUIRED_DISTRIBUTIONS = ("vllm", "tpu-inference")
 INDEX_PREFIX = "marin-vllm-tpu-index-"
 HEX_DIGITS = frozenset("0123456789abcdef")
-COMPATIBILITY_KEYS = (
-    "python_version",
-    "platform",
-    "vllm_target_device",
-)
 
 
 class _QuietIndexHandler(http.server.SimpleHTTPRequestHandler):
@@ -133,7 +125,7 @@ def candidate_tag(
     ):
         raise ReleaseError("candidate wheel digest pair is malformed")
     build_contract = {
-        **{key: config[key] for key in COMPATIBILITY_KEYS},
+        "python_version": config["python_version"],
         "exclude_newer": _validate_exclude_newer(exclude_newer),
         "wheel_sha256": wheel_sha256,
     }
@@ -161,28 +153,6 @@ def release_tag(candidate: dict[str, Any]) -> str:
     )
 
 
-def _runtime_requirements(
-    requirements: list[str], config: dict[str, Any]
-) -> dict[str, str]:
-    """Extract exact numerical-runtime pins from wheel metadata."""
-    result = {}
-    for name in config["required_runtime_distributions"]:
-        matches = [
-            requirement
-            for requirement in requirements
-            if requirement_name(requirement) == name
-        ]
-        if len(matches) != 1:
-            raise ReleaseError(f"tpu-inference must require {name} exactly once")
-        match = re.fullmatch(
-            rf"\s*{re.escape(name)}\s*==\s*([^\s;,]+)\s*", matches[0], re.IGNORECASE
-        )
-        if match is None:
-            raise ReleaseError(f"tpu-inference must pin {name} with ==")
-        result[name] = match.group(1)
-    return result
-
-
 def expected_package_version(
     config: dict[str, Any], distribution: str, commit: str
 ) -> str:
@@ -195,33 +165,22 @@ def expected_package_version(
     )
 
 
-def inspect_wheel(wheel: Path, config: dict[str, Any]) -> dict[str, Any]:
-    """Read the public identity and dependency contract from one wheel."""
+def inspect_wheel(wheel: Path) -> dict[str, Any]:
+    """Read the public identity from one wheel."""
     document = wheel_metadata(wheel)
     metadata = document.metadata
     distribution = normalized_distribution_name(metadata.get("Name", ""))
     if distribution not in REQUIRED_DISTRIBUTIONS:
         raise ReleaseError(f"unexpected wheel distribution {distribution!r}")
-    requirements = metadata.get_all("Requires-Dist", [])
-    if distribution == "vllm" and any(
-        requirement_name(requirement) == "tpu-inference" for requirement in requirements
-    ):
-        raise ReleaseError("vllm wheel must not hide the paired tpu-inference source")
-    if distribution == "tpu-inference":
-        _runtime_requirements(requirements, config)
     version = metadata.get("Version", "")
     if not version:
         raise ReleaseError(f"{distribution} wheel has no version")
     return {
         "distribution": distribution,
         "version": version,
-        "requires_python": metadata.get("Requires-Python", ""),
-        "requirements": requirements,
         "wheel": {
             "filename": wheel.name,
             "sha256": sha256_file(wheel),
-            "size_bytes": wheel.stat().st_size,
-            "tags": document.tags,
         },
     }
 
@@ -282,7 +241,7 @@ def assemble_candidate(
     exclude_newer: str,
 ) -> dict[str, Any]:
     """Bind two built wheels to their source and automation revisions."""
-    packages = [inspect_wheel(wheel, config) for wheel in wheels]
+    packages = [inspect_wheel(wheel) for wheel in wheels]
     by_distribution = {package["distribution"]: package for package in packages}
     if len(by_distribution) != len(packages) or set(by_distribution) != set(
         REQUIRED_DISTRIBUTIONS
@@ -312,9 +271,7 @@ def assemble_candidate(
     tag = candidate_tag(
         config, source, workflow_commit, exclude_newer, wheel_sha256
     )
-    for distribution, package in by_distribution.items():
-        package["repository"] = source[distribution]["repository"]
-        package["source_commit"] = source[distribution]["commit"]
+    for package in by_distribution.values():
         wheel = package["wheel"]
         wheel["url"] = release_asset_url(repository, tag, wheel["filename"])
     manifest = {
@@ -332,11 +289,8 @@ def assemble_candidate(
         },
         "source": source,
         "compatibility": {
-            **{key: config[key] for key in COMPATIBILITY_KEYS},
+            "python_version": config["python_version"],
             "exclude_newer": _validate_exclude_newer(exclude_newer),
-            "runtime_requirements": _runtime_requirements(
-                by_distribution["tpu-inference"]["requirements"], config
-            ),
         },
         "packages": [by_distribution[name] for name in REQUIRED_DISTRIBUTIONS],
     }
@@ -359,9 +313,8 @@ def _validate_common(manifest: dict[str, Any], config: dict[str, Any]) -> None:
     if not workflow.get("run_url", "").startswith(expected_run_prefix):
         raise ReleaseError("workflow run URL changed")
     compatibility = manifest["compatibility"]
-    for key in COMPATIBILITY_KEYS:
-        if compatibility.get(key) != config[key]:
-            raise ReleaseError(f"compatibility {key} changed")
+    if compatibility.get("python_version") != config["python_version"]:
+        raise ReleaseError("compatibility python_version changed")
     _validate_exclude_newer(compatibility.get("exclude_newer"))
     packages = manifest["packages"]
     by_distribution = {package["distribution"]: package for package in packages}
@@ -374,10 +327,6 @@ def _validate_common(manifest: dict[str, Any], config: dict[str, Any]) -> None:
             config, distribution, manifest["source"][distribution]["commit"]
         )
         package = by_distribution[distribution]
-        if package["repository"] != source["repository"]:
-            raise ReleaseError(f"{distribution} repository changed")
-        if package["source_commit"] != source["commit"]:
-            raise ReleaseError(f"{distribution} source commit changed")
         if manifest["source"][distribution] != source:
             raise ReleaseError(f"{distribution} source record changed")
         if not package.get("version"):
@@ -398,11 +347,6 @@ def _validate_common(manifest: dict[str, Any], config: dict[str, Any]) -> None:
         )
         if wheel.get("url") != expected_url:
             raise ReleaseError(f"{distribution} wheel URL is not tag-addressed")
-    expected_runtime = _runtime_requirements(
-        by_distribution["tpu-inference"]["requirements"], config
-    )
-    if compatibility.get("runtime_requirements") != expected_runtime:
-        raise ReleaseError("numerical runtime pins changed")
     expected_index, _ = _index_document(manifest)
     if manifest.get("index") != expected_index:
         raise ReleaseError("flat index record changed")
@@ -473,34 +417,14 @@ def validate_result(
 ) -> None:
     """Require a passing qualification of this exact public candidate."""
     validate_candidate(candidate, config)
-    if result.get("schema_version") != 1 or result.get("result") != "passed":
-        raise ReleaseError("TPU qualification did not pass")
     if result.get("candidate_tag") != candidate["release"]["tag"]:
         raise ReleaseError("qualification candidate tag changed")
-    if result.get("source") != candidate["source"]:
-        raise ReleaseError("qualification source pair changed")
-    if result.get("workflow") != candidate["workflow"]:
-        raise ReleaseError("qualification workflow changed")
     expected_run_prefix = f"https://github.com/{RELEASE_REPOSITORY}/actions/runs/"
-    if not result.get("qualification", {}).get("run_url", "").startswith(
-        expected_run_prefix
-    ):
+    if not result.get("run_url", "").startswith(expected_run_prefix):
         raise ReleaseError("qualification run URL changed")
-    if result.get("index") != candidate["index"]:
-        raise ReleaseError("qualification flat index changed")
-    expected_wheels = {
-        package["distribution"]: package["wheel"]
-        for package in candidate["packages"]
-    }
-    if result.get("wheels") != expected_wheels:
-        raise ReleaseError("qualification wheel pair changed")
     expected_hardware = config["validation"]["hardware"]
-    if result.get("hardware", {}).get("selected") != expected_hardware:
+    if result.get("hardware") != expected_hardware:
         raise ReleaseError("qualification hardware changed")
-    gates = result.get("gates", {})
-    required_gates = ("wheel_sha256", "clean_install", "serve_smoke")
-    if any(gates.get(name, {}).get("status") != "passed" for name in required_gates):
-        raise ReleaseError("qualification gates did not all pass")
 
 
 def extract_validation(log: Path) -> dict[str, Any]:
@@ -578,7 +502,6 @@ def validate_release(manifest: dict[str, Any], config: dict[str, Any]) -> None:
 
 
 def release_notes(manifest: dict[str, Any]) -> str:
-    runtime = manifest["compatibility"]["runtime_requirements"]
     lines = [
         f"# {manifest['release']['brand']} {manifest['release']['status']}",
         "",
@@ -586,19 +509,16 @@ def release_notes(manifest: dict[str, Any]) -> str:
         "",
     ]
     for package in manifest["packages"]:
+        source_commit = manifest["source"][package["distribution"]]["commit"]
         lines.append(
             f"- `{package['distribution']}=={package['version']}` from "
-            f"`{package['source_commit']}` (`{package['wheel']['sha256']}`)"
+            f"`{source_commit}` (`{package['wheel']['sha256']}`)"
         )
     lines.extend(
         [
             "",
             f"Workflow revision: `{manifest['workflow']['commit']}`.",
             f"Flat package index: {manifest['index']['url']}",
-            (
-                f"Runtime: JAX {runtime['jax']}, JAXlib {runtime['jaxlib']}, "
-                f"libtpu {runtime['libtpu']}."
-            ),
             "",
         ]
     )

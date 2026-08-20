@@ -4,6 +4,6 @@
   "min_completion_tokens": 32,
   "min_output_tokens_per_second": 1.0,
   "provenance": {
-    "note": "This is a correctness smoke, not a throughput benchmark. The validation artifact retains observed v6e-8 throughput."
+    "note": "This is a correctness smoke, not a throughput benchmark."
   }
 }

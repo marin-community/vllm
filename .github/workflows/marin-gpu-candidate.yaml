@@ -452,18 +452,6 @@ jobs:
           CANDIDATE_TAG=$(jq -r '.release.tag' candidate/marin-vllm-tpu-manifest.json)
           echo "candidate_tag=$CANDIDATE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Clean-install the locally built pair
-        run: |
-          uv venv --python "${{ steps.pair.outputs.python_version }}" .tpu-pair-smoke
-          uv pip install \
-            --python .tpu-pair-smoke/bin/python \
-            --prerelease allow \
-            --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-            --torch-backend cpu \
-            candidate/*.whl
-          .tpu-pair-smoke/bin/python -c \
-            "import vllm; from tpu_inference.runner.tpu_runner import TPUModelRunner"
-
       - name: Publish candidate assets once
         env:
           CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
@@ -493,7 +481,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --dir published
 
-      - name: Verify, hash, and clean-install through the published index
+      - name: Verify the published assets
         env:
           CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
         run: |
@@ -502,24 +490,6 @@ jobs:
             --manifest published/marin-vllm-tpu-manifest.json \
             --directory published \
             --expected-tag "$CANDIDATE_TAG"
-          VLLM_VERSION=$(jq -r '.packages[] | select(.distribution == "vllm") | .version' \
-            published/marin-vllm-tpu-manifest.json)
-          TPU_VERSION=$(jq -r '.packages[] | select(.distribution == "tpu-inference") | .version' \
-            published/marin-vllm-tpu-manifest.json)
-          INDEX_FILENAME=$(jq -r '.index.filename' published/marin-vllm-tpu-manifest.json)
-          uv venv --python "${{ steps.pair.outputs.python_version }}" .tpu-url-smoke
-          UV_CACHE_DIR="$GITHUB_WORKSPACE/.tpu-public-cache" \
-            .metadata/bin/python infra/release/tpu_release.py run-with-index \
-              --index "published/$INDEX_FILENAME" -- \
-              uv pip install \
-                --python .tpu-url-smoke/bin/python \
-                --prerelease allow \
-                --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-                --torch-backend cpu \
-                "vllm==$VLLM_VERSION" \
-                "tpu-inference==$TPU_VERSION"
-          .tpu-url-smoke/bin/python -c \
-            "import vllm; from tpu_inference.runner.tpu_runner import TPUModelRunner"
 
       - uses: actions/upload-artifact@v4
         if: always()

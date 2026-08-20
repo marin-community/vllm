@@ -17,7 +17,7 @@ on:
           - gpu
           - tpu
       candidate_tag:
-        description: "Exact candidate tag; empty selects the newest candidate"
+        description: "Exact candidate tag; required for TPU, optional for GPU"
         required: false
         type: string
       promote:
@@ -539,7 +539,7 @@ jobs:
               --serve-smoke infra/nightly/gpu_serve_smoke.py \
               --spec "${{ needs.resolve_tpu.outputs.spec }}" \
               --qualification-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-              --output marin-vllm-tpu-validation.json 2>&1 | tee validation.log
+              2>&1 | tee validation.log
 
       - name: Stop any Iris job left behind
         if: always()
