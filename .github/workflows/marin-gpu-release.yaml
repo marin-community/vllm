@@ -1,34 +1,49 @@
-name: Marin vLLM GPU Release
+name: Marin vLLM Release
 
-# Validate exact candidate wheel bytes on both Marin GPU platforms, then publish
-# them under a new immutable release tag. No moving nightly alias is created.
+# Validate exact candidate bytes, then optionally publish them under a
+# non-overwriting, hash-verified release tag. No moving alias is created.
 
 on:
   schedule:
     - cron: "30 12 * * *"
   workflow_dispatch:
     inputs:
+      lane:
+        description: "Release lane"
+        required: true
+        default: gpu
+        type: choice
+        options:
+          - gpu
+          - tpu
       candidate_tag:
-        description: "Exact candidate tag; empty selects the newest candidate"
+        description: "Exact candidate tag; required for TPU, optional for GPU"
         required: false
         type: string
+      promote:
+        description: "Publish the validated TPU pair"
+        default: false
+        required: false
+        type: boolean
       model:
-        description: "HF model id for the serving smoke"
+        description: "HF model id for the GPU serving smoke"
         default: Qwen/Qwen3-0.6B
         required: false
         type: string
 
 concurrency:
-  group: marin-vllm-gpu-release
+  group: marin-vllm-${{ inputs.lane || 'gpu' }}-release
   cancel-in-progress: false
 
 env:
   RELEASE_CONFIG: infra/release/config.json
+  TPU_RELEASE_CONFIG: infra/release/tpu_config.json
   UV_VERSION: "0.11.21"
 
 jobs:
   resolve:
     name: Resolve candidate
+    if: github.event_name == 'schedule' || inputs.lane == 'gpu'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -376,3 +391,308 @@ jobs:
             --manifest published/marin-vllm-gpu-manifest.json \
             --directory published \
             --config "$RELEASE_CONFIG"
+
+  resolve_tpu:
+    name: Resolve exact TPU candidate
+    if: github.event_name == 'workflow_dispatch' && inputs.lane == 'tpu'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      candidate_tag: ${{ steps.candidate.outputs.candidate_tag }}
+      release_tag: ${{ steps.candidate.outputs.release_tag }}
+      hardware: ${{ steps.candidate.outputs.hardware }}
+      region: ${{ steps.candidate.outputs.region }}
+      spec: ${{ steps.candidate.outputs.spec }}
+      python_version: ${{ steps.candidate.outputs.python_version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Create the metadata environment
+        run: uv venv --python 3.12
+
+      - name: Download and verify the requested candidate
+        id: candidate
+        env:
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          if [[ -z "$CANDIDATE_TAG" ]]; then
+            echo "The TPU lane requires an exact candidate tag." >&2
+            exit 1
+          fi
+          mkdir candidate
+          gh release download "$CANDIDATE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir candidate
+          .venv/bin/python infra/release/tpu_release.py verify-candidate \
+            --config "$TPU_RELEASE_CONFIG" \
+            --manifest candidate/marin-vllm-tpu-manifest.json \
+            --directory candidate \
+            --expected-tag "$CANDIDATE_TAG"
+          WORKFLOW_COMMIT=$(jq -r '.workflow.commit' \
+            candidate/marin-vllm-tpu-manifest.json)
+          if [[ "$WORKFLOW_COMMIT" != "$GITHUB_SHA" ]]; then
+            echo "Candidate was built by $WORKFLOW_COMMIT, not this workflow revision $GITHUB_SHA." >&2
+            echo "Build a new candidate after changing producer, manifest, or qualification code." >&2
+            exit 1
+          fi
+          RELEASE_TAG=$(.venv/bin/python infra/release/tpu_release.py release-tag \
+            --candidate candidate/marin-vllm-tpu-manifest.json)
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to requalify it." >&2
+            exit 1
+          fi
+          {
+            echo "candidate_tag=${CANDIDATE_TAG}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "hardware=$(jq -r '.validation.hardware' "$TPU_RELEASE_CONFIG")"
+            echo "region=$(jq -r '.validation.region' "$TPU_RELEASE_CONFIG")"
+            echo "spec=$(jq -r '.validation.spec' "$TPU_RELEASE_CONFIG")"
+            echo "python_version=$(jq -r '.python_version' "$TPU_RELEASE_CONFIG")"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marin-vllm-tpu-resolved-candidate
+          path: candidate/marin-vllm-tpu-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  validate_tpu:
+    name: Qualify public TPU wheel pair on ${{ needs.resolve_tpu.outputs.hardware }}
+    needs: resolve_tpu
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      JOB_USER: vllm-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: marin-vllm-tpu-resolved-candidate
+          path: candidate
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Create the metadata environment
+        run: uv venv --python "${{ needs.resolve_tpu.outputs.python_version }}"
+
+      - name: Trim the Iris bundle
+        run: git rm -r --quiet docs vllm tests csrc rust benchmarks examples
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: hai-gcp-models
+          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
+          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: hai-gcp-models
+
+      - name: Install the Iris client
+        run: |
+          uv tool install --prerelease allow marin-core
+          echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
+
+      - name: Qualify the public pair
+        id: iris
+        continue-on-error: true
+        env:
+          JOB_NAME: vllm-tpu-release-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          JOB_NAME=$(echo "$JOB_NAME" | cut -c1-63 | tr '[:upper:]' '[:lower:]')
+          echo "JOB_NAME=${JOB_NAME}" >> "$GITHUB_ENV"
+          set -o pipefail
+          iris --cluster marin job run \
+            --job-name "$JOB_NAME" \
+            --user "$JOB_USER" \
+            --tpu "${{ needs.resolve_tpu.outputs.hardware }}" --enable-extra-resources \
+            --region "${{ needs.resolve_tpu.outputs.region }}" \
+            --priority production \
+            --cpu 16 --memory 64g --disk 100g \
+            --timeout 4200 \
+            --no-sync \
+            --max-retries 0 \
+            -- uv run --no-project --python "${{ needs.resolve_tpu.outputs.python_version }}" python \
+              infra/release/tpu_validation.py \
+              --config "$TPU_RELEASE_CONFIG" \
+              --candidate-manifest candidate/marin-vllm-tpu-manifest.json \
+              --serve-smoke infra/nightly/gpu_serve_smoke.py \
+              --spec "${{ needs.resolve_tpu.outputs.spec }}" \
+              --qualification-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              2>&1 | tee validation.log
+
+      - name: Stop any Iris job left behind
+        if: always()
+        run: |
+          if [[ -n "${JOB_NAME:-}" ]]; then
+            iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
+          fi
+
+      - name: Wait for the federated validation record
+        if: steps.iris.outcome == 'success'
+        env:
+          FORWARDED_LOG_POLL_ATTEMPTS: 60
+          FORWARDED_LOG_POLL_INTERVAL: 15
+        run: |
+          validation_record_ready() {
+            .venv/bin/python infra/release/tpu_release.py extract-validation \
+              --log "$1" --output validation-probe.json &&
+              .venv/bin/python infra/release/tpu_release.py validate-result \
+                --result validation-probe.json \
+                --candidate candidate/marin-vllm-tpu-manifest.json \
+                --config "$TPU_RELEASE_CONFIG" >/dev/null 2>&1
+          }
+          if validation_record_ready validation.log; then
+            exit 0
+          fi
+          for attempt in $(seq 1 "$FORWARDED_LOG_POLL_ATTEMPTS"); do
+            sleep "$FORWARDED_LOG_POLL_INTERVAL"
+            iris --cluster marin job logs "/$JOB_USER/$JOB_NAME" > forwarded-validation.log 2>&1
+            if validation_record_ready forwarded-validation.log; then
+              cat forwarded-validation.log >> validation.log
+              exit 0
+            fi
+            echo "Validation record is not available yet (${attempt}/${FORWARDED_LOG_POLL_ATTEMPTS})."
+          done
+          cat forwarded-validation.log >> validation.log
+          echo "Timed out waiting for the validation record." >&2
+          exit 1
+
+      - name: Extract the validation record
+        if: always()
+        run: |
+          .venv/bin/python infra/release/tpu_release.py extract-validation \
+            --log validation.log \
+            --output marin-vllm-tpu-validation.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marin-vllm-tpu-validation
+          path: |
+            marin-vllm-tpu-validation.json
+            validation.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce qualification
+        if: always()
+        run: |
+          if [[ "${{ steps.iris.outcome }}" != "success" ]]; then
+            echo "Iris qualification failed." >&2
+            exit 1
+          fi
+          .venv/bin/python infra/release/tpu_release.py validate-result \
+            --result marin-vllm-tpu-validation.json \
+            --candidate candidate/marin-vllm-tpu-manifest.json \
+            --config "$TPU_RELEASE_CONFIG"
+
+  promote_tpu:
+    name: Publish qualified TPU release
+    needs: [resolve_tpu, validate_tpu]
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.lane == 'tpu' && inputs.promote == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_TAG: ${{ needs.resolve_tpu.outputs.candidate_tag }}
+      RELEASE_TAG: ${{ needs.resolve_tpu.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Create the metadata environment
+        run: uv venv --python 3.12
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: marin-vllm-tpu-validation
+          path: validation
+
+      - name: Download and verify exact candidate assets
+        run: |
+          mkdir candidate release
+          gh release download "$CANDIDATE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir candidate
+          .venv/bin/python infra/release/tpu_release.py verify-candidate \
+            --config "$TPU_RELEASE_CONFIG" \
+            --manifest candidate/marin-vllm-tpu-manifest.json \
+            --directory candidate \
+            --expected-tag "$CANDIDATE_TAG"
+          cp candidate/*.whl release/
+
+      - name: Finalize and verify the release manifest
+        run: |
+          .venv/bin/python infra/release/tpu_release.py finalize-release \
+            --config "$TPU_RELEASE_CONFIG" \
+            --candidate candidate/marin-vllm-tpu-manifest.json \
+            --validation validation/marin-vllm-tpu-validation.json \
+            --release-tag "$RELEASE_TAG" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --output release/marin-vllm-tpu-manifest.json
+          .venv/bin/python infra/release/tpu_release.py write-index \
+            --manifest release/marin-vllm-tpu-manifest.json \
+            --directory release
+          .venv/bin/python infra/release/tpu_release.py release-notes \
+            --manifest release/marin-vllm-tpu-manifest.json \
+            --output release-notes.md
+          cp validation/marin-vllm-tpu-validation.json release/
+          .venv/bin/python infra/release/tpu_release.py verify-release \
+            --config "$TPU_RELEASE_CONFIG" \
+            --manifest release/marin-vllm-tpu-manifest.json \
+            --directory release
+
+      - name: Publish release assets once
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release $RELEASE_TAG" >&2
+            exit 1
+          fi
+          WORKFLOW_COMMIT=$(jq -r '.workflow.commit' release/marin-vllm-tpu-manifest.json)
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$WORKFLOW_COMMIT" \
+            --title "Marin vLLM TPU ${RELEASE_TAG#marin-vllm-tpu-}" \
+            --notes-file release-notes.md \
+            release/*.whl \
+            release/*.html \
+            release/*.json
+
+      - name: Verify published release assets
+        run: |
+          mkdir published
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir published
+          .venv/bin/python infra/release/tpu_release.py verify-release \
+            --config "$TPU_RELEASE_CONFIG" \
+            --manifest published/marin-vllm-tpu-manifest.json \
+            --directory published
