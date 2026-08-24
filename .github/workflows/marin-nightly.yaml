@@ -16,9 +16,9 @@ name: Marin Nightly
 # them, so the job is submitted to the `marin` cluster and federated to CoreWeave with
 # --target-cluster, which is the supported route from CI.
 #
-# A leaked H100 is expensive, so teardown is threefold: `iris job run` blocks and stops
+# A leaked H100 is expensive, so teardown is threefold: `iris job run` blocks and cancels
 # its job when it exits, --timeout is a server-side backstop, and the always() step below
-# stops the job by name if the runner was hard-killed.
+# cancels the job by name if the runner was hard-killed.
 
 on:
   schedule:
@@ -44,8 +44,10 @@ jobs:
       contents: read
       id-token: write   # mint the OIDC token that WIF exchanges for github-iris
     env:
-      JOB_NAME: vllm-nightly-serve-smoke
-      # --user pins the job's canonical id, which `iris job stop` requires: it takes
+      # Run, attempt, and commit keep overlapping runs and reruns distinct. The short
+      # prefix keeps the Iris name under 63 characters.
+      JOB_NAME: vllm-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+      # --user pins the job's canonical id, which `iris job cancel` requires: it takes
       # /<user>/<job> and raises on a bare name. Without pinning it, the id would depend on
       # whichever identity CI authenticated as.
       JOB_USER: vllm-ci
@@ -73,9 +75,18 @@ jobs:
         run: |
           git remote add upstream https://github.com/vllm-project/vllm.git
           git fetch --quiet --no-tags upstream main
+          UPSTREAM_BASE=$(git merge-base upstream/main HEAD)
+          PACKAGE_VERSION=$(
+            uv run --python 3.12 --no-project --with packaging --with setuptools-scm \
+              python infra/nightly/resolve_version.py
+          )
+          if [[ -z "$PACKAGE_VERSION" ]]; then
+            echo "Package version resolution returned an empty value." >&2
+            exit 1
+          fi
           {
-            echo "VLLM_PRECOMPILED_WHEEL_COMMIT=$(git merge-base upstream/main HEAD)"
-            echo "SETUPTOOLS_SCM_PRETEND_VERSION=$(uvx --from setuptools-scm python -c 'from setuptools_scm import get_version; print(get_version())')"
+            echo "VLLM_PRECOMPILED_WHEEL_COMMIT=$UPSTREAM_BASE"
+            echo "SETUPTOOLS_SCM_PRETEND_VERSION=$PACKAGE_VERSION"
           } >> "$GITHUB_ENV"
 
       - name: Authenticate to Google Cloud
@@ -102,6 +113,7 @@ jobs:
           echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
 
       - name: Serve and gate on one H100
+        id: iris
         # --gpu is gated behind --enable-extra-resources by iris. --no-sync stops iris from
         # syncing the bundled workspace; run_h100.sh builds its own venv. --exclude '^docs/'
         # drops docs/ from the workspace bundle -- it is nearly all of this tree's 38MB and
@@ -114,6 +126,7 @@ jobs:
         # the GPU. A healthy run is ~8 minutes end to end (install ~3, tests ~1.5, serve and
         # gate ~2), so 25 minutes is generous without being open-ended.
         run: |
+          set -o pipefail
           iris --cluster marin job run \
             --target-cluster "$TARGET_CLUSTER" \
             --job-name "$JOB_NAME" \
@@ -130,12 +143,11 @@ jobs:
             -e SMOKE_HARDWARE "H100x1 on $TARGET_CLUSTER via iris" \
             -- bash infra/nightly/run_h100.sh 2>&1 | tee nightly.log
 
-      - name: Stop any Iris job the run left behind
+      - name: Cancel any Iris job the run left behind
         if: always()
-        # Only matters if the runner was hard-killed; `iris job run` already stops its own
-        # job on exit. The id must be canonical: `job stop` raises on a bare name, and with
-        # the `|| true` below that would fail silently and leak the GPU.
-        run: iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
+        # Only matters if the runner was hard-killed; `iris job run` already cancels its own
+        # job on exit. The id must be canonical: `job cancel` raises on a bare name.
+        run: iris --cluster marin job cancel "/$JOB_USER/$JOB_NAME"
 
       - uses: actions/upload-artifact@v4
         if: always()
