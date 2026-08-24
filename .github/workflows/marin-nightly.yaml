@@ -146,9 +146,8 @@ jobs:
       - name: Cancel any Iris job the run left behind
         if: always()
         # Only matters if the runner was hard-killed; `iris job run` already cancels its own
-        # job on exit. The id must be canonical: `job cancel` raises on a bare name, and with
-        # the `|| true` below that would fail silently and leak the GPU.
-        run: iris --cluster marin job cancel "/$JOB_USER/$JOB_NAME" || true
+        # job on exit. The id must be canonical: `job cancel` raises on a bare name.
+        run: iris --cluster marin job cancel "/$JOB_USER/$JOB_NAME"
 
       - uses: actions/upload-artifact@v4
         if: always()
