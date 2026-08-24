@@ -1082,7 +1082,7 @@ def get_vllm_version() -> str:
         git_sha = subprocess.check_output(
             ["git", "rev-parse", "--short=9", "HEAD"], text=True
         ).strip()
-        version = f"0.27.0rc1.dev0+g{git_sha}"
+        version = f"0.26.1rc1.dev0+g{git_sha}"
         print(
             "Falling back to "
             f"{version} because setuptools-scm could not parse this checkout: {exc!r}"
