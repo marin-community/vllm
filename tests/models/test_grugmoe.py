@@ -689,6 +689,10 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights():
         _process_moe_weights(mlp)
 
     expected = _reference_moe(x, mlp)
+    # The fused-MoE kernels allocate through the workspace manager, which a real run
+    # installs in GPUModelRunner.__init__. This test drives the layer directly, so it
+    # has to do the same setup itself.
+    init_workspace_manager(torch.device("cuda"))
     with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
         actual = mlp(x)
 
