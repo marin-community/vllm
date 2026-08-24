@@ -16,7 +16,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -454,7 +454,7 @@ class GrugMoeMLP(nn.Module):
             global_num_experts=cfg.num_experts,
             bias=self.router.bias,
         )
-        self.experts = FusedMoE(
+        self.experts = FusedMoEFactory(
             num_experts=cfg.num_experts,
             top_k=cfg.num_experts_per_token,
             hidden_size=cfg.hidden_dim,
