@@ -84,6 +84,13 @@ def test_server_command_pins_requested_attention_backend():
     assert command[-2:] == ["--attention-backend", "FLASH_ATTN"]
 
 
+def test_server_command_binds_to_port_probe_interface():
+    command = server_command("Qwen/Qwen3-0.6B", 8000, None)
+
+    host_index = command.index("--host")
+    assert command[host_index + 1] == "127.0.0.1"
+
+
 def test_server_command_uses_requested_tensor_parallel_size():
     command = server_command("Qwen/Qwen3-0.6B", 8000, None, 8)
 

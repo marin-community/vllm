@@ -62,6 +62,7 @@ MAX_TOKENS = 1024
 TEMPERATURE = 0.0
 REQUEST_TIMEOUT = 120.0
 READY_POLL_INTERVAL = 5.0
+SERVE_HOST = "127.0.0.1"
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,8 @@ def server_command(
         "vllm.entrypoints.openai.api_server",
         "--model",
         model,
+        "--host",
+        SERVE_HOST,
         "--port",
         str(port),
         "--max-model-len",
@@ -128,13 +131,13 @@ def server_command(
 def pick_free_port() -> int:
     """Return a currently-free localhost TCP port.
 
-    The GB200 validation lane runs with host networking, so a fixed serve port
-    collides with anything already bound on the node (including a prior run's
-    server that outlived its job). Letting the kernel assign a free port avoids
-    that class of "address already in use" startup failure.
+    Accelerator validation runs with host networking, so a fixed serve port
+    collides with anything already bound on the node. Probe the same loopback
+    interface that the smoke server binds so a service on another host interface
+    cannot invalidate the result between the probe and server startup.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
+        probe.bind((SERVE_HOST, 0))
         return probe.getsockname()[1]
 
 
