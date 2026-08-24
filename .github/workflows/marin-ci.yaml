@@ -85,3 +85,9 @@ jobs:
         run: >-
           uv run --python 3.12 --no-project --with pytest --with pyyaml
           python -m pytest infra/release/tests -v
+
+      - name: Test nightly failure boundaries
+        run: >-
+          uv run --python 3.12 --no-project --with pytest --with pyyaml
+          --with packaging --with setuptools-scm
+          python -m pytest infra/nightly/tests -v
