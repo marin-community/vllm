@@ -180,4 +180,6 @@ jobs:
           triage-notes: >-
             The nightly is an H100 serve smoke via a WIF-authenticated Iris job on the
             CoreWeave cluster. This fork tracks upstream vLLM: only the Marin delta is in
-            scope for fixes here.
+            scope for fixes here. A repository-local PR that fixes the tracked failure
+            must end its body with a Fixes link to this issue. Use Part of only when the
+            PR does not restore the lane.
