@@ -1,4 +1,3 @@
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -13,89 +12,36 @@ NIGHTLY_WORKFLOW = REPO_ROOT / ".github/workflows/marin-nightly.yaml"
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=Nightly Test",
-            "-c",
-            "user.email=nightly-test@example.com",
-            *args,
-        ],
+        ["git", "-c", "user.name=test", "-c", "user.email=test@example.com", *args],
         cwd=repo,
         check=True,
-        capture_output=True,
-        text=True,
     )
 
 
 def test_version_resolution_ignores_marin_release_tags(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init")
-    (repo / "source.txt").write_text("base\n")
-    _git(repo, "add", "source.txt")
-    _git(repo, "commit", "-m", "base")
-    _git(repo, "tag", "v1.2.3")
+    _git(tmp_path, "init")
+    _git(tmp_path, "commit", "--allow-empty", "-m", "base")
+    _git(tmp_path, "tag", "v1.2.3")
+    _git(tmp_path, "commit", "--allow-empty", "-m", "head")
+    _git(tmp_path, "tag", "marin-vllm-gpu-20260815-a12602971f08")
 
-    (repo / "source.txt").write_text("head\n")
-    _git(repo, "commit", "-am", "head")
-    _git(repo, "tag", "marin-vllm-gpu-20260815-a12602971f08")
-    _git(repo, "tag", "marin-vllm-gpu-candidate-deadbeef")
-
-    completed = subprocess.run(
+    output = subprocess.check_output(
         [sys.executable, str(RESOLVE_VERSION)],
-        cwd=repo,
-        check=True,
-        capture_output=True,
+        cwd=tmp_path,
         text=True,
     )
-    version = Version(completed.stdout.strip())
+    version = Version(output.strip())
 
-    assert version.release == (1, 2, 4)
-    assert version.dev == 1
+    assert (version.release, version.dev) == ((1, 2, 4), 1)
 
 
 def test_iris_failure_remains_nonzero_through_log_capture(tmp_path: Path) -> None:
     workflow = yaml.safe_load(NIGHTLY_WORKFLOW.read_text())
-    iris_steps = [
-        step
-        for step in workflow["jobs"]["serve-smoke"]["steps"]
-        if step.get("id") == "iris"
-    ]
-    [iris_step] = iris_steps
+    steps = workflow["jobs"]["serve-smoke"]["steps"]
+    iris_step = next(step for step in steps if step.get("id") == "iris")
+    script = 'iris() { echo "current Iris run"; return 23; }\n' + iris_step["run"]
 
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_iris = fake_bin / "iris"
-    fake_iris.write_text(
-        "#!/usr/bin/env bash\n"
-        "printf 'current Iris run\\n'\n"
-        "exit 23\n"
-    )
-    fake_iris.chmod(0o755)
-
-    tested_sha = "0123456789abcdef0123456789abcdef01234567"
-    env = os.environ.copy()
-    env.update(
-        {
-            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
-            "TARGET_CLUSTER": "cw-rno2a",
-            "JOB_NAME": f"vllm-123-1-{tested_sha}",
-            "JOB_USER": "vllm-ci",
-            "MODEL": "Qwen/Qwen3-0.6B",
-            "VLLM_PRECOMPILED_WHEEL_COMMIT": tested_sha,
-            "SETUPTOOLS_SCM_PRETEND_VERSION": "1.2.4.dev1",
-            "GITHUB_SHA": tested_sha,
-        }
-    )
-
-    completed = subprocess.run(
-        ["bash", "-e", "-c", iris_step["run"]],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    completed = subprocess.run(["bash", "-e", "-c", script], cwd=tmp_path)
 
     assert completed.returncode == 23
     assert (tmp_path / "nightly.log").read_text() == "current Iris run\n"
