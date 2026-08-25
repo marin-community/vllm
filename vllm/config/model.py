@@ -1899,6 +1899,10 @@ class ModelConfig:
     def is_hybrid(self) -> bool:
         if not self._model_info.is_hybrid:
             return False
+        # Snowball GrugMoE is attention-only. Hero uses the same serialized
+        # model identity but becomes hybrid when short convolutions are enabled.
+        if getattr(self.hf_text_config, "model_type", None) == "grug_moe":
+            return bool(getattr(self.hf_text_config, "sconv", False))
         # Handle granite-4.0-micro case which uses hybrid config but does not
         # actually contain any non-attention layers.
         layer_types = getattr(self.hf_config, "layer_types", None)
@@ -1912,6 +1916,10 @@ class ModelConfig:
 
     @property
     def has_inner_state(self):
+        if getattr(self.hf_text_config, "model_type", None) == "grug_moe":
+            return self._model_info.has_inner_state and bool(
+                getattr(self.hf_text_config, "sconv", False)
+            )
         return self._model_info.has_inner_state
 
     @property
