@@ -448,6 +448,23 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
         MambaModelConfig.verify_and_update_config(vllm_config)
 
 
+class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        if not getattr(vllm_config.model_config.hf_text_config, "sconv", False):
+            return
+
+        from vllm.config import CUDAGraphMode
+
+        compilation_config = vllm_config.compilation_config
+        if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            logger.warning_once(
+                "GrugMoE ShortConv does not support CUDA graphs; "
+                "overriding cudagraph_mode to NONE."
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+
 class JambaForSequenceClassificationConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -905,6 +922,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Gemma4ForConditionalGeneration": Gemma4Config,
     "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
+    "GrugMoeForCausalLM": GrugMoeForCausalLMConfig,
     "LongcatFlashNgramForCausalLM": LongcatFlashNgramForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,

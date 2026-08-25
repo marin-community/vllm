@@ -12,8 +12,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
@@ -22,6 +23,18 @@ from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
+    MambaStateCopyFuncCalculator,
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+    is_conv_state_dim_first,
+)
+from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -43,9 +56,12 @@ from vllm.transformers_utils.configs.grugmoe import (
     grug_moe_layer_types,
     grug_moe_rope_theta,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 
-from .interfaces import SupportsPP
+from .interfaces import HasInnerState, IsHybrid, SupportsPP
 
 logger = init_logger(__name__)
 
@@ -54,6 +70,8 @@ _GATED_NORM_RANK = 128
 _ROUTER_COMBINE_WEIGHT_SUM = 2.5
 _ROUTER_COMBINE_WEIGHT_EPS = 1e-9
 _UNQUANTIZED_METHOD = "unquantized"
+_GRUGMOE_ARTIFACT_SCHEMA_VERSION = 2
+_SUPPORTED_SCONV_SITES = frozenset({"k", "attn", "mlp"})
 
 
 def _config_attr(config: Any, names: tuple[str, ...], default: Any = None) -> Any:
@@ -80,7 +98,7 @@ def _align_kv_heads(value: torch.Tensor, num_q_heads: int) -> torch.Tensor:
     value = value.unsqueeze(2).expand(
         value.shape[0], num_kv_heads, repeat, value.shape[2]
     )
-    return value.reshape(value.shape[0], num_q_heads, value.shape[-1])
+    return value.reshape(value.shape[0], num_q_heads, value.shape[-1]).contiguous()
 
 
 def _format_int_ranges(values: list[int]) -> str:
@@ -178,23 +196,33 @@ def _log_grug_moe_runtime_info(
 @dataclass(frozen=True)
 class GrugMoeRuntimeConfig:
     vocab_size: int
+    artifact_schema_version: int = 1
     hidden_dim: int = 2048
     intermediate_dim: int = 5632
     shared_expert_intermediate_dim: int = 5632
+    num_shared_experts: int = 1
     num_experts: int = 8
     num_experts_per_token: int = 2
+    latent_dim: int | None = None
     num_layers: int = 24
     num_heads: int = 16
     num_kv_heads: int = 16
+    local_kv_heads: int | None = None
+    global_kv_heads: int | None = None
     head_dim: int | None = None
     max_seq_len: int = 4096
     sliding_window: int = 4096
+    global_every: int = 4
     layer_norm_eps: float = 1e-5
     initializer_std: float = 0.02
     qk_mult: float = 1.0
     qk_mult_long_scale: float = 1.0
     disable_pko: bool = True
     disable_long_rope: bool = True
+    rope_fused: bool = False
+    sconv: bool = False
+    sconv_kernel: int = 4
+    sconv_sites: tuple[str, ...] = ("k", "attn", "mlp")
     tie_word_embeddings: bool = False
     rope_theta: float = 10000.0
 
@@ -205,8 +233,14 @@ class GrugMoeRuntimeConfig:
         )
         num_heads = int(_config_attr(config, ("num_heads", "num_attention_heads"), 16))
         num_layers = int(_config_attr(config, ("num_layers", "num_hidden_layers"), 24))
+        latent_dim = _config_attr(config, ("latent_dim",))
+        local_kv_heads = _config_attr(config, ("local_kv_heads",))
+        global_kv_heads = _config_attr(config, ("global_kv_heads",))
         return cls(
             vocab_size=int(_config_attr(config, ("vocab_size",))),
+            artifact_schema_version=int(
+                _config_attr(config, ("grugmoe_artifact_schema_version",), 1)
+            ),
             hidden_dim=int(_config_attr(config, ("hidden_dim", "hidden_size"), 2048)),
             intermediate_dim=int(
                 _config_attr(
@@ -225,6 +259,9 @@ class GrugMoeRuntimeConfig:
                     5632,
                 )
             ),
+            num_shared_experts=int(
+                _config_attr(config, ("num_shared_experts",), 1)
+            ),
             num_experts=int(
                 _config_attr(config, ("num_experts", "num_local_experts"), 8)
             ),
@@ -233,14 +270,22 @@ class GrugMoeRuntimeConfig:
                     config, ("num_experts_per_token", "num_experts_per_tok"), 2
                 )
             ),
+            latent_dim=None if latent_dim is None else int(latent_dim),
             num_layers=num_layers,
             num_heads=num_heads,
             num_kv_heads=int(
                 _config_attr(config, ("num_kv_heads", "num_key_value_heads"), num_heads)
             ),
+            local_kv_heads=(
+                None if local_kv_heads is None else int(local_kv_heads)
+            ),
+            global_kv_heads=(
+                None if global_kv_heads is None else int(global_kv_heads)
+            ),
             head_dim=_config_attr(config, ("head_dim", "attention_head_dim")),
             max_seq_len=max_seq_len,
             sliding_window=int(_config_attr(config, ("sliding_window",), max_seq_len)),
+            global_every=int(_config_attr(config, ("global_every",), 4)),
             layer_norm_eps=float(
                 _config_attr(config, ("layer_norm_eps", "rms_norm_eps"), 1e-5)
             ),
@@ -253,6 +298,12 @@ class GrugMoeRuntimeConfig:
             ),
             disable_pko=bool(_config_attr(config, ("disable_pko",), True)),
             disable_long_rope=bool(_config_attr(config, ("disable_long_rope",), True)),
+            rope_fused=bool(_config_attr(config, ("rope_fused",), False)),
+            sconv=bool(_config_attr(config, ("sconv",), False)),
+            sconv_kernel=int(_config_attr(config, ("sconv_kernel",), 4)),
+            sconv_sites=tuple(
+                _config_attr(config, ("sconv_sites",), ("k", "attn", "mlp"))
+            ),
             tie_word_embeddings=bool(
                 _config_attr(config, ("tie_word_embeddings",), False)
             ),
@@ -272,9 +323,53 @@ class GrugMoeRuntimeConfig:
 
     @property
     def attention_layer_types(self) -> tuple[str, ...]:
-        return tuple(grug_moe_layer_types(self.num_layers))
+        return tuple(grug_moe_layer_types(self.num_layers, self.global_every))
+
+    @property
+    def is_schema_2(self) -> bool:
+        return self.artifact_schema_version == _GRUGMOE_ARTIFACT_SCHEMA_VERSION
+
+    @property
+    def expert_dim(self) -> int:
+        return self.hidden_dim if self.latent_dim is None else self.latent_dim
+
+    def logical_kv_heads(self, *, is_global: bool) -> int:
+        if self.local_kv_heads is None or self.global_kv_heads is None:
+            return self.num_kv_heads
+        return self.global_kv_heads if is_global else self.local_kv_heads
 
     def validate(self) -> "GrugMoeRuntimeConfig":
+        if self.artifact_schema_version not in (
+            1,
+            _GRUGMOE_ARTIFACT_SCHEMA_VERSION,
+        ):
+            raise ValueError(
+                "unsupported grugmoe_artifact_schema_version="
+                f"{self.artifact_schema_version}"
+            )
+        if self.artifact_schema_version == 1:
+            schema_2_fields = []
+            if self.num_shared_experts != 1:
+                schema_2_fields.append("num_shared_experts")
+            if self.latent_dim is not None:
+                schema_2_fields.append("latent_dim")
+            if self.local_kv_heads is not None or self.global_kv_heads is not None:
+                schema_2_fields.extend(("local_kv_heads", "global_kv_heads"))
+            if self.global_every != 4:
+                schema_2_fields.append("global_every")
+            if self.rope_fused:
+                schema_2_fields.append("rope_fused")
+            if self.sconv:
+                schema_2_fields.append("sconv")
+            if self.sconv_kernel != 4:
+                schema_2_fields.append("sconv_kernel")
+            if self.sconv_sites != ("k", "attn", "mlp"):
+                schema_2_fields.append("sconv_sites")
+            if schema_2_fields:
+                raise ValueError(
+                    ", ".join(schema_2_fields)
+                    + " require grugmoe_artifact_schema_version=2"
+                )
         if self.vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
         if self.hidden_dim <= 0:
@@ -283,6 +378,8 @@ class GrugMoeRuntimeConfig:
             raise ValueError("intermediate_dim must be positive")
         if self.shared_expert_intermediate_dim < 0:
             raise ValueError("shared_expert_intermediate_dim must be non-negative")
+        if self.num_shared_experts <= 0:
+            raise ValueError("num_shared_experts must be positive")
         if self.num_experts <= 0:
             raise ValueError("num_experts must be positive")
         if self.num_experts_per_token <= 0:
@@ -290,6 +387,10 @@ class GrugMoeRuntimeConfig:
         if self.num_experts_per_token >= self.num_experts:
             raise ValueError(
                 "num_experts_per_token must be < num_experts for QB routing"
+            )
+        if self.latent_dim is not None and not 0 < self.latent_dim <= self.hidden_dim:
+            raise ValueError(
+                f"latent_dim must be in (0, hidden_dim={self.hidden_dim}]"
             )
         if self.num_layers <= 0:
             raise ValueError("num_layers must be positive")
@@ -299,6 +400,26 @@ class GrugMoeRuntimeConfig:
             raise ValueError("num_kv_heads must be positive")
         if self.num_heads % self.num_kv_heads != 0:
             raise ValueError("num_heads must be divisible by num_kv_heads")
+        if (self.local_kv_heads is None) != (self.global_kv_heads is None):
+            raise ValueError("local_kv_heads and global_kv_heads must be set together")
+        if self.local_kv_heads is not None and self.global_kv_heads is not None:
+            if self.local_kv_heads <= 0 or self.global_kv_heads <= 0:
+                raise ValueError("local_kv_heads and global_kv_heads must be positive")
+            if (
+                self.num_heads % self.local_kv_heads != 0
+                or self.num_heads % self.global_kv_heads != 0
+            ):
+                raise ValueError(
+                    "num_heads must be divisible by both local and global "
+                    "KV-head counts"
+                )
+            if self.num_kv_heads != max(
+                self.local_kv_heads, self.global_kv_heads
+            ):
+                raise ValueError(
+                    "num_kv_heads must equal the stored maximum of local/global "
+                    "KV heads"
+                )
         if self.inferred_head_dim <= 0:
             raise ValueError("head_dim must be positive")
         if self.inferred_head_dim % 2 != 0:
@@ -307,6 +428,16 @@ class GrugMoeRuntimeConfig:
             raise ValueError("max_seq_len must be positive")
         if self.sliding_window <= 1:
             raise ValueError("sliding_window must be greater than 1")
+        if self.global_every <= 0:
+            raise ValueError("global_every must be positive")
+        if self.sconv and not 2 <= self.sconv_kernel <= 5:
+            raise ValueError("sconv_kernel must be between 2 and 5")
+        unknown_sconv_sites = set(self.sconv_sites) - _SUPPORTED_SCONV_SITES
+        if unknown_sconv_sites:
+            raise ValueError(
+                "unsupported sconv_sites: "
+                + ", ".join(sorted(unknown_sconv_sites))
+            )
         _ = self.attention_layer_types
         return self
 
@@ -434,10 +565,8 @@ class GrugMoeRouter(BaseRouter):
 
 def _apply_grug_linear(layer: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor:
     """Apply a Grug projection without adding its separately handled bias."""
-    if current_platform.is_tpu():
-        output, _ = layer(x)
-        return output
-    return F.linear(x, layer.weight)
+    output, _ = layer(x)
+    return output
 
 
 class GrugMoeMLP(nn.Module):
@@ -468,10 +597,41 @@ class GrugMoeMLP(nn.Module):
             global_num_experts=cfg.num_experts,
             bias=self.router.bias,
         )
+        self.latent_down_proj = (
+            ReplicatedLinear(
+                cfg.hidden_dim,
+                cfg.expert_dim,
+                bias=False,
+                params_dtype=params_dtype,
+                quant_config=quant_config,
+                disable_tp=True,
+                prefix=f"{prefix}.latent_down_proj",
+            )
+            if cfg.latent_dim is not None
+            else None
+        )
+        self.latent_norm = (
+            RMSNorm(cfg.expert_dim, eps=cfg.layer_norm_eps)
+            if cfg.latent_dim is not None
+            else None
+        )
+        self.latent_up_proj = (
+            ReplicatedLinear(
+                cfg.expert_dim,
+                cfg.hidden_dim,
+                bias=False,
+                params_dtype=params_dtype,
+                quant_config=quant_config,
+                disable_tp=True,
+                prefix=f"{prefix}.latent_up_proj",
+            )
+            if cfg.latent_dim is not None
+            else None
+        )
         self.experts = FusedMoEFactory(
             num_experts=cfg.num_experts,
             top_k=cfg.num_experts_per_token,
-            hidden_size=cfg.hidden_dim,
+            hidden_size=cfg.expert_dim,
             intermediate_size=cfg.intermediate_dim,
             params_dtype=params_dtype,
             renormalize=False,
@@ -481,7 +641,21 @@ class GrugMoeMLP(nn.Module):
             router_logits_dtype=torch.float32,
         )
 
-    def _forward_torch_reference(self, x_flat: torch.Tensor) -> torch.Tensor:
+    def _routed_input(self, x_flat: torch.Tensor) -> torch.Tensor:
+        if self.latent_down_proj is None or self.latent_norm is None:
+            return x_flat
+        return self.latent_norm(_apply_grug_linear(self.latent_down_proj, x_flat))
+
+    def _expand_routed_output(self, routed_output: torch.Tensor) -> torch.Tensor:
+        if self.latent_up_proj is None:
+            return routed_output
+        return _apply_grug_linear(self.latent_up_proj, routed_output)
+
+    def _forward_torch_reference(
+        self,
+        x_flat: torch.Tensor,
+        routed_input: torch.Tensor,
+    ) -> torch.Tensor:
         router_logits = _apply_grug_linear(self.router, x_flat.float())
         combine_weights, selected = self.experts.router.select_experts(
             hidden_states=x_flat,
@@ -499,20 +673,23 @@ class GrugMoeMLP(nn.Module):
         down_weight = down_proj_weight[selected]
         gate = torch.einsum(
             "td,tkid->tki",
-            x_flat,
-            gate_weight.to(x_flat.dtype),
+            routed_input,
+            gate_weight.to(routed_input.dtype),
         )
         up = torch.einsum(
             "td,tkid->tki",
-            x_flat,
-            up_weight.to(x_flat.dtype),
+            routed_input,
+            up_weight.to(routed_input.dtype),
         )
         expert_out = torch.einsum(
             "tki,tkdi->tkd",
             F.silu(gate) * up,
-            down_weight.to(x_flat.dtype),
+            down_weight.to(routed_input.dtype),
         )
-        return torch.sum(expert_out * combine_weights.unsqueeze(-1), dim=1)
+        routed_output = torch.sum(
+            expert_out * combine_weights.unsqueeze(-1), dim=1
+        )
+        return self._expand_routed_output(routed_output)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
@@ -522,15 +699,165 @@ class GrugMoeMLP(nn.Module):
         # tensors. Keep the non-Module custom router bound to that current
         # bias rather than the CPU Parameter captured during construction.
         self.experts.router.bias = self.router.bias
+        routed_input = self._routed_input(x_flat)
         if not x_flat.is_cuda and not current_platform.is_tpu():
-            out = self._forward_torch_reference(x_flat)
+            out = self._forward_torch_reference(x_flat, routed_input)
             return out.to(x.dtype).reshape(orig_shape)
         router_logits = _apply_grug_linear(self.router, x_flat.float())
         out = self.experts(
-            hidden_states=x_flat,
+            hidden_states=routed_input,
             router_logits=router_logits,
         )
+        out = self._expand_routed_output(out)
         return out.to(x.dtype).reshape(orig_shape)
+
+
+class GrugMoeShortConv(MambaBase, nn.Module):
+    """Stateful depthwise causal convolution for exported GrugMoE weights."""
+
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int,
+        params_dtype: torch.dtype,
+        cache_config: CacheConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.kernel_size = kernel_size
+        self.params_dtype = params_dtype
+        self.cache_config = cache_config
+        self.prefix = prefix
+        # Marin exports [lag, channel], with lag zero being the current token.
+        self.weight = nn.Parameter(
+            torch.empty(kernel_size, dim, dtype=params_dtype),
+        )
+
+        compilation_config = get_current_vllm_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        self.kv_cache = (torch.tensor([]),)
+
+    def _conv_weight(self) -> torch.Tensor:
+        # causal_conv1d follows torch.conv1d's oldest-to-current convention.
+        return self.weight.transpose(0, 1).flip(-1).contiguous()
+
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        forward_context = get_forward_context()
+        attn_metadata_raw = forward_context.attn_metadata
+        if attn_metadata_raw is None:
+            # Profiling only needs the right shape. The lag-zero path is also
+            # the exact result for the zero history used by identity init.
+            output.copy_(hidden_states * self.weight[0])
+            return
+
+        assert isinstance(attn_metadata_raw, dict)
+        attn_metadata = attn_metadata_raw[self.prefix]
+        assert isinstance(attn_metadata, ShortConvAttentionMetadata)
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        conv_weight = self._conv_weight()
+
+        num_decodes = attn_metadata.num_decode_tokens
+        num_prefill_tokens = attn_metadata.num_prefill_tokens
+        num_actual_tokens = num_decodes + num_prefill_tokens
+        decode, prefill = torch.split(
+            hidden_states[:num_actual_tokens],
+            [num_decodes, num_prefill_tokens],
+            dim=0,
+        )
+        pieces: list[torch.Tensor] = []
+
+        if attn_metadata.num_prefills > 0:
+            assert attn_metadata.state_indices_tensor_p is not None
+            prefill_output = causal_conv1d_fn(
+                prefill.transpose(0, 1),
+                conv_weight,
+                None,
+                conv_state,
+                attn_metadata.query_start_loc_p,
+                cache_indices=attn_metadata.state_indices_tensor_p,
+                has_initial_state=attn_metadata.has_initial_states_p,
+                activation=None,
+                metadata=(
+                    attn_metadata if attn_metadata.nums_dict is not None else None
+                ),
+            ).transpose(0, 1)[:num_prefill_tokens]
+            pieces.append(prefill_output)
+
+        if num_decodes > 0:
+            assert attn_metadata.state_indices_tensor_d is not None
+            decode_output = torch.empty_like(decode)
+            decode_output = causal_conv1d_update(
+                decode.contiguous(),
+                conv_state,
+                conv_weight,
+                None,
+                activation=None,
+                conv_state_indices=attn_metadata.state_indices_tensor_d,
+                out=decode_output,
+            )
+            pieces.insert(0, decode_output)
+
+        output[:num_actual_tokens] = torch.vstack(pieces)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        output = torch.empty_like(hidden_states)
+        torch.ops.vllm.grug_moe_short_conv(hidden_states, output, self.prefix)
+        return output
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        assert self.cache_config is not None
+        return MambaStateDtypeCalculator.short_conv_state_dtype(
+            self.params_dtype,
+            self.cache_config.mamba_cache_dtype,
+        )
+
+    def get_state_shape(self) -> tuple[tuple[int, int]]:
+        return MambaStateShapeCalculator.short_conv_state_shape(
+            tp_world_size=1,
+            intermediate_size=self.dim,
+            conv_kernel=self.kernel_size,
+        )
+
+    @property
+    def mamba_type(self) -> MambaAttentionBackendEnum:
+        return MambaAttentionBackendEnum.SHORT_CONV
+
+
+def _grug_moe_short_conv(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    forward_context: ForwardContext = get_forward_context()
+    layer = forward_context.no_compile_layers[layer_name]
+    layer.forward_impl(hidden_states, output)
+
+
+def _grug_moe_short_conv_fake(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="grug_moe_short_conv",
+    op_func=_grug_moe_short_conv,
+    mutates_args=["output"],
+    fake_impl=_grug_moe_short_conv_fake,
+)
 
 
 class GrugMoeAttention(nn.Module):
@@ -542,6 +869,7 @@ class GrugMoeAttention(nn.Module):
         sliding_window: int | None,
         use_rope: bool,
         qk_mult_scale: float,
+        is_global: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -551,6 +879,8 @@ class GrugMoeAttention(nn.Module):
         self.q_size = cfg.num_heads * self.head_dim
         self.kv_size = cfg.num_kv_heads * self.head_dim
         self.use_rope = use_rope
+        self.is_global = is_global
+        self.logical_kv_heads = cfg.logical_kv_heads(is_global=is_global)
         self.qk_mult_scale = qk_mult_scale
 
         self.q_proj = ReplicatedLinear(
@@ -598,6 +928,17 @@ class GrugMoeAttention(nn.Module):
             disable_tp=True,
             prefix=f"{prefix}.attn_gate",
         )
+        self.sconv_k = (
+            GrugMoeShortConv(
+                self.kv_size,
+                cfg.sconv_kernel,
+                params_dtype,
+                cache_config,
+                prefix=f"{prefix}.sconv_k",
+            )
+            if cfg.is_schema_2 and cfg.sconv and "k" in cfg.sconv_sites
+            else None
+        )
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=cfg.max_seq_len,
@@ -605,7 +946,7 @@ class GrugMoeAttention(nn.Module):
                 "rope_theta": cfg.rope_theta,
                 "partial_rotary_factor": 0.5,
             },
-            is_neox_style=True,
+            is_neox_style=not cfg.rope_fused,
         )
         self.attn = Attention(
             cfg.num_heads,
@@ -648,12 +989,20 @@ class GrugMoeAttention(nn.Module):
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
+        if self.sconv_k is not None:
+            k = self.sconv_k(k)
 
         num_tokens = hidden_states.shape[0]
         q = _rms_norm(q.view(num_tokens, self.cfg.num_heads, self.head_dim))
-        k = _rms_norm(k.view(num_tokens, self.cfg.num_kv_heads, self.head_dim))
+        k = k.view(num_tokens, self.cfg.num_kv_heads, self.head_dim)
+        v = v.view(num_tokens, self.cfg.num_kv_heads, self.head_dim)
+        if self.logical_kv_heads != self.cfg.num_kv_heads:
+            k = _align_kv_heads(k[:, : self.logical_kv_heads], self.cfg.num_kv_heads)
+            v = _align_kv_heads(v[:, : self.logical_kv_heads], self.cfg.num_kv_heads)
+        k = _rms_norm(k)
         q = q.reshape(num_tokens, self.q_size)
         k = k.reshape(num_tokens, self.kv_size)
+        v = v.reshape(num_tokens, self.kv_size)
         if self.use_rope:
             q, k = self.rotary_emb(positions, q, k)
         q = q * self.cfg.qk_mult * self.qk_mult_scale
@@ -691,6 +1040,7 @@ class GrugMoeDecoderLayer(nn.Module):
             sliding_window,
             use_rope=not (is_long and cfg.disable_long_rope),
             qk_mult_scale=cfg.qk_mult_long_scale if is_long else 1.0,
+            is_global=is_long,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
@@ -718,7 +1068,43 @@ class GrugMoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.shared_expert",
             )
-            if cfg.shared_expert_intermediate_dim > 0
+            if not cfg.is_schema_2 and cfg.shared_expert_intermediate_dim > 0
+            else None
+        )
+        self.shared_experts = nn.ModuleList(
+            [
+                GrugMoeDenseMLP(
+                    cfg.hidden_dim,
+                    cfg.shared_expert_intermediate_dim,
+                    params_dtype,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.shared_experts.{shared_index}",
+                )
+                for shared_index in range(cfg.num_shared_experts)
+            ]
+            if cfg.is_schema_2 and cfg.shared_expert_intermediate_dim > 0
+            else []
+        )
+        self.sconv_attn = (
+            GrugMoeShortConv(
+                cfg.hidden_dim,
+                cfg.sconv_kernel,
+                params_dtype,
+                cache_config,
+                prefix=f"{prefix}.sconv_attn",
+            )
+            if cfg.is_schema_2 and cfg.sconv and "attn" in cfg.sconv_sites
+            else None
+        )
+        self.sconv_mlp = (
+            GrugMoeShortConv(
+                cfg.hidden_dim,
+                cfg.sconv_kernel,
+                params_dtype,
+                cache_config,
+                prefix=f"{prefix}.sconv_mlp",
+            )
+            if cfg.is_schema_2 and cfg.sconv and "mlp" in cfg.sconv_sites
             else None
         )
 
@@ -728,12 +1114,19 @@ class GrugMoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         attn_in = self.attn_gated_norm(self.input_layernorm(hidden_states))
-        hidden_states = hidden_states + self.self_attn(positions, attn_in)
+        attn_out = self.self_attn(positions, attn_in)
+        if self.sconv_attn is not None:
+            attn_out = self.sconv_attn(attn_out)
+        hidden_states = hidden_states + attn_out
 
         mlp_in = self.mlp_gated_norm(self.post_attention_layernorm(hidden_states))
         mlp_out = self.mlp(mlp_in)
         if self.shared_expert is not None:
             mlp_out = mlp_out + self.shared_expert(mlp_in)
+        for shared_expert in self.shared_experts:
+            mlp_out = mlp_out + shared_expert(mlp_in)
+        if self.sconv_mlp is not None:
+            mlp_out = self.sconv_mlp(mlp_out)
         return hidden_states + mlp_out
 
 
@@ -923,8 +1316,37 @@ def _try_load_grug_expert_weight(
     return None
 
 
-class GrugMoeForCausalLM(nn.Module, SupportsPP):
+class GrugMoeForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
     fall_back_to_pt_during_load = False
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: VllmConfig,
+    ) -> tuple[torch.dtype, ...]:
+        return MambaStateDtypeCalculator.short_conv_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls,
+        vllm_config: VllmConfig,
+    ) -> tuple[tuple[int, int]]:
+        hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+        if hf_config is None:
+            hf_config = vllm_config.model_config.hf_config
+        cfg = GrugMoeRuntimeConfig.from_hf_config(hf_config)
+        return MambaStateShapeCalculator.short_conv_state_shape(
+            tp_world_size=vllm_config.parallel_config.tensor_parallel_size,
+            intermediate_size=cfg.hidden_dim,
+            conv_kernel=cfg.sconv_kernel,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.short_conv_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

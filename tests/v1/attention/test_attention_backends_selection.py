@@ -122,3 +122,7 @@ def test_mamba_layers_have_unified_interface(
     assert hasattr(layer_class, "mamba_type"), (
         f"{layer_class.__name__} should have mamba_type property"
     )
+
+
+def test_short_conv_supports_batch_invariance():
+    assert ShortConvAttentionBackend.supports_batch_invariance()

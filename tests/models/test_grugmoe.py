@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import tempfile
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +15,7 @@ from torch import nn
 from transformers import AutoConfig
 
 from tests.utils import ensure_current_vllm_config
-from vllm.config import get_current_vllm_config
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -33,6 +34,7 @@ from vllm.model_executor.models.grugmoe import (
     GrugMoeMLP,
     GrugMoeRouter,
     GrugMoeRuntimeConfig,
+    GrugMoeShortConv,
     _raise_for_unsupported_modes,
     _try_load_grug_expert_weight,
     get_grug_moe_runtime_info,
@@ -40,6 +42,7 @@ from vllm.model_executor.models.grugmoe import (
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
+from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.worker.workspace import init_workspace_manager
 
 
@@ -83,6 +86,35 @@ def _tiny_config() -> GrugMoeRuntimeConfig:
     ).validate()
 
 
+def _tiny_schema_2_config() -> GrugMoeRuntimeConfig:
+    return GrugMoeRuntimeConfig(
+        vocab_size=32,
+        artifact_schema_version=2,
+        hidden_dim=16,
+        intermediate_dim=6,
+        shared_expert_intermediate_dim=5,
+        num_shared_experts=2,
+        num_experts=4,
+        num_experts_per_token=2,
+        latent_dim=8,
+        num_layers=5,
+        num_heads=4,
+        num_kv_heads=2,
+        local_kv_heads=1,
+        global_kv_heads=2,
+        head_dim=4,
+        max_seq_len=16,
+        sliding_window=8,
+        global_every=3,
+        initializer_std=0.02,
+        disable_pko=True,
+        rope_fused=True,
+        sconv=True,
+        sconv_kernel=4,
+        sconv_sites=("k", "attn", "mlp"),
+    ).validate()
+
+
 def _reference_rms_norm(x: torch.Tensor, norm: nn.Module) -> torch.Tensor:
     x_float = x.float()
     out = x_float * torch.rsqrt(
@@ -109,6 +141,13 @@ def _reference_dense_mlp(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
 def _reference_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
     cfg = module.cfg
     x_flat = x.reshape(-1, x.shape[-1])
+    routed_input = x_flat
+    if module.latent_down_proj is not None:
+        assert module.latent_norm is not None
+        routed_input = _reference_rms_norm(
+            F.linear(x_flat, module.latent_down_proj.weight),
+            module.latent_norm,
+        )
     router_logits = F.linear(x_flat.float(), module.router.weight.float())
     _, top_indices = torch.topk(
         router_logits + module.router.bias.float(),
@@ -128,8 +167,16 @@ def _reference_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
     gate_weight = gate_proj_weight[selected]
     up_weight = up_proj_weight[selected]
     down_weight = down_proj_weight[selected]
-    gate = torch.einsum("td,tkid->tki", x_flat, gate_weight.to(x_flat.dtype))
-    up = torch.einsum("td,tkid->tki", x_flat, up_weight.to(x_flat.dtype))
+    gate = torch.einsum(
+        "td,tkid->tki",
+        routed_input,
+        gate_weight.to(routed_input.dtype),
+    )
+    up = torch.einsum(
+        "td,tkid->tki",
+        routed_input,
+        up_weight.to(routed_input.dtype),
+    )
     expert_out = torch.einsum(
         "tki,tkdi->tkd",
         F.silu(gate) * up,
@@ -139,6 +186,8 @@ def _reference_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
         expert_out * combine_weights.to(expert_out.dtype).unsqueeze(-1),
         dim=1,
     )
+    if module.latent_up_proj is not None:
+        out = F.linear(out, module.latent_up_proj.weight)
     return out.to(x.dtype).reshape_as(x)
 
 
@@ -182,6 +231,33 @@ class _FakeDenseMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _reference_dense_mlp(x, self)
+
+
+class _FixedProjection(nn.Module):
+    def __init__(self, value: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("value", value)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return self.value[: x.shape[0]], None
+
+
+class _CaptureAttention(nn.Module):
+    def __init__(self, q_size: int) -> None:
+        super().__init__()
+        self.q_size = q_size
+        self.k: torch.Tensor | None = None
+        self.v: torch.Tensor | None = None
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        self.k = k
+        self.v = v
+        return torch.zeros(q.shape[0], self.q_size, dtype=q.dtype)
 
 
 def test_grug_moe_config_parses_hf_aliases_and_rope_theta():
@@ -301,6 +377,8 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
         skip_tokenizer_init=True,
         dtype="float32",
     ).create_engine_config()
+    assert vllm_config.model_config.is_hybrid is False
+    assert vllm_config.model_config.has_inner_state is False
     assert vllm_config.model_config.get_sliding_window() == 2048
     assert vllm_config.cache_config.sliding_window is None
 
@@ -316,6 +394,61 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
     assert final_full_layer.self_attn.attn.sliding_window is None
 
 
+def test_grug_moe_hf_config_loads_schema_2_fields(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["GrugMoeForCausalLM"],
+                "model_type": "grug_moe",
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "moe_intermediate_size": 6,
+                "shared_expert_intermediate_size": 5,
+                "num_shared_experts": 2,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "latent_dim": 8,
+                "num_hidden_layers": 5,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "local_kv_heads": 1,
+                "global_kv_heads": 2,
+                "head_dim": 4,
+                "max_position_embeddings": 16,
+                "sliding_window": 8,
+                "global_every": 3,
+                "rope_fused": True,
+                "sconv": True,
+                "sconv_kernel": 4,
+                "sconv_sites": ["k", "attn", "mlp"],
+                "grugmoe_artifact_schema_version": 2,
+            }
+        )
+    )
+
+    hf_config = get_config(tmp_path, trust_remote_code=False)
+    runtime_config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
+    vllm_config = EngineArgs(
+        model=str(tmp_path),
+        tokenizer=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="float32",
+    ).create_engine_config()
+
+    assert hf_config.layer_types == [
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+    ]
+    assert runtime_config == _tiny_schema_2_config()
+    assert vllm_config.model_config.is_hybrid is True
+    assert vllm_config.model_config.has_inner_state is True
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+
+
 def test_grug_moe_config_rejects_noncanonical_layer_types():
     with pytest.raises(
         ValueError,
@@ -328,6 +461,43 @@ def test_grug_moe_config_rejects_noncanonical_layer_types():
                 "sliding_attention",
                 "full_attention",
             ],
+        )
+
+
+@pytest.mark.parametrize(
+    ("schema_2_field", "value"),
+    [
+        ("latent_dim", 8),
+        ("local_kv_heads", 1),
+        ("num_shared_experts", 2),
+        ("global_every", 3),
+        ("rope_fused", True),
+        ("sconv", True),
+    ],
+)
+def test_grug_moe_schema_1_rejects_schema_2_behavior(
+    schema_2_field,
+    value,
+):
+    kwargs = {schema_2_field: value}
+    if schema_2_field == "local_kv_heads":
+        kwargs["global_kv_heads"] = 2
+        kwargs["num_kv_heads"] = 2
+        kwargs["num_heads"] = 4
+
+    with pytest.raises(
+        ValueError,
+        match="require grugmoe_artifact_schema_version=2",
+    ):
+        GrugMoeConfig(**kwargs)
+
+
+def test_grug_moe_sconv_rejects_unsupported_kernel_width():
+    with pytest.raises(ValueError, match="sconv_kernel must be between 2 and 5"):
+        GrugMoeConfig(
+            grugmoe_artifact_schema_version=2,
+            sconv=True,
+            sconv_kernel=6,
         )
 
 
@@ -468,6 +638,24 @@ def test_grug_gated_norm_matches_reference_math():
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_grug_gated_norm_preserves_projection_dispatch():
+    module = GrugMoeGatedNorm(
+        hidden_dim=2,
+        params_dtype=torch.float32,
+    )
+    x = torch.tensor([[0.2, -0.3], [0.5, 0.7]], dtype=torch.float32)
+    fixed_gate = torch.tensor([[0.4, -0.8], [1.2, 0.6]], dtype=torch.float32)
+    module.down_proj = _FixedProjection(
+        torch.zeros(x.shape[0], module.down_proj.weight.shape[0])
+    )
+    module.up_proj = _FixedProjection(fixed_gate)
+
+    actual = module(x)
+    expected = x * torch.sigmoid(fixed_gate)
+
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
 def test_grug_moe_uses_qb_bias_for_selection_and_normalized_unbiased_weights():
     cfg = _tiny_config()
     mlp = GrugMoeMLP(cfg, params_dtype=torch.float32)
@@ -543,6 +731,43 @@ def test_grug_moe_uses_qb_bias_for_selection_and_normalized_unbiased_weights():
             )
         expected_tokens.append(token_out)
     expected = torch.stack(expected_tokens)
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_grug_moe_schema_2_latent_experts_match_reference_math():
+    cfg = _tiny_schema_2_config()
+    mlp = GrugMoeMLP(cfg, params_dtype=torch.float32)
+    x = torch.linspace(-0.7, 0.8, steps=3 * cfg.hidden_dim).view(
+        3, cfg.hidden_dim
+    )
+
+    with torch.no_grad():
+        _fill_parameter(mlp.router.weight, -0.3, 0.4)
+        _fill_parameter(mlp.router.bias, 0.2, -0.1)
+        assert mlp.latent_down_proj is not None
+        assert mlp.latent_norm is not None
+        assert mlp.latent_up_proj is not None
+        _fill_parameter(mlp.latent_down_proj.weight, -0.2, 0.25)
+        _fill_parameter(mlp.latent_norm.weight, 0.7, 1.2)
+        _fill_parameter(mlp.latent_up_proj.weight, 0.3, -0.2)
+        routed_experts = mlp.experts.routed_experts
+        _fill_parameter(
+            routed_experts.w13_weight[:, : cfg.intermediate_dim, :],
+            -0.4,
+            0.2,
+        )
+        _fill_parameter(
+            routed_experts.w13_weight[:, cfg.intermediate_dim :, :],
+            0.25,
+            -0.35,
+        )
+        _fill_parameter(routed_experts.w2_weight, -0.15, 0.3)
+        _process_moe_weights(mlp)
+
+    expected = _reference_moe(x, mlp)
+    with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
+        actual = mlp(x)
 
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
@@ -666,6 +891,61 @@ def test_grug_moe_routed_experts_keep_model_dtype():
     assert layer.shared_expert.gate_proj.weight.dtype == torch.bfloat16
 
 
+def test_grug_moe_schema_2_selects_logical_kv_heads_by_layer_type():
+    cfg = replace(_tiny_schema_2_config(), sconv=False)
+    q = torch.arange(16, dtype=torch.float32).view(1, 16) + 1
+    k = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [9.0, 8.0, 7.0, 6.0]]]
+    ).reshape(1, 8)
+    v = torch.tensor(
+        [[[0.1, 0.2, 0.3, 0.4], [1.1, 1.2, 1.3, 1.4]]]
+    ).reshape(1, 8)
+    captures = []
+
+    for is_global in (False, True):
+        module = GrugMoeAttention(
+            cfg,
+            cache_config=None,
+            params_dtype=torch.float32,
+            sliding_window=None if is_global else cfg.sliding_window,
+            use_rope=False,
+            qk_mult_scale=1.0,
+            is_global=is_global,
+            prefix=f"kv.{is_global}",
+        )
+        module.q_proj = _FixedProjection(q)
+        module.k_proj = _FixedProjection(k)
+        module.v_proj = _FixedProjection(v)
+        capture = _CaptureAttention(module.q_size)
+        module.attn = capture
+        module(torch.zeros(1, dtype=torch.long), torch.zeros(1, cfg.hidden_dim))
+        captures.append(capture)
+
+    local_capture, global_capture = captures
+    assert local_capture.k is not None
+    assert local_capture.v is not None
+    assert global_capture.k is not None
+    assert global_capture.v is not None
+    expected_local_k_head = _reference_rms_norm(
+        k.view(1, 2, 4)[:, :1],
+        SimpleNamespace(variance_epsilon=1e-6, weight=torch.ones(4)),
+    )
+    torch.testing.assert_close(
+        local_capture.k.view(1, 2, 4),
+        expected_local_k_head.expand(1, 2, 4),
+    )
+    torch.testing.assert_close(
+        local_capture.v.view(1, 2, 4),
+        v.view(1, 2, 4)[:, :1].expand(1, 2, 4),
+    )
+    assert local_capture.v.is_contiguous()
+    assert not torch.equal(
+        global_capture.k.view(1, 2, 4)[:, 0],
+        global_capture.k.view(1, 2, 4)[:, 1],
+    )
+    torch.testing.assert_close(global_capture.v, v)
+
+
 def test_grug_moe_attention_schedule_matches_training_architecture():
     cfg = GrugMoeRuntimeConfig(
         vocab_size=32,
@@ -716,6 +996,114 @@ def test_grug_moe_attention_schedule_matches_training_architecture():
         assert layer.self_attn.attn.sliding_window is None
         assert layer.self_attn.use_rope is False
         assert layer.self_attn.qk_mult_scale == cfg.qk_mult_long_scale
+
+
+def _causal_depthwise_reference(
+    sequence: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.zeros_like(sequence)
+    for token_index in range(sequence.shape[0]):
+        for lag in range(weight.shape[0]):
+            if token_index >= lag:
+                output[token_index] += weight[lag] * sequence[token_index - lag]
+    return output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_grug_moe_schema_2_sconv_preserves_request_history_and_isolation():
+    prefix = "schema2.sconv.history"
+    module = GrugMoeShortConv(
+        dim=2,
+        kernel_size=4,
+        params_dtype=torch.float32,
+        cache_config=None,
+        prefix=prefix,
+    ).cuda()
+    weight = torch.tensor(
+        [[1.0, 0.75], [0.5, -0.25], [-0.25, 0.125], [0.125, 0.5]],
+        device="cuda",
+    )
+    module.weight.data.copy_(weight)
+    # State slot zero is vLLM's reserved null block.
+    module.kv_cache = (torch.zeros(3, 3, 2, device="cuda"),)
+
+    request_a = torch.tensor(
+        [[1.0, -1.0], [2.0, -2.0], [3.0, -3.0]], device="cuda"
+    )
+    request_b = torch.tensor([[10.0, 4.0], [20.0, 8.0]], device="cuda")
+    prefill = torch.vstack((request_a, request_b))
+    prefill_metadata = ShortConvAttentionMetadata(
+        num_prefills=2,
+        num_prefill_tokens=5,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_reqs=2,
+        query_start_loc_p=torch.tensor([0, 3, 5], device="cuda", dtype=torch.int32),
+        has_initial_states_p=torch.tensor([False, False], device="cuda"),
+        state_indices_tensor_p=torch.tensor([1, 2], device="cuda", dtype=torch.int32),
+        state_indices_tensor_d=torch.empty(0, device="cuda", dtype=torch.int32),
+        num_accepted_tokens=None,
+        query_start_loc_d=None,
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        block_idx_last_scheduled_token_prev_step=None,
+        num_computed_tokens_p=None,
+        seq_lens=torch.tensor([3, 2], device="cuda"),
+    )
+    with set_forward_context(
+        {prefix: prefill_metadata},
+        get_current_vllm_config(),
+        num_tokens=prefill.shape[0],
+    ):
+        prefill_output = module(prefill)
+
+    expected_a = _causal_depthwise_reference(request_a, weight)
+    expected_b = _causal_depthwise_reference(request_b, weight)
+    torch.testing.assert_close(
+        prefill_output,
+        torch.vstack((expected_a, expected_b)),
+    )
+
+    decode = torch.tensor([[4.0, -4.0], [30.0, 12.0]], device="cuda")
+    decode_metadata = ShortConvAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=2,
+        num_decode_tokens=2,
+        num_reqs=2,
+        query_start_loc_p=None,
+        has_initial_states_p=None,
+        state_indices_tensor_p=torch.empty(0, device="cuda", dtype=torch.int32),
+        state_indices_tensor_d=torch.tensor([1, 2], device="cuda", dtype=torch.int32),
+        num_accepted_tokens=None,
+        query_start_loc_d=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        block_idx_last_scheduled_token_prev_step=None,
+        num_computed_tokens_p=None,
+        seq_lens=torch.tensor([4, 3], device="cuda"),
+    )
+    with set_forward_context(
+        {prefix: decode_metadata},
+        get_current_vllm_config(),
+        num_tokens=decode.shape[0],
+    ):
+        decode_output = module(decode)
+
+    expected_decode = torch.vstack(
+        (
+            _causal_depthwise_reference(torch.vstack((request_a, decode[:1])), weight)[
+                -1:
+            ],
+            _causal_depthwise_reference(torch.vstack((request_b, decode[1:])), weight)[
+                -1:
+            ],
+        )
+    )
+    torch.testing.assert_close(decode_output, expected_decode)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
