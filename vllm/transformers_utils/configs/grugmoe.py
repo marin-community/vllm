@@ -6,8 +6,10 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-# Grug architecture: every fourth layer and the final layer use full attention.
+# Snowball used a fixed interval. Hero exports write the interval into config.
 _FULL_ATTENTION_INTERVAL = 4
+_HERO_ARTIFACT_SCHEMA_VERSION = 2
+_SUPPORTED_SCONV_SITES = frozenset({"k", "attn", "mlp"})
 
 
 def _coalesce(*values: Any) -> Any:
@@ -17,11 +19,14 @@ def _coalesce(*values: Any) -> Any:
     return None
 
 
-def grug_moe_layer_types(num_layers: int) -> list[str]:
+def grug_moe_layer_types(
+    num_layers: int,
+    global_every: int = _FULL_ATTENTION_INTERVAL,
+) -> list[str]:
     return [
         (
             "full_attention"
-            if (layer_index + 1) % _FULL_ATTENTION_INTERVAL == 0
+            if (layer_index + 1) % global_every == 0
             or layer_index == num_layers - 1
             else "sliding_attention"
         )
@@ -62,6 +67,7 @@ class GrugMoeConfig(PretrainedConfig):
         moe_intermediate_size: int | None = None,
         shared_expert_intermediate_dim: int | None = None,
         shared_expert_intermediate_size: int | None = None,
+        num_shared_experts: int = 1,
         num_experts: int | None = None,
         num_local_experts: int | None = None,
         num_experts_per_token: int | None = None,
@@ -72,11 +78,14 @@ class GrugMoeConfig(PretrainedConfig):
         num_attention_heads: int | None = None,
         num_kv_heads: int | None = None,
         num_key_value_heads: int | None = None,
+        local_kv_heads: int | None = None,
+        global_kv_heads: int | None = None,
         head_dim: int | None = None,
         attention_head_dim: int | None = None,
         max_seq_len: int | None = None,
         max_position_embeddings: int | None = None,
         sliding_window: int | None = None,
+        global_every: int = _FULL_ATTENTION_INTERVAL,
         layer_types: list[str] | None = None,
         layer_norm_eps: float | None = None,
         rms_norm_eps: float | None = None,
@@ -84,8 +93,14 @@ class GrugMoeConfig(PretrainedConfig):
         initializer_range: float | None = None,
         qk_mult: float = 1.0,
         qk_mult_long_scale: float = 1.0,
+        latent_dim: int | None = None,
         disable_pko: bool = True,
         disable_long_rope: bool = True,
+        rope_fused: bool = False,
+        sconv: bool = False,
+        sconv_kernel: int = 4,
+        sconv_sites: list[str] | tuple[str, ...] = ("k", "attn", "mlp"),
+        grugmoe_artifact_schema_version: int = 1,
         rope: dict[str, Any] | None = None,
         rope_parameters: dict[str, Any] | None = None,
         rope_scaling: dict[str, Any] | None = None,
@@ -125,7 +140,10 @@ class GrugMoeConfig(PretrainedConfig):
             rope = {"theta": rope_theta}
         if rope_parameters is None:
             rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
-        resolved_layer_types = grug_moe_layer_types(num_hidden_layers)
+        global_every = int(global_every)
+        if global_every <= 0:
+            raise ValueError("global_every must be positive")
+        resolved_layer_types = grug_moe_layer_types(num_hidden_layers, global_every)
         if layer_types is not None and layer_types != resolved_layer_types:
             raise ValueError(
                 "layer_types must match the GrugMoE attention architecture"
@@ -139,6 +157,7 @@ class GrugMoeConfig(PretrainedConfig):
         self.moe_intermediate_size = intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.shared_expert_intermediate_dim = shared_expert_intermediate_size
+        self.num_shared_experts = int(num_shared_experts)
         self.num_experts = int(_coalesce(num_experts, num_local_experts, 8))
         self.num_local_experts = self.num_experts
         self.num_experts_per_tok = int(
@@ -151,11 +170,18 @@ class GrugMoeConfig(PretrainedConfig):
         self.num_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_kv_heads = num_key_value_heads
+        self.local_kv_heads = (
+            None if local_kv_heads is None else int(local_kv_heads)
+        )
+        self.global_kv_heads = (
+            None if global_kv_heads is None else int(global_kv_heads)
+        )
         self.head_dim = head_dim
         self.attention_head_dim = head_dim
         self.max_position_embeddings = max_position_embeddings
         self.max_seq_len = max_position_embeddings
         self.sliding_window = int(_coalesce(sliding_window, max_position_embeddings))
+        self.global_every = global_every
         self.layer_types = resolved_layer_types
         self.rms_norm_eps = float(_coalesce(rms_norm_eps, layer_norm_eps, 1e-5))
         self.layer_norm_eps = self.rms_norm_eps
@@ -165,13 +191,87 @@ class GrugMoeConfig(PretrainedConfig):
         self.initializer_std = self.initializer_range
         self.qk_mult = qk_mult
         self.qk_mult_long_scale = qk_mult_long_scale
+        self.latent_dim = None if latent_dim is None else int(latent_dim)
         self.disable_pko = disable_pko
         self.disable_long_rope = disable_long_rope
+        self.rope_fused = bool(rope_fused)
+        self.sconv = bool(sconv)
+        self.sconv_kernel = int(sconv_kernel)
+        self.sconv_sites = list(sconv_sites)
+        self.grugmoe_artifact_schema_version = int(
+            grugmoe_artifact_schema_version
+        )
         self.rope = rope
         self.rope_parameters = rope_parameters
         self.rope_scaling = rope_scaling
         self.rope_theta = rope_theta
         self.use_cache = use_cache
+
+        if self.grugmoe_artifact_schema_version not in (
+            1,
+            _HERO_ARTIFACT_SCHEMA_VERSION,
+        ):
+            raise ValueError(
+                "unsupported grugmoe_artifact_schema_version="
+                f"{self.grugmoe_artifact_schema_version}"
+            )
+        if self.grugmoe_artifact_schema_version == 1:
+            hero_fields = []
+            if self.num_shared_experts != 1:
+                hero_fields.append("num_shared_experts")
+            if self.latent_dim is not None:
+                hero_fields.append("latent_dim")
+            if self.local_kv_heads is not None or self.global_kv_heads is not None:
+                hero_fields.extend(("local_kv_heads", "global_kv_heads"))
+            if self.global_every != _FULL_ATTENTION_INTERVAL:
+                hero_fields.append("global_every")
+            if self.rope_fused:
+                hero_fields.append("rope_fused")
+            if self.sconv:
+                hero_fields.append("sconv")
+            if self.sconv_kernel != 4:
+                hero_fields.append("sconv_kernel")
+            if self.sconv_sites != ["k", "attn", "mlp"]:
+                hero_fields.append("sconv_sites")
+            if hero_fields:
+                raise ValueError(
+                    ", ".join(hero_fields)
+                    + " require grugmoe_artifact_schema_version=2"
+                )
+        if self.num_shared_experts <= 0:
+            raise ValueError("num_shared_experts must be positive")
+        if self.latent_dim is not None and not 0 < self.latent_dim <= hidden_size:
+            raise ValueError(
+                f"latent_dim must be in (0, hidden_size={hidden_size}]"
+            )
+        if (self.local_kv_heads is None) != (self.global_kv_heads is None):
+            raise ValueError("local_kv_heads and global_kv_heads must be set together")
+        if self.local_kv_heads is not None and self.global_kv_heads is not None:
+            if self.local_kv_heads <= 0 or self.global_kv_heads <= 0:
+                raise ValueError("local_kv_heads and global_kv_heads must be positive")
+            if (
+                num_attention_heads % self.local_kv_heads != 0
+                or num_attention_heads % self.global_kv_heads != 0
+            ):
+                raise ValueError(
+                    "num_attention_heads must be divisible by both local and "
+                    "global KV-head counts"
+                )
+            if num_key_value_heads != max(
+                self.local_kv_heads, self.global_kv_heads
+            ):
+                raise ValueError(
+                    "num_key_value_heads must equal the stored maximum of "
+                    "local/global KV heads"
+                )
+        if self.sconv and not 2 <= self.sconv_kernel <= 5:
+            raise ValueError("sconv_kernel must be between 2 and 5")
+        unknown_sconv_sites = set(self.sconv_sites) - _SUPPORTED_SCONV_SITES
+        if unknown_sconv_sites:
+            raise ValueError(
+                "unsupported sconv_sites: "
+                + ", ".join(sorted(unknown_sconv_sites))
+            )
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
