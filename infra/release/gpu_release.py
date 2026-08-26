@@ -8,41 +8,22 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import hashlib
 import json
 import os
 import re
 import sys
 import zipfile
+from dataclasses import dataclass
+from email.message import Message
+from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
-
-if __package__:
-    from .release_common import (
-        RELEASE_REPOSITORY,
-        ReleaseError,
-        load_json,
-        normalized_distribution_name,
-        release_asset_url,
-        requirement_name,
-        sha256_file,
-        wheel_metadata,
-        write_json,
-    )
-else:
-    from release_common import (  # type: ignore[no-redef]
-        RELEASE_REPOSITORY,
-        ReleaseError,
-        load_json,
-        normalized_distribution_name,
-        release_asset_url,
-        requirement_name,
-        sha256_file,
-        wheel_metadata,
-        write_json,
-    )
+from urllib.parse import quote
 
 MANIFEST_NAME = "marin-vllm-gpu-manifest.json"
 VALIDATION_SENTINEL = "MARIN_GPU_VALIDATION_JSON="
+RELEASE_REPOSITORY = "marin-community/vllm"
 SOURCE_REPOSITORY = "https://github.com/marin-community/vllm"
 UPSTREAM_REPOSITORY = "https://github.com/vllm-project/vllm"
 REQUIRED_EXTENSIONS = ("vllm._C_stable_libtorch", "vllm.cumem_allocator")
@@ -72,8 +53,72 @@ REQUIRED_RUNTIME_GATES = (
 )
 
 
-def _packaged_contents(wheel: Path) -> dict[str, str]:
+class ReleaseError(RuntimeError):
+    """A release input violates the published artifact contract."""
+
+
+@dataclass(frozen=True)
+class WheelDocument:
+    """Release-relevant records read from one wheel archive."""
+
+    metadata: Message
+    tags: list[str]
+    packaged: dict[str, str]
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ReleaseError(f"{path} must contain a JSON object")
+    return value
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def normalized_distribution_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def requirement_name(requirement: str) -> str:
+    match = re.match(r"\s*([A-Za-z0-9_.-]+)", requirement)
+    if match is None:
+        raise ReleaseError(f"cannot parse Requires-Dist entry {requirement!r}")
+    return normalized_distribution_name(match.group(1))
+
+
+def release_asset_url(repository: str, tag: str, filename: str) -> str:
+    return (
+        f"https://github.com/{repository}/releases/download/"
+        f"{quote(tag, safe='')}/{quote(filename, safe='+._-')}"
+    )
+
+
+def _wheel_document(wheel: Path) -> WheelDocument:
     with zipfile.ZipFile(wheel) as archive:
+        metadata_names = [
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        ]
+        wheel_names = [
+            name for name in archive.namelist() if name.endswith(".dist-info/WHEEL")
+        ]
+        if len(metadata_names) != 1 or len(wheel_names) != 1:
+            raise ReleaseError(
+                f"{wheel.name} must contain one METADATA and one WHEEL file"
+            )
+        metadata = BytesParser().parsebytes(archive.read(metadata_names[0]))
+        wheel_metadata = BytesParser().parsebytes(archive.read(wheel_names[0]))
         members = archive.namelist()
         grug_sources = [
             name
@@ -85,7 +130,7 @@ def _packaged_contents(wheel: Path) -> dict[str, str]:
             source = archive.read(grug_sources[0])
             if b"class GrugMoeForCausalLM" in source:
                 grug_state = "included"
-        return {
+        packaged = {
             "vllm._C_stable_libtorch": (
                 "included"
                 if any(
@@ -104,6 +149,7 @@ def _packaged_contents(wheel: Path) -> dict[str, str]:
             ),
             GRUG_ARCHITECTURE: grug_state,
         }
+    return WheelDocument(metadata, wheel_metadata.get_all("Tag", []), packaged)
 
 
 def inspect_wheel(
@@ -120,10 +166,10 @@ def inspect_wheel(
 ) -> dict[str, Any]:
     if architecture not in config["platforms"]:
         raise ReleaseError(f"unsupported architecture {architecture!r}")
-    document = wheel_metadata(wheel)
+    document = _wheel_document(wheel)
     metadata = document.metadata
     wheel_tags = document.tags
-    packaged = _packaged_contents(wheel)
+    packaged = document.packaged
     distribution = metadata.get("Name", "")
     expected_distribution = config["distribution_name"]
     if normalized_distribution_name(distribution) != normalized_distribution_name(
