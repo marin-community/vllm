@@ -411,7 +411,7 @@ jobs:
               --index-strategy unsafe-best-match \
               --requirements requirements/build/tpu.txt
             VLLM_TARGET_DEVICE=tpu \
-              VLLM_VERSION_OVERRIDE="${VLLM_VERSION_BASE}+marin.${VLLM_COMMIT:0:12}" \
+              VLLM_VERSION_OVERRIDE="${VLLM_VERSION_BASE}+marin.${VLLM_COMMIT:0:12}.tpu" \
               uv build \
                 --wheel \
                 --no-build-isolation \
