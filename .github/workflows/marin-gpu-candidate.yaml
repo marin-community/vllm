@@ -319,6 +319,9 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+    env:
+      TPU_INFERENCE_VERSION_BASE: "0.26.0"
+      VLLM_VERSION_BASE: "0.20.1rc1.dev0"
     steps:
       - name: Check out producer revision
         uses: actions/checkout@v4
@@ -329,7 +332,7 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
 
-      - name: Validate immutable inputs
+      - name: Validate inputs and derive release tag
         id: release
         run: |
           for commit in "${{ inputs.vllm_commit }}" "${{ inputs.tpu_inference_commit }}"; do
@@ -345,8 +348,11 @@ jobs:
           VLLM_COMMIT="${{ inputs.vllm_commit }}"
           TPU_COMMIT="${{ inputs.tpu_inference_commit }}"
           RELEASE_DATE=$(git show -s --format=%cs "$GITHUB_SHA" | tr -d -)
-          echo "tag=marin-vllm-tpu-${RELEASE_DATE}-${VLLM_COMMIT:0:12}-${TPU_COMMIT:0:12}" \
-            >> "$GITHUB_OUTPUT"
+          TAG="marin-vllm-tpu-${RELEASE_DATE}-${VLLM_COMMIT:0:12}-${TPU_COMMIT:0:12}"
+          {
+            echo "tag=$TAG"
+            echo "asset_base_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check out exact vLLM source
         uses: actions/checkout@v4
@@ -370,7 +376,7 @@ jobs:
           [[ "$(git -C sources/tpu-inference rev-parse HEAD)" == "${{ inputs.tpu_inference_commit }}" ]]
           mkdir candidate
           TPU_COMMIT="${{ inputs.tpu_inference_commit }}"
-          VLLM_VERSION_OVERRIDE="0.26.0+marin.${TPU_COMMIT:0:12}" uv build \
+          VLLM_VERSION_OVERRIDE="${TPU_INFERENCE_VERSION_BASE}+marin.${TPU_COMMIT:0:12}" uv build \
             --wheel \
             --python 3.12 \
             --exclude-newer "${{ inputs.exclude_newer }}" \
@@ -382,7 +388,7 @@ jobs:
             exit 1
           fi
           TPU_WHEEL=$(basename "${TPU_WHEELS[0]}")
-          TPU_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.release.outputs.tag }}/$TPU_WHEEL"
+          TPU_URL="${{ steps.release.outputs.asset_base_url }}/$TPU_WHEEL"
           {
             echo "wheel=$TPU_WHEEL"
             echo "url=$TPU_URL"
@@ -405,7 +411,7 @@ jobs:
               --index-strategy unsafe-best-match \
               --requirements requirements/build/tpu.txt
             VLLM_TARGET_DEVICE=tpu \
-              VLLM_VERSION_OVERRIDE="0.20.1rc1.dev0+marin.${VLLM_COMMIT:0:12}" \
+              VLLM_VERSION_OVERRIDE="${VLLM_VERSION_BASE}+marin.${VLLM_COMMIT:0:12}" \
               uv build \
                 --wheel \
                 --no-build-isolation \
@@ -419,7 +425,7 @@ jobs:
             exit 1
           fi
           VLLM_WHEEL=$(basename "${VLLM_WHEELS[0]}")
-          VLLM_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.release.outputs.tag }}/$VLLM_WHEEL"
+          VLLM_URL="${{ steps.release.outputs.asset_base_url }}/$VLLM_WHEEL"
           unzip -p "${VLLM_WHEELS[0]}" '*.dist-info/METADATA' > vllm-metadata.txt
           grep -F "$TPU_INFERENCE_URL" vllm-metadata.txt
           {
@@ -433,8 +439,9 @@ jobs:
           TPU_INFERENCE_URL: ${{ steps.companion.outputs.url }}
           VLLM_URL: ${{ steps.pair.outputs.url }}
         run: |
-          if gh release view "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Refusing to overwrite existing release ${{ steps.release.outputs.tag }}" >&2
+          TAG="${{ steps.release.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release $TAG" >&2
             exit 1
           fi
           {
@@ -450,10 +457,10 @@ jobs:
             echo
             echo "Companion asset: $TPU_INFERENCE_URL"
           } > release-notes.md
-          gh release create "${{ steps.release.outputs.tag }}" \
+          gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "Marin vLLM TPU ${{ steps.release.outputs.tag }}" \
+            --title "Marin vLLM TPU ${TAG#marin-vllm-tpu-}" \
             --notes-file release-notes.md \
             --prerelease \
             candidate/*.whl
