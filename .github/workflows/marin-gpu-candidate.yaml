@@ -1,7 +1,7 @@
 name: Marin vLLM Candidate
 
-# Marin fork only. GPU candidates follow main. The manual TPU lane packages the
-# two exact source commits supplied by the caller.
+# Marin fork only. GPU candidates follow main. The manual TPU lane builds one
+# public pair from the two exact source commits supplied by the caller.
 
 on:
   push:
@@ -13,7 +13,6 @@ on:
       - ".github/workflows/marin-gpu-candidate.yaml"
       - ".github/workflows/marin-gpu-release.yaml"
       - "infra/release/gpu_validation.py"
-      - "infra/release/validation_common.py"
       - "infra/release/tests/**"
   workflow_dispatch:
     inputs:
@@ -26,14 +25,14 @@ on:
           - gpu
           - tpu
       vllm_commit:
-        description: "Exact vLLM package source for the TPU lane"
+        description: "Exact TPU vLLM source commit"
         required: true
-        default: 3d26773be1d7aa7361a542943e3ef14f023d6f3a
+        default: 5b69c198a2cc51ae531ad7d8d46ced8ff3c7d8df
         type: string
       tpu_inference_commit:
-        description: "Exact tpu-inference package source for the TPU lane"
+        description: "Exact tpu-inference source commit"
         required: true
-        default: c63712cb74eb8183999b9bec1a75a810edb4abab
+        default: e8f28a4ef35783227546da8032c03f3c61167e25
         type: string
       exclude_newer:
         description: "UTC dependency cutoff for the TPU pair"
@@ -50,7 +49,6 @@ permissions:
 
 env:
   RELEASE_CONFIG: infra/release/config.json
-  TPU_RELEASE_CONFIG: infra/release/tpu_config.json
   UV_VERSION: "0.11.21"
 
 jobs:
@@ -315,28 +313,24 @@ jobs:
             --config "$RELEASE_CONFIG"
 
   publish-tpu:
-    name: Build and publish exact TPU wheel pair
+    name: Build and publish TPU pair
     if: github.event_name == 'workflow_dispatch' && inputs.lane == 'tpu'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
       contents: write
     steps:
-      - name: Checkout workflow revision
+      - name: Check out producer revision
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       - uses: astral-sh/setup-uv@v6
         with:
           version: ${{ env.UV_VERSION }}
 
-      - name: Create the metadata environment
-        run: uv venv --python "$(jq -r '.python_version' "$TPU_RELEASE_CONFIG")" .metadata
-
-      - name: Read exact package sources
-        id: pair
+      - name: Validate immutable inputs
+        id: release
         run: |
           for commit in "${{ inputs.vllm_commit }}" "${{ inputs.tpu_inference_commit }}"; do
             if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
@@ -348,153 +342,118 @@ jobs:
             echo "exclude_newer must be a whole-second UTC timestamp." >&2
             exit 1
           fi
-          VLLM_VERSION=$(.metadata/bin/python infra/release/tpu_release.py package-version \
-            --config "$TPU_RELEASE_CONFIG" \
-            --distribution vllm \
-            --source-commit "${{ inputs.vllm_commit }}")
-          TPU_VERSION=$(.metadata/bin/python infra/release/tpu_release.py package-version \
-            --config "$TPU_RELEASE_CONFIG" \
-            --distribution tpu-inference \
-            --source-commit "${{ inputs.tpu_inference_commit }}")
-          {
-            echo "vllm_commit=${{ inputs.vllm_commit }}"
-            echo "tpu_commit=${{ inputs.tpu_inference_commit }}"
-            echo "exclude_newer=${{ inputs.exclude_newer }}"
-            echo "python_version=$(jq -r '.python_version' "$TPU_RELEASE_CONFIG")"
-            echo "target_device=$(jq -r '.vllm_target_device' "$TPU_RELEASE_CONFIG")"
-            echo "vllm_repository=$(jq -r '.repositories.vllm' "$TPU_RELEASE_CONFIG")"
-            echo "tpu_repository=$(jq -r '.repositories["tpu-inference"]' "$TPU_RELEASE_CONFIG")"
-            echo "vllm_version=${VLLM_VERSION}"
-            echo "tpu_version=${TPU_VERSION}"
-          } >> "$GITHUB_OUTPUT"
+          VLLM_COMMIT="${{ inputs.vllm_commit }}"
+          TPU_COMMIT="${{ inputs.tpu_inference_commit }}"
+          RELEASE_DATE=$(git show -s --format=%cs "$GITHUB_SHA" | tr -d -)
+          echo "tag=marin-vllm-tpu-${RELEASE_DATE}-${VLLM_COMMIT:0:12}-${TPU_COMMIT:0:12}" \
+            >> "$GITHUB_OUTPUT"
 
-      - name: Checkout exact vLLM source
+      - name: Check out exact vLLM source
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.pair.outputs.vllm_repository }}
-          ref: ${{ steps.pair.outputs.vllm_commit }}
-          fetch-depth: 0
+          repository: marin-community/vllm
+          ref: ${{ inputs.vllm_commit }}
           path: sources/vllm
           persist-credentials: false
 
-      - name: Checkout exact tpu-inference source
+      - name: Check out exact tpu-inference source
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.pair.outputs.tpu_repository }}
-          ref: ${{ steps.pair.outputs.tpu_commit }}
-          fetch-depth: 0
+          repository: marin-community/tpu-inference
+          ref: ${{ inputs.tpu_inference_commit }}
           path: sources/tpu-inference
           persist-credentials: false
 
-      - name: Build both Python 3.12 wheels
+      - name: Build the companion wheel
+        id: companion
         run: |
-          [[ "$(git -C sources/vllm rev-parse HEAD)" == "${{ steps.pair.outputs.vllm_commit }}" ]]
-          [[ "$(git -C sources/tpu-inference rev-parse HEAD)" == "${{ steps.pair.outputs.tpu_commit }}" ]]
+          [[ "$(git -C sources/tpu-inference rev-parse HEAD)" == "${{ inputs.tpu_inference_commit }}" ]]
           mkdir candidate
+          TPU_COMMIT="${{ inputs.tpu_inference_commit }}"
+          VLLM_VERSION_OVERRIDE="0.26.0+marin.${TPU_COMMIT:0:12}" uv build \
+            --wheel \
+            --python 3.12 \
+            --exclude-newer "${{ inputs.exclude_newer }}" \
+            --out-dir "$GITHUB_WORKSPACE/candidate" \
+            sources/tpu-inference
+          TPU_WHEELS=(candidate/tpu_inference-*.whl)
+          if [[ ${#TPU_WHEELS[@]} -ne 1 ]]; then
+            echo "Expected one tpu-inference wheel, found ${#TPU_WHEELS[@]}" >&2
+            exit 1
+          fi
+          TPU_WHEEL=$(basename "${TPU_WHEELS[0]}")
+          TPU_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.release.outputs.tag }}/$TPU_WHEEL"
+          {
+            echo "wheel=$TPU_WHEEL"
+            echo "url=$TPU_URL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build vLLM with the companion requirement
+        id: pair
+        env:
+          TPU_INFERENCE_URL: ${{ steps.companion.outputs.url }}
+        run: |
+          [[ "$(git -C sources/vllm rev-parse HEAD)" == "${{ inputs.vllm_commit }}" ]]
+          printf '\ntpu-inference @ %s\n' "$TPU_INFERENCE_URL" >> sources/vllm/requirements/tpu.txt
           (
             cd sources/vllm
-            uv venv --python "${{ steps.pair.outputs.python_version }}" .tpu-wheel-build
+            VLLM_COMMIT="${{ inputs.vllm_commit }}"
+            uv venv --python 3.12 .tpu-wheel-build
             uv pip install \
               --python .tpu-wheel-build/bin/python \
-              --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
+              --exclude-newer "${{ inputs.exclude_newer }}" \
               --index-strategy unsafe-best-match \
               --requirements requirements/build/tpu.txt
-            VLLM_TARGET_DEVICE="${{ steps.pair.outputs.target_device }}" \
-              VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.vllm_version }}" \
-              uv build --wheel \
+            VLLM_TARGET_DEVICE=tpu \
+              VLLM_VERSION_OVERRIDE="0.20.1rc1.dev0+marin.${VLLM_COMMIT:0:12}" \
+              uv build \
+                --wheel \
                 --no-build-isolation \
                 --python .tpu-wheel-build/bin/python \
-                --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
+                --exclude-newer "${{ inputs.exclude_newer }}" \
                 --out-dir "$GITHUB_WORKSPACE/candidate"
           )
-          (
-            cd sources/tpu-inference
-            VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.tpu_version }}" uv build --wheel \
-              --python "${{ steps.pair.outputs.python_version }}" \
-              --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-              --out-dir "$GITHUB_WORKSPACE/candidate"
-          )
-          WHEELS=(candidate/*.whl)
-          if [[ ${#WHEELS[@]} -ne 2 ]]; then
-            echo "Expected two wheels, found ${#WHEELS[@]}" >&2
+          VLLM_WHEELS=(candidate/vllm-*.whl)
+          if [[ ${#VLLM_WHEELS[@]} -ne 1 ]]; then
+            echo "Expected one vLLM wheel, found ${#VLLM_WHEELS[@]}" >&2
             exit 1
           fi
+          VLLM_WHEEL=$(basename "${VLLM_WHEELS[0]}")
+          VLLM_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.release.outputs.tag }}/$VLLM_WHEEL"
+          unzip -p "${VLLM_WHEELS[0]}" '*.dist-info/METADATA' > vllm-metadata.txt
+          grep -F "$TPU_INFERENCE_URL" vllm-metadata.txt
+          {
+            echo "wheel=$VLLM_WHEEL"
+            echo "url=$VLLM_URL"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Assemble and verify pair manifest
-        id: manifest
-        run: |
-          CREATED_AT=$(git show -s --format=%cI "$GITHUB_SHA")
-          WHEEL_ARGS=()
-          while IFS= read -r wheel; do
-            WHEEL_ARGS+=(--wheel "$wheel")
-          done < <(find candidate -maxdepth 1 -name '*.whl' -print | sort)
-          .metadata/bin/python infra/release/tpu_release.py assemble-candidate \
-            --config "$TPU_RELEASE_CONFIG" \
-            "${WHEEL_ARGS[@]}" \
-            --repository "$GITHUB_REPOSITORY" \
-            --vllm-commit "${{ steps.pair.outputs.vllm_commit }}" \
-            --tpu-inference-commit "${{ steps.pair.outputs.tpu_commit }}" \
-            --workflow-commit "$GITHUB_SHA" \
-            --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --created-at "$CREATED_AT" \
-            --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-            --output candidate/marin-vllm-tpu-manifest.json
-          .metadata/bin/python infra/release/tpu_release.py write-index \
-            --manifest candidate/marin-vllm-tpu-manifest.json \
-            --directory candidate
-          .metadata/bin/python infra/release/tpu_release.py verify-candidate \
-            --config "$TPU_RELEASE_CONFIG" \
-            --manifest candidate/marin-vllm-tpu-manifest.json \
-            --directory candidate
-          .metadata/bin/python infra/release/tpu_release.py release-notes \
-            --manifest candidate/marin-vllm-tpu-manifest.json \
-            --output candidate-notes.md
-          CANDIDATE_TAG=$(jq -r '.release.tag' candidate/marin-vllm-tpu-manifest.json)
-          echo "candidate_tag=$CANDIDATE_TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Publish candidate assets once
+      - name: Publish the once-built pair as a prerelease
         env:
-          CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
           GH_TOKEN: ${{ github.token }}
+          TPU_INFERENCE_URL: ${{ steps.companion.outputs.url }}
+          VLLM_URL: ${{ steps.pair.outputs.url }}
         run: |
-          if gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Refusing to overwrite existing candidate $CANDIDATE_TAG" >&2
+          if gh release view "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release ${{ steps.release.outputs.tag }}" >&2
             exit 1
           fi
-          gh release create "$CANDIDATE_TAG" \
+          {
+            echo "Built once by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "Producer revision: $GITHUB_SHA"
+            echo "vLLM source: ${{ inputs.vllm_commit }}"
+            echo "tpu-inference source: ${{ inputs.tpu_inference_commit }}"
+            echo "Dependency cutoff: ${{ inputs.exclude_newer }}"
+            echo
+            echo "Install this vLLM requirement; its metadata installs the companion:"
+            echo "vllm @ $VLLM_URL"
+            echo
+            echo "Companion asset: $TPU_INFERENCE_URL"
+          } > release-notes.md
+          gh release create "${{ steps.release.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "Marin vLLM TPU candidate ${CANDIDATE_TAG#marin-vllm-tpu-candidate-}" \
-            --notes-file candidate-notes.md \
+            --title "Marin vLLM TPU ${{ steps.release.outputs.tag }}" \
+            --notes-file release-notes.md \
             --prerelease \
-            candidate/*.whl \
-            candidate/*.html \
-            candidate/marin-vllm-tpu-manifest.json
-
-      - name: Redownload the published pair
-        env:
-          CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir published
-          gh release download "$CANDIDATE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --dir published
-
-      - name: Verify the published assets
-        env:
-          CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
-        run: |
-          .metadata/bin/python infra/release/tpu_release.py verify-candidate \
-            --config "$TPU_RELEASE_CONFIG" \
-            --manifest published/marin-vllm-tpu-manifest.json \
-            --directory published \
-            --expected-tag "$CANDIDATE_TAG"
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: marin-vllm-tpu-candidate-${{ github.run_id }}
-          path: candidate/marin-vllm-tpu-manifest.json
-          if-no-files-found: ignore
-          retention-days: 14
+            candidate/*.whl
