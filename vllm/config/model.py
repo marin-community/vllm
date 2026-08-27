@@ -1856,9 +1856,8 @@ class ModelConfig:
     def is_hybrid(self) -> bool:
         if not self._model_info.is_hybrid:
             return False
-        # GrugMoE schema 1 is attention-only. The schema-2 model uses the same
-        # class but becomes hybrid only when its stateful short convolutions
-        # are enabled.
+        # Snowball GrugMoE is attention-only. Hero uses the same serialized
+        # model identity but becomes hybrid when short convolutions are enabled.
         if getattr(self.hf_text_config, "model_type", None) == "grug_moe":
             return bool(getattr(self.hf_text_config, "sconv", False))
         # Handle granite-4.0-micro case which uses hybrid config but does not

@@ -70,7 +70,7 @@ _GATED_NORM_RANK = 128
 _ROUTER_COMBINE_WEIGHT_SUM = 2.5
 _ROUTER_COMBINE_WEIGHT_EPS = 1e-9
 _UNQUANTIZED_METHOD = "unquantized"
-_GRUGMOE_ARTIFACT_SCHEMA_VERSION = 2
+_HERO_ARTIFACT_SCHEMA_VERSION = 2
 _SUPPORTED_SCONV_SITES = frozenset({"k", "attn", "mlp"})
 
 
@@ -326,8 +326,8 @@ class GrugMoeRuntimeConfig:
         return tuple(grug_moe_layer_types(self.num_layers, self.global_every))
 
     @property
-    def is_schema_2(self) -> bool:
-        return self.artifact_schema_version == _GRUGMOE_ARTIFACT_SCHEMA_VERSION
+    def is_hero(self) -> bool:
+        return self.artifact_schema_version == _HERO_ARTIFACT_SCHEMA_VERSION
 
     @property
     def expert_dim(self) -> int:
@@ -341,33 +341,33 @@ class GrugMoeRuntimeConfig:
     def validate(self) -> "GrugMoeRuntimeConfig":
         if self.artifact_schema_version not in (
             1,
-            _GRUGMOE_ARTIFACT_SCHEMA_VERSION,
+            _HERO_ARTIFACT_SCHEMA_VERSION,
         ):
             raise ValueError(
                 "unsupported grugmoe_artifact_schema_version="
                 f"{self.artifact_schema_version}"
             )
         if self.artifact_schema_version == 1:
-            schema_2_fields = []
+            hero_fields = []
             if self.num_shared_experts != 1:
-                schema_2_fields.append("num_shared_experts")
+                hero_fields.append("num_shared_experts")
             if self.latent_dim is not None:
-                schema_2_fields.append("latent_dim")
+                hero_fields.append("latent_dim")
             if self.local_kv_heads is not None or self.global_kv_heads is not None:
-                schema_2_fields.extend(("local_kv_heads", "global_kv_heads"))
+                hero_fields.extend(("local_kv_heads", "global_kv_heads"))
             if self.global_every != 4:
-                schema_2_fields.append("global_every")
+                hero_fields.append("global_every")
             if self.rope_fused:
-                schema_2_fields.append("rope_fused")
+                hero_fields.append("rope_fused")
             if self.sconv:
-                schema_2_fields.append("sconv")
+                hero_fields.append("sconv")
             if self.sconv_kernel != 4:
-                schema_2_fields.append("sconv_kernel")
+                hero_fields.append("sconv_kernel")
             if self.sconv_sites != ("k", "attn", "mlp"):
-                schema_2_fields.append("sconv_sites")
-            if schema_2_fields:
+                hero_fields.append("sconv_sites")
+            if hero_fields:
                 raise ValueError(
-                    ", ".join(schema_2_fields)
+                    ", ".join(hero_fields)
                     + " require grugmoe_artifact_schema_version=2"
                 )
         if self.vocab_size <= 0:
@@ -936,7 +936,7 @@ class GrugMoeAttention(nn.Module):
                 cache_config,
                 prefix=f"{prefix}.sconv_k",
             )
-            if cfg.is_schema_2 and cfg.sconv and "k" in cfg.sconv_sites
+            if cfg.is_hero and cfg.sconv and "k" in cfg.sconv_sites
             else None
         )
         self.rotary_emb = get_rope(
@@ -1068,7 +1068,7 @@ class GrugMoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.shared_expert",
             )
-            if not cfg.is_schema_2 and cfg.shared_expert_intermediate_dim > 0
+            if not cfg.is_hero and cfg.shared_expert_intermediate_dim > 0
             else None
         )
         self.shared_experts = nn.ModuleList(
@@ -1082,7 +1082,7 @@ class GrugMoeDecoderLayer(nn.Module):
                 )
                 for shared_index in range(cfg.num_shared_experts)
             ]
-            if cfg.is_schema_2 and cfg.shared_expert_intermediate_dim > 0
+            if cfg.is_hero and cfg.shared_expert_intermediate_dim > 0
             else []
         )
         self.sconv_attn = (
@@ -1093,7 +1093,7 @@ class GrugMoeDecoderLayer(nn.Module):
                 cache_config,
                 prefix=f"{prefix}.sconv_attn",
             )
-            if cfg.is_schema_2 and cfg.sconv and "attn" in cfg.sconv_sites
+            if cfg.is_hero and cfg.sconv and "attn" in cfg.sconv_sites
             else None
         )
         self.sconv_mlp = (
@@ -1104,7 +1104,7 @@ class GrugMoeDecoderLayer(nn.Module):
                 cache_config,
                 prefix=f"{prefix}.sconv_mlp",
             )
-            if cfg.is_schema_2 and cfg.sconv and "mlp" in cfg.sconv_sites
+            if cfg.is_hero and cfg.sconv and "mlp" in cfg.sconv_sites
             else None
         )
 

@@ -86,7 +86,7 @@ def _tiny_config() -> GrugMoeRuntimeConfig:
     ).validate()
 
 
-def _tiny_schema_2_config() -> GrugMoeRuntimeConfig:
+def _tiny_hero_config() -> GrugMoeRuntimeConfig:
     return GrugMoeRuntimeConfig(
         vocab_size=32,
         artifact_schema_version=2,
@@ -394,7 +394,7 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
     assert final_full_layer.self_attn.attn.sliding_window is None
 
 
-def test_grug_moe_hf_config_loads_schema_2_fields(tmp_path):
+def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(
         json.dumps(
@@ -443,7 +443,7 @@ def test_grug_moe_hf_config_loads_schema_2_fields(tmp_path):
         "sliding_attention",
         "full_attention",
     ]
-    assert runtime_config == _tiny_schema_2_config()
+    assert runtime_config == _tiny_hero_config()
     assert vllm_config.model_config.is_hybrid is True
     assert vllm_config.model_config.has_inner_state is True
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
@@ -465,7 +465,7 @@ def test_grug_moe_config_rejects_noncanonical_layer_types():
 
 
 @pytest.mark.parametrize(
-    ("schema_2_field", "value"),
+    ("hero_field", "value"),
     [
         ("latent_dim", 8),
         ("local_kv_heads", 1),
@@ -475,12 +475,12 @@ def test_grug_moe_config_rejects_noncanonical_layer_types():
         ("sconv", True),
     ],
 )
-def test_grug_moe_schema_1_rejects_schema_2_behavior(
-    schema_2_field,
+def test_snowball_grug_moe_rejects_hero_behavior(
+    hero_field,
     value,
 ):
-    kwargs = {schema_2_field: value}
-    if schema_2_field == "local_kv_heads":
+    kwargs = {hero_field: value}
+    if hero_field == "local_kv_heads":
         kwargs["global_kv_heads"] = 2
         kwargs["num_kv_heads"] = 2
         kwargs["num_heads"] = 4
@@ -735,8 +735,8 @@ def test_grug_moe_uses_qb_bias_for_selection_and_normalized_unbiased_weights():
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_grug_moe_schema_2_latent_experts_match_reference_math():
-    cfg = _tiny_schema_2_config()
+def test_hero_grug_moe_latent_experts_match_reference_math():
+    cfg = _tiny_hero_config()
     mlp = GrugMoeMLP(cfg, params_dtype=torch.float32)
     x = torch.linspace(-0.7, 0.8, steps=3 * cfg.hidden_dim).view(
         3, cfg.hidden_dim
@@ -891,8 +891,8 @@ def test_grug_moe_routed_experts_keep_model_dtype():
     assert layer.shared_expert.gate_proj.weight.dtype == torch.bfloat16
 
 
-def test_grug_moe_schema_2_selects_logical_kv_heads_by_layer_type():
-    cfg = replace(_tiny_schema_2_config(), sconv=False)
+def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type():
+    cfg = replace(_tiny_hero_config(), sconv=False)
     q = torch.arange(16, dtype=torch.float32).view(1, 16) + 1
     k = torch.tensor(
         [[[1.0, 2.0, 3.0, 4.0], [9.0, 8.0, 7.0, 6.0]]]
@@ -1011,8 +1011,8 @@ def _causal_depthwise_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_grug_moe_schema_2_sconv_preserves_request_history_and_isolation():
-    prefix = "schema2.sconv.history"
+def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
+    prefix = "hero.sconv.history"
     module = GrugMoeShortConv(
         dim=2,
         kernel_size=4,

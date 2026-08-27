@@ -6,9 +6,9 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-# Schema 1 used a fixed interval. Schema 2 writes the interval into config.
+# Snowball used a fixed interval. Hero exports write the interval into config.
 _FULL_ATTENTION_INTERVAL = 4
-_GRUGMOE_ARTIFACT_SCHEMA_VERSION = 2
+_HERO_ARTIFACT_SCHEMA_VERSION = 2
 _SUPPORTED_SCONV_SITES = frozenset({"k", "attn", "mlp"})
 
 
@@ -209,33 +209,33 @@ class GrugMoeConfig(PretrainedConfig):
 
         if self.grugmoe_artifact_schema_version not in (
             1,
-            _GRUGMOE_ARTIFACT_SCHEMA_VERSION,
+            _HERO_ARTIFACT_SCHEMA_VERSION,
         ):
             raise ValueError(
                 "unsupported grugmoe_artifact_schema_version="
                 f"{self.grugmoe_artifact_schema_version}"
             )
         if self.grugmoe_artifact_schema_version == 1:
-            schema_2_fields = []
+            hero_fields = []
             if self.num_shared_experts != 1:
-                schema_2_fields.append("num_shared_experts")
+                hero_fields.append("num_shared_experts")
             if self.latent_dim is not None:
-                schema_2_fields.append("latent_dim")
+                hero_fields.append("latent_dim")
             if self.local_kv_heads is not None or self.global_kv_heads is not None:
-                schema_2_fields.extend(("local_kv_heads", "global_kv_heads"))
+                hero_fields.extend(("local_kv_heads", "global_kv_heads"))
             if self.global_every != _FULL_ATTENTION_INTERVAL:
-                schema_2_fields.append("global_every")
+                hero_fields.append("global_every")
             if self.rope_fused:
-                schema_2_fields.append("rope_fused")
+                hero_fields.append("rope_fused")
             if self.sconv:
-                schema_2_fields.append("sconv")
+                hero_fields.append("sconv")
             if self.sconv_kernel != 4:
-                schema_2_fields.append("sconv_kernel")
+                hero_fields.append("sconv_kernel")
             if self.sconv_sites != ["k", "attn", "mlp"]:
-                schema_2_fields.append("sconv_sites")
-            if schema_2_fields:
+                hero_fields.append("sconv_sites")
+            if hero_fields:
                 raise ValueError(
-                    ", ".join(schema_2_fields)
+                    ", ".join(hero_fields)
                     + " require grugmoe_artifact_schema_version=2"
                 )
         if self.global_every <= 0:
