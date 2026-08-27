@@ -879,7 +879,6 @@ class GrugMoeAttention(nn.Module):
         self.q_size = cfg.num_heads * self.head_dim
         self.kv_size = cfg.num_kv_heads * self.head_dim
         self.use_rope = use_rope
-        self.is_global = is_global
         self.logical_kv_heads = cfg.logical_kv_heads(is_global=is_global)
         self.qk_mult_scale = qk_mult_scale
 

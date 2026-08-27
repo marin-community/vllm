@@ -238,8 +238,6 @@ class GrugMoeConfig(PretrainedConfig):
                     ", ".join(hero_fields)
                     + " require grugmoe_artifact_schema_version=2"
                 )
-        if self.global_every <= 0:
-            raise ValueError("global_every must be positive")
         if self.num_shared_experts <= 0:
             raise ValueError("num_shared_experts must be positive")
         if self.latent_dim is not None and not 0 < self.latent_dim <= hidden_size:
