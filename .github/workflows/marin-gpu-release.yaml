@@ -196,7 +196,9 @@ jobs:
 
       - name: Install the Iris client
         run: |
-          uv tool install --prerelease allow "marin-core>=0.2.46.dev202607131620"
+          uv tool install --prerelease allow \
+            --with "marin-finelog==0.2.38.dev33017094821" \
+            "marin-core==0.2.92.dev32937879514"
           echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
 
       - name: Validate the published wheel on ${{ matrix.hardware }}
