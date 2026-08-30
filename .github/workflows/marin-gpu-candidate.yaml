@@ -338,20 +338,25 @@ jobs:
 
       - name: Validate inputs and accept release tag
         id: release
+        env:
+          VLLM_COMMIT: ${{ inputs.vllm_commit }}
+          TPU_INFERENCE_COMMIT: ${{ inputs.tpu_inference_commit }}
+          EXCLUDE_NEWER: ${{ inputs.exclude_newer }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          for commit in "${{ inputs.vllm_commit }}" "${{ inputs.tpu_inference_commit }}"; do
+          for commit in "$VLLM_COMMIT" "$TPU_INFERENCE_COMMIT"; do
             if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
               echo "TPU package sources must be full lowercase Git SHAs." >&2
               exit 1
             fi
           done
-          if [[ ! "${{ inputs.exclude_newer }}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+          if [[ ! "$EXCLUDE_NEWER" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
             echo "exclude_newer must be a whole-second UTC timestamp." >&2
             exit 1
           fi
-          TAG="${{ inputs.release_tag }}"
-          if [[ ! "$TAG" =~ ^marin-vllm-tpu-.+$ ]]; then
-            echo "release_tag must start with marin-vllm-tpu-." >&2
+          TAG="$RELEASE_TAG"
+          if [[ ! "$TAG" =~ ^marin-vllm-tpu-[A-Za-z0-9._-]+$ ]]; then
+            echo "release_tag must use the marin-vllm-tpu- prefix and Git-ref-safe characters." >&2
             exit 1
           fi
           {
@@ -377,14 +382,18 @@ jobs:
 
       - name: Build the companion wheel
         id: companion
+        env:
+          TPU_INFERENCE_COMMIT: ${{ inputs.tpu_inference_commit }}
+          EXCLUDE_NEWER: ${{ inputs.exclude_newer }}
+          ASSET_BASE_URL: ${{ steps.release.outputs.asset_base_url }}
         run: |
-          [[ "$(git -C sources/tpu-inference rev-parse HEAD)" == "${{ inputs.tpu_inference_commit }}" ]]
+          [[ "$(git -C sources/tpu-inference rev-parse HEAD)" == "$TPU_INFERENCE_COMMIT" ]]
           mkdir candidate
-          TPU_COMMIT="${{ inputs.tpu_inference_commit }}"
+          TPU_COMMIT="$TPU_INFERENCE_COMMIT"
           VLLM_VERSION_OVERRIDE="${TPU_INFERENCE_VERSION_BASE}+marin.${TPU_COMMIT:0:12}" uv build \
             --wheel \
             --python 3.12 \
-            --exclude-newer "${{ inputs.exclude_newer }}" \
+            --exclude-newer "$EXCLUDE_NEWER" \
             --out-dir "$GITHUB_WORKSPACE/candidate" \
             sources/tpu-inference
           TPU_WHEELS=(candidate/tpu_inference-*.whl)
@@ -393,7 +402,7 @@ jobs:
             exit 1
           fi
           TPU_WHEEL=$(basename "${TPU_WHEELS[0]}")
-          TPU_URL="${{ steps.release.outputs.asset_base_url }}/$TPU_WHEEL"
+          TPU_URL="$ASSET_BASE_URL/$TPU_WHEEL"
           {
             echo "wheel=$TPU_WHEEL"
             echo "url=$TPU_URL"
@@ -403,16 +412,18 @@ jobs:
         id: pair
         env:
           TPU_INFERENCE_URL: ${{ steps.companion.outputs.url }}
+          VLLM_COMMIT: ${{ inputs.vllm_commit }}
+          EXCLUDE_NEWER: ${{ inputs.exclude_newer }}
+          ASSET_BASE_URL: ${{ steps.release.outputs.asset_base_url }}
         run: |
-          [[ "$(git -C sources/vllm rev-parse HEAD)" == "${{ inputs.vllm_commit }}" ]]
+          [[ "$(git -C sources/vllm rev-parse HEAD)" == "$VLLM_COMMIT" ]]
           printf '\ntpu-inference @ %s\n' "$TPU_INFERENCE_URL" >> sources/vllm/requirements/tpu.txt
           (
             cd sources/vllm
-            VLLM_COMMIT="${{ inputs.vllm_commit }}"
             uv venv --python 3.12 .tpu-wheel-build
             uv pip install \
               --python .tpu-wheel-build/bin/python \
-              --exclude-newer "${{ inputs.exclude_newer }}" \
+              --exclude-newer "$EXCLUDE_NEWER" \
               --index-strategy unsafe-best-match \
               --requirements requirements/build/tpu.txt
             VLLM_TARGET_DEVICE=tpu \
@@ -421,7 +432,7 @@ jobs:
                 --wheel \
                 --no-build-isolation \
                 --python .tpu-wheel-build/bin/python \
-                --exclude-newer "${{ inputs.exclude_newer }}" \
+                --exclude-newer "$EXCLUDE_NEWER" \
                 --out-dir "$GITHUB_WORKSPACE/candidate"
           )
           VLLM_WHEELS=(candidate/vllm-*.whl)
@@ -430,7 +441,7 @@ jobs:
             exit 1
           fi
           VLLM_WHEEL=$(basename "${VLLM_WHEELS[0]}")
-          VLLM_URL="${{ steps.release.outputs.asset_base_url }}/$VLLM_WHEEL"
+          VLLM_URL="$ASSET_BASE_URL/$VLLM_WHEEL"
           unzip -p "${VLLM_WHEELS[0]}" '*.dist-info/METADATA' > vllm-metadata.txt
           grep -F "$TPU_INFERENCE_URL" vllm-metadata.txt
           {
@@ -443,8 +454,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TPU_INFERENCE_URL: ${{ steps.companion.outputs.url }}
           VLLM_URL: ${{ steps.pair.outputs.url }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          VLLM_COMMIT: ${{ inputs.vllm_commit }}
+          TPU_INFERENCE_COMMIT: ${{ inputs.tpu_inference_commit }}
+          EXCLUDE_NEWER: ${{ inputs.exclude_newer }}
         run: |
-          TAG="${{ steps.release.outputs.tag }}"
+          TAG="$RELEASE_TAG"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Refusing to overwrite existing release $TAG" >&2
             exit 1
@@ -453,9 +468,9 @@ jobs:
             echo "Built once by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo
             echo "Producer revision: $GITHUB_SHA"
-            echo "vLLM source: ${{ inputs.vllm_commit }}"
-            echo "tpu-inference source: ${{ inputs.tpu_inference_commit }}"
-            echo "Dependency cutoff: ${{ inputs.exclude_newer }}"
+            echo "vLLM source: $VLLM_COMMIT"
+            echo "tpu-inference source: $TPU_INFERENCE_COMMIT"
+            echo "Dependency cutoff: $EXCLUDE_NEWER"
             echo
             echo "Install this vLLM requirement; its metadata installs the companion:"
             echo "vllm @ $VLLM_URL"

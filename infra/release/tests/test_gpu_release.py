@@ -78,6 +78,20 @@ def test_candidate_build_ignores_release_only_changes():
     }
 
 
+def test_tpu_publish_shell_receives_dispatch_values_through_environment():
+    workflow = yaml.safe_load(GPU_CANDIDATE_WORKFLOW_PATH.read_text())
+    steps = workflow["jobs"]["publish-tpu"]["steps"]
+    shell_source = "\n".join(step.get("run", "") for step in steps)
+
+    for expression in (
+        "${{ inputs.",
+        "${{ steps.release.outputs.",
+        "${{ steps.companion.outputs.",
+        "${{ steps.pair.outputs.",
+    ):
+        assert expression not in shell_source
+
+
 def test_server_command_pins_requested_attention_backend():
     command = server_command("Qwen/Qwen3-0.6B", 8000, "FLASH_ATTN")
 
