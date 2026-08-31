@@ -104,12 +104,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Reclaim x86_64 runner disk and add swap
-        if: matrix.architecture == 'x86_64'
+      - name: Reclaim runner disk and add swap
         run: |
           # The CUDA-13 compile peaks past the runner's ~16GB RAM and OOM-kills the
-          # runner agent mid-build (frozen step, no logs). Free disk and back the
-          # memory spikes with a large swapfile so the build fits the standard runner.
+          # runner agent mid-build. Free disk and back the memory spikes with a
+          # large swapfile so both architectures fit the standard runners.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
           sudo swapoff -a || true
           sudo rm -f /mnt/swapfile /swapfile
