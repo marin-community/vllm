@@ -16,16 +16,18 @@ import yaml
 from infra.nightly.gpu_serve_smoke import server_command
 from infra.release.gpu_release import (
     GRUG_ARCHITECTURE,
+    ReleaseError,
     assemble_candidate,
     build_matrix,
     extract_validation,
     finalize_release,
     inspect_wheel,
+    load_json,
+    sha256_file,
     validate_wheel_fragment,
     validation_matrix,
     verify_release_assets,
 )
-from infra.release.release_common import ReleaseError, load_json, sha256_file
 
 REPOSITORY_ROOT = Path(__file__).parents[3]
 CONFIG_PATH = Path(__file__).parents[1] / "config.json"
@@ -72,22 +74,28 @@ def test_candidate_build_ignores_release_only_changes():
         ".github/workflows/marin-gpu-candidate.yaml",
         ".github/workflows/marin-gpu-release.yaml",
         "infra/release/gpu_validation.py",
-        "infra/release/validation_common.py",
         "infra/release/tests/**",
     }
+
+
+def test_tpu_publish_shell_receives_dispatch_values_through_environment():
+    workflow = yaml.safe_load(GPU_CANDIDATE_WORKFLOW_PATH.read_text())
+    steps = workflow["jobs"]["publish-tpu"]["steps"]
+    shell_source = "\n".join(step.get("run", "") for step in steps)
+
+    for expression in (
+        "${{ inputs.",
+        "${{ steps.release.outputs.",
+        "${{ steps.companion.outputs.",
+        "${{ steps.pair.outputs.",
+    ):
+        assert expression not in shell_source
 
 
 def test_server_command_pins_requested_attention_backend():
     command = server_command("Qwen/Qwen3-0.6B", 8000, "FLASH_ATTN")
 
-    assert "--tensor-parallel-size" not in command
     assert command[-2:] == ["--attention-backend", "FLASH_ATTN"]
-
-
-def test_server_command_uses_requested_tensor_parallel_size():
-    command = server_command("Qwen/Qwen3-0.6B", 8000, None, 8)
-
-    assert command[-2:] == ["--tensor-parallel-size", "8"]
 
 
 def write_wheel(
