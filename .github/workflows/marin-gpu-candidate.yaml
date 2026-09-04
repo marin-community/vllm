@@ -69,11 +69,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Reclaim x86_64 runner disk
+      - name: Reclaim x86_64 runner disk and add swap
         if: matrix.architecture == 'x86_64'
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          # Two concurrent CUDA compiles can exceed the hosted runner's physical
+          # memory. Preserve that concurrency, which is needed to finish within
+          # the job timeout, and absorb the short peaks with disk-backed swap.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 32G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
           df -h /
+          free -h
 
       - uses: docker/setup-buildx-action@v3
 
