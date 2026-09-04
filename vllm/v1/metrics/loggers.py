@@ -9,7 +9,7 @@ from collections.abc import Callable
 from prometheus_client import Counter, Gauge, Histogram
 
 import vllm.envs as envs
-from vllm.compilation.cuda_graph import CUDAGraphLogging
+from vllm.compilation.cuda_graph import CUDAGraphLogging, CUDAGraphStat
 from vllm.config import SupportsMetricsInfo, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorLogging,
@@ -35,6 +35,7 @@ logger = init_logger(__name__)
 # User-facing reason labels for waiting request breakdown
 WAITING_REASON_CAPACITY = "capacity"
 WAITING_REASON_DEFERRED = "deferred"
+CUDAGRAPH_RUNTIME_MODES = ("NONE", "PIECEWISE", "FULL")
 
 PerEngineStatLoggerFactory = Callable[[VllmConfig, int], "StatLoggerBase"]
 AggregateStatLoggerFactory = type["AggregateStatLoggerBase"]
@@ -427,6 +428,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.kv_cache_metrics_enabled = (
             vllm_config.observability_config.kv_cache_metrics
         )
+        self.cudagraph_metrics_enabled = (
+            vllm_config.observability_config.cudagraph_metrics
+        )
 
         labelnames = ["model_name", "engine"]
         model_name = vllm_config.model_config.served_model_name
@@ -672,6 +676,56 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.counter_generation_tokens = create_metric_per_engine(
             counter_generation_tokens, per_engine_labelvalues
         )
+
+        self.counter_cudagraph_iterations: dict[str, dict[int, Counter]] = {}
+        self.counter_cudagraph_unpadded_tokens: dict[str, dict[int, Counter]] = {}
+        self.counter_cudagraph_padded_tokens: dict[str, dict[int, Counter]] = {}
+        if self.cudagraph_metrics_enabled:
+            cudagraph_labelnames = labelnames + ["runtime_mode"]
+            cudagraph_counters = (
+                (
+                    self.counter_cudagraph_iterations,
+                    self._counter_cls(
+                        name="vllm:cudagraph_iterations",
+                        documentation=(
+                            "Cumulative number of model iterations by CUDA graph "
+                            "runtime mode."
+                        ),
+                        labelnames=cudagraph_labelnames,
+                    ),
+                ),
+                (
+                    self.counter_cudagraph_unpadded_tokens,
+                    self._counter_cls(
+                        name="vllm:cudagraph_unpadded_tokens",
+                        documentation=(
+                            "Cumulative number of actual model input tokens by CUDA "
+                            "graph runtime mode."
+                        ),
+                        labelnames=cudagraph_labelnames,
+                    ),
+                ),
+                (
+                    self.counter_cudagraph_padded_tokens,
+                    self._counter_cls(
+                        name="vllm:cudagraph_padded_tokens",
+                        documentation=(
+                            "Cumulative number of padded model input tokens by CUDA "
+                            "graph runtime mode."
+                        ),
+                        labelnames=cudagraph_labelnames,
+                    ),
+                ),
+            )
+            for counters_by_mode, counter in cudagraph_counters:
+                for runtime_mode in CUDAGRAPH_RUNTIME_MODES:
+                    counters_by_mode[runtime_mode] = create_metric_per_engine(
+                        counter,
+                        {
+                            idx: labelvalues + [runtime_mode]
+                            for idx, labelvalues in per_engine_labelvalues.items()
+                        },
+                    )
 
         self.counter_request_success: dict[FinishReason, dict[int, Counter]] = {}
         counter_request_success_base = self._counter_cls(
@@ -1092,6 +1146,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.prefix_cache_stats.hits
             )
 
+            if (
+                self.cudagraph_metrics_enabled
+                and scheduler_stats.cudagraph_stats is not None
+            ):
+                self._record_cudagraph_metrics(
+                    scheduler_stats.cudagraph_stats, engine_idx
+                )
+
             if scheduler_stats.connector_prefix_cache_stats is not None:
                 self.counter_connector_prefix_cache_queries[engine_idx].inc(
                     scheduler_stats.connector_prefix_cache_stats.queries
@@ -1220,6 +1282,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+
+    def _record_cudagraph_metrics(self, stats: CUDAGraphStat, engine_idx: int) -> None:
+        runtime_mode = stats.runtime_mode
+        if runtime_mode not in CUDAGRAPH_RUNTIME_MODES:
+            logger.warning_once(
+                "Ignoring unexpected CUDA graph runtime mode %r in metrics",
+                runtime_mode,
+            )
+            return
+
+        self.counter_cudagraph_iterations[runtime_mode][engine_idx].inc()
+        self.counter_cudagraph_unpadded_tokens[runtime_mode][engine_idx].inc(
+            stats.num_unpadded_tokens
+        )
+        self.counter_cudagraph_padded_tokens[runtime_mode][engine_idx].inc(
+            stats.num_padded_tokens
+        )
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1
