@@ -260,6 +260,21 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._kv_cache = kv_caches[self.cache_layers[0]]
 
+        # The hidden-state cache layer is re-blocked by the KV cache allocator so
+        # that its page size matches the attention layers (see
+        # kv_cache_utils.get_kv_cache_groups). Its block size is therefore NOT
+        # cache_config.block_size in general; use the actual tensor layout so
+        # the slot mapping computed in _submit_async_write matches what the
+        # writer (basic_cache) used.
+        if self._kv_cache.shape[1] != self._block_size:
+            logger.info(
+                "Hidden-state cache block size %d differs from "
+                "cache_config.block_size %d; using the cache layout.",
+                self._kv_cache.shape[1],
+                self._block_size,
+            )
+            self._block_size = int(self._kv_cache.shape[1])
+
         # Find the KV cache group index for hidden states
         if self._kv_cache_config is not None:
             for i, group in enumerate(self._kv_cache_config.kv_cache_groups):
