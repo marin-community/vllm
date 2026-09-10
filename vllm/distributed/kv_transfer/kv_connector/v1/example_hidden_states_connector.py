@@ -150,7 +150,23 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Worker-side state (set by register_kv_caches).
         self._kv_cache: torch.Tensor | None = None
+        # Index of the KV cache group holding the hidden-state cache layer.
+        # Needed on the *scheduler* side too (request_finished_all_groups
+        # picks the block ids of this group), so resolve it here from the
+        # kv_cache_config instead of only in register_kv_caches (worker only).
         self._hs_group_idx: int = 0
+        if kv_cache_config is not None:
+            from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+
+            for i, group in enumerate(kv_cache_config.kv_cache_groups):
+                if isinstance(group.kv_cache_spec, HiddenStateCacheSpec):
+                    self._hs_group_idx = i
+                    logger.info(
+                        "Hidden-state cache is KV cache group %d (block_size %d)",
+                        i,
+                        group.kv_cache_spec.block_size,
+                    )
+                    break
         # Only TP rank 0 writes hidden states to disk; other TP ranks no-op.
         # Set in register_kv_caches (after distributed init).
         self._is_tp_rank_zero: bool = True
