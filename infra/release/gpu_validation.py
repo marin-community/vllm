@@ -300,6 +300,8 @@ def install_wheel_environment(
             "--extra-index-url",
             config["torch_index_url"],
             str(wheel),
+            "--constraint",
+            str(Path(__file__).with_name("gpu-constraints.txt")),
             "pytest",
             "tblib",
         ],

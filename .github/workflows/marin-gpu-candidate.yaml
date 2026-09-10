@@ -160,9 +160,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ccache-cache
-          key: marin-vllm-cu130-ccache-${{ matrix.architecture }}-${{ github.sha }}
+          key: marin-vllm-cu132-ccache-${{ matrix.architecture }}-${{ github.sha }}
           restore-keys: |
-            marin-vllm-cu130-ccache-${{ matrix.architecture }}-
+            marin-vllm-cu132-ccache-${{ matrix.architecture }}-
 
       - name: Load the compile cache into the builder
         continue-on-error: true
@@ -173,7 +173,7 @@ jobs:
               "ccache-cache": "/root/.cache/ccache"
             }
 
-      - name: Build and export the CUDA 13.0 wheel
+      - name: Build and export the CUDA 13.2 wheel
         run: |
           mkdir -p artifacts
           docker buildx build \
@@ -181,6 +181,7 @@ jobs:
             --output type=local,dest=artifacts \
             --build-arg BUILD_OS=manylinux \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
+            --build-arg UV_CONSTRAINT=/opt/marin-gpu-constraints.txt \
             --build-arg CUDA_VERSION="${{ matrix.cuda_version }}" \
             --build-arg PYTHON_VERSION="${{ matrix.python_version }}" \
             --build-arg torch_cuda_arch_list="${{ matrix.sm_targets }}" \

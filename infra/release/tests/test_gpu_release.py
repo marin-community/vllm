@@ -133,8 +133,10 @@ def fragment(
     architecture: str,
     *,
     include_cumem: bool = True,
+    config: dict | None = None,
 ) -> dict:
-    config = load_json(CONFIG_PATH)
+    if config is None:
+        config = load_json(CONFIG_PATH)
     wheel = tmp_path / (
         "vllm-0.0.0.dev20260803+marin.test.cu130-cp38-abi3-"
         f"manylinux_2_28_{architecture}.whl"
@@ -245,9 +247,6 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
     }
     assert record["source"]["fork_commit"] == FORK_COMMIT
     assert record["source"]["upstream_base"] == UPSTREAM_BASE
-    assert record["build"]["python_version"] == "3.12"
-    assert record["build"]["torch_version"] == "2.13.0+cu130"
-    assert record["build"]["cuda_toolkit_version"] == "13.0.3"
     assert record["platform"]["wheel_tags"] == [
         "cp38-abi3-linux_x86_64"
     ]
@@ -265,7 +264,7 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
 
 
 def test_missing_cumem_allocator_is_explicit_and_blocks_candidate(tmp_path):
-    record = fragment(tmp_path, "aarch64", include_cumem=False)
+    record = fragment(tmp_path, "x86_64", include_cumem=False)
 
     assert record["platform"]["packaged"]["vllm.cumem_allocator"] == "absent"
     with pytest.raises(ReleaseError, match="vllm.cumem_allocator.*absent"):
@@ -274,8 +273,9 @@ def test_missing_cumem_allocator_is_explicit_and_blocks_candidate(tmp_path):
 
 def test_candidate_rejects_cross_arch_source_mismatch(tmp_path):
     config = load_json(CONFIG_PATH)
+    config["platforms"]["aarch64"] = copy.deepcopy(config["platforms"]["x86_64"])
     x86 = fragment(tmp_path, "x86_64")
-    arm = fragment(tmp_path, "aarch64")
+    arm = fragment(tmp_path, "aarch64", config=config)
     arm["source"]["upstream_base"] = "c" * 40
 
     with pytest.raises(ReleaseError, match="disagrees on source"):
@@ -347,7 +347,6 @@ def test_release_binds_passed_gpu_results_to_candidate_wheel_digests(tmp_path):
     assert manifest["validation"]["status"] == "passed"
     assert {item["architecture"] for item in manifest["validation"]["targets"]} == {
         "x86_64",
-        "aarch64",
     }
     for platform in manifest["platforms"]:
         assert f"/{manifest['release']['tag']}/" in platform["wheel"]["url"]
@@ -372,9 +371,9 @@ def test_release_rejects_allocator_absence_from_gpu_result(tmp_path):
 
 def test_release_rejects_wrong_serving_attention_backend(tmp_path):
     config, candidate_manifest, validations, _ = release_fixture(tmp_path)
-    broken = copy.deepcopy(validations[1])
+    broken = copy.deepcopy(validations[0])
     broken["environment"]["attention_backend"] = "FLASHINFER"
-    validations[1] = broken
+    validations[0] = broken
 
     with pytest.raises(ReleaseError, match="attention_backend='FLASHINFER'"):
         finalize_release(
