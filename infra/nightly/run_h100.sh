@@ -23,7 +23,7 @@ echo "::: installing vLLM with upstream's prebuilt kernels"
 # ones and nothing needs compiling here.
 uv venv --python 3.12
 VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-uv pip install pytest tblib
+uv pip install pytest tblib transformers --constraint requirements/test/cuda.txt
 
 echo "::: running the delta's tests on the GPU"
 # Two tests are deselected because they cannot run on a single GPU, not because they are
