@@ -484,6 +484,14 @@ def validate(args: argparse.Namespace) -> int:
             python = install_wheel_environment(
                 workdir, wheel, config, environment
             )
+            cuda_home = (
+                python.parent.parent
+                / "lib"
+                / f"python{config['python_version']}"
+                / "site-packages/nvidia/cu13"
+            )
+            environment.update(CUDA_HOME=str(cuda_home), NVRTC_HOME=str(cuda_home))
+            environment["PATH"] = f"{python.parent}:{environment.get('PATH', '')}"
             probe, probe_return_code = run_installed_probe(
                 python,
                 workdir,

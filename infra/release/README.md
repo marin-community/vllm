@@ -12,7 +12,7 @@ images, deployment-specific SM targets, Iris validation hardware, and the digest
 multi-architecture validation image. Update the config and workflows in one PR
 when an ABI changes.
 
-The x86_64 build reuses the `build` target in
+The x86_64 build reuses the `wheel-build` target in
 [`docker/Dockerfile`](../../docker/Dockerfile). That is the same build path
 used by upstream's release pipeline. Release code does not edit
 `requirements/cuda.txt`, `requirements/build/cuda.txt`, or the `vllm`
@@ -26,8 +26,12 @@ Compilation uses two jobs with one NVCC thread each and an 800 MiB wheel limit.
 
 `gpu-constraints.txt` pins the Python build and runtime dependencies for CPython
 3.12 on Linux x86_64. Both the release Docker build and wheel validation consume
-it. Regenerate from `requirements/cuda.txt` and `requirements/build/cuda.txt`
-with the configured PyTorch index when changing the ABI.
+it. Regenerate from `requirements/cuda.txt`, `requirements/build/cuda.txt`, and
+`cuda-toolkit[nvcc,cccl]==13.2.1` with the configured PyTorch index when changing
+the ABI. The toolkit extras pin the compiler and headers used by runtime JIT
+compilation. Preserve the direct
+TorchAudio CPU wheel constraint: the available CUDA 13.0 TorchAudio wheel
+rejects Torch cu132, while audio preprocessing uses Torch's tensor operators.
 
 The x86_64 candidate job removes unused Android, .NET, and GHC toolchains from
 its ephemeral hosted runner before compiling. The wheel-only BuildKit export
