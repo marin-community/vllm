@@ -299,9 +299,13 @@ def install_wheel_environment(
             "unsafe-best-match",
             "--extra-index-url",
             config["torch_index_url"],
+            "--extra-index-url",
+            "https://flashinfer.ai/whl/",
             str(wheel),
             "--constraint",
             str(Path(__file__).with_name("gpu-constraints.txt")),
+            "cuda-toolkit[nvcc,cccl]",
+            "flashinfer-cubin",
             "pytest",
             "tblib",
         ],
@@ -492,6 +496,12 @@ def validate(args: argparse.Namespace) -> int:
             )
             environment.update(CUDA_HOME=str(cuda_home), NVRTC_HOME=str(cuda_home))
             environment["PATH"] = f"{python.parent}:{environment.get('PATH', '')}"
+            # The NVIDIA runtime wheel omits the unversioned linker name.
+            linker_directory = python.parent.parent / "lib"
+            (linker_directory / "libcudart.so").symlink_to(
+                cuda_home / "lib/libcudart.so.13"
+            )
+            environment["LIBRARY_PATH"] = str(linker_directory)
             probe, probe_return_code = run_installed_probe(
                 python,
                 workdir,
