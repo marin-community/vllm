@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -77,6 +78,30 @@ class SpecDecodeBaseProposer:
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+
+        # Whether the draft forward needs cross-DP-rank batch coordination.
+        # Only an MoE drafter (EP all-to-all inside the draft) does; a dense
+        # drafter (EAGLE/EAGLE-3 Llama heads) runs no DP collective, so its
+        # padded token count can be filled in locally. Each avoided
+        # coordinate_batch_across_dp() is one all-reduce per draft pass (a CPU
+        # gloo all-reduce whenever async scheduling disables NCCL for DP sync),
+        # and the proposer's ran after the sampler, desynchronising the ranks
+        # before the target's own DP sync: measured 2.1x decode step at k=3 on
+        # a DP4xEP4 MoE target. VLLM_DRAFT_DP_SYNC=0/1 forces either behaviour.
+        _sync = os.environ.get("VLLM_DRAFT_DP_SYNC", "auto").strip().lower()
+        if _sync in ("0", "false", "off"):
+            self.draft_dp_sync = False
+        elif _sync in ("1", "true", "on"):
+            self.draft_dp_sync = True
+        else:
+            self.draft_dp_sync = bool(self.draft_model_config.is_moe)
+        if vllm_config.parallel_config.data_parallel_size > 1:
+            logger.info_once(
+                "Draft DP batch coordination: %s (VLLM_DRAFT_DP_SYNC=%s, draft is_moe=%s)",
+                "all-reduce per draft pass" if self.draft_dp_sync else "local (no collective)",
+                _sync,
+                self.draft_model_config.is_moe,
+            )
 
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -1640,7 +1665,16 @@ class SpecDecodeBaseProposer:
         # coordinate across ranks
         # TODO(Flechman): support DBO ubatching
         should_ubatch, num_tokens_across_dp = False, None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        if dp_size > 1 and not self.draft_dp_sync:
+            # Dense drafter: no rank needs this rank's padded size, so build
+            # the DP metadata locally (see __init__) instead of all-reducing.
+            # set_forward_context() would otherwise all-reduce itself when
+            # num_tokens_across_dp is None.
+            num_tokens_across_dp = torch.full(
+                (dp_size,), num_tokens_padded, dtype=torch.int32
+            )
+        elif dp_size > 1:
             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,
