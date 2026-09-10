@@ -455,7 +455,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 #################### EXTENSIONS BUILD IMAGE ####################
 
 #################### WHEEL BUILD IMAGE ####################
-FROM base AS build
+FROM base AS wheel-build
 ARG TARGETPLATFORM
 
 ARG PIP_INDEX_URL UV_INDEX_URL
@@ -531,13 +531,6 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # when the wheel changes, without copying the wheel itself into the image.
 RUN sha256sum dist/*.whl > dist/wheel.sha256
 
-# Copy extension wheels from extensions-build stage for later use
-COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
-
-# Record the EP kernels wheel checksum for the same cache-busting purpose.
-RUN sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
-    > /tmp/ep_kernels_workspace/dist/wheels.sha256
-
 # Check the size of the CUDA 13 wheel uploaded to PyPI
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
 # sync the default value with .buildkite/check-wheel-size.py
@@ -553,10 +546,16 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
 
 #################### WHEEL BUILD IMAGE ####################
 
+# The container also ships EP wheels. The Marin wheel release only needs vLLM.
+FROM wheel-build AS build
+COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
+RUN sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
+    > /tmp/ep_kernels_workspace/dist/wheels.sha256
+
 # Export only the release artifact. Loading the full build stage into Docker
 # duplicates its toolchains and intermediate objects on the hosted runner.
 FROM scratch AS marin-wheel-export
-COPY --from=build /workspace/dist /dist
+COPY --from=wheel-build /workspace/dist /dist
 
 #################### DEV IMAGE ####################
 FROM base AS dev
