@@ -44,7 +44,7 @@ from vllm.transformers_utils.configs.grugmoe import (
 )
 from vllm.v1.attention.backend import AttentionType
 
-from .interfaces import SupportsPP
+from .interfaces import EagleModelMixin, SupportsEagle, SupportsEagle3, SupportsPP
 
 logger = init_logger(__name__)
 
@@ -713,7 +713,7 @@ class GrugMoeDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class GrugMoeModel(nn.Module):
+class GrugMoeModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
@@ -804,11 +804,25 @@ class GrugMoeModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        # EAGLE-3 auxiliary hidden states: index k is the hidden state entering
+        # layer k (index 0 = post-embedding), as in the other SupportsEagle3 models.
+        aux_hidden_states = self._maybe_add_hidden_state(
+            [], self.start_layer, hidden_states, None
+        )
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states = layer(positions, hidden_states)
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_idx + 1, hidden_states, None
+            )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
-        return self.final_gated_norm(self.norm(hidden_states))
+        hidden_states = self.final_gated_norm(self.norm(hidden_states))
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
@@ -886,7 +900,7 @@ def _try_load_grug_expert_weight(
     return None
 
 
-class GrugMoeForCausalLM(nn.Module, SupportsPP):
+class GrugMoeForCausalLM(nn.Module, SupportsPP, SupportsEagle, SupportsEagle3):
     fall_back_to_pt_during_load = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
