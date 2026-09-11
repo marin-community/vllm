@@ -1626,6 +1626,49 @@ def _annotate_eagle_groups_deepseek_v4(
             break
 
 
+def _co_locate_eagle3_layers(
+    vllm_config: VllmConfig, groups: list[KVCacheGroupSpec]
+) -> None:
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or spec_config.method != "eagle3":
+        return
+    # Eagle3LlamaForCausalLM numbers its attention layers after the target.
+    target_layers = vllm_config.model_config.hf_config.num_hidden_layers
+    draft_layers = spec_config.draft_model_config.hf_config.num_hidden_layers
+    names = {
+        f"model.layers.{i}.self_attn.attn"
+        for i in range(target_layers, target_layers + draft_layers)
+    }
+    owners = [g for g in groups if names.intersection(g.layer_names)]
+    if len(owners) <= 1:
+        return
+    if names != {n for g in owners for n in g.layer_names if n in names}:
+        return
+    if any(g.kv_cache_spec != owners[0].kv_cache_spec for g in owners):
+        return
+    compatible = [g for g in groups if g.kv_cache_spec == owners[0].kv_cache_spec]
+    anchor = max(compatible, key=lambda g: len(g.layer_names))
+    if len(anchor.layer_names) < len(names):
+        return
+    # Swap equal-spec layers, preserving every group size and memory allocation.
+    # The proposer shares one block table across all draft layers.
+    for group in owners:
+        if group is anchor:
+            continue
+        for index, name in enumerate(group.layer_names):
+            if name in names:
+                slot = next(
+                    i
+                    for i, other in enumerate(anchor.layer_names)
+                    if other not in names
+                )
+                group.layer_names[index], anchor.layer_names[slot] = (
+                    anchor.layer_names[slot],
+                    name,
+                )
+    logger.info("Co-located %d EAGLE3 draft layers in one KV cache group", len(names))
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1682,6 +1725,7 @@ def get_kv_cache_groups(
     # will raise an error.
     filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    _co_locate_eagle3_layers(vllm_config, groups)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:

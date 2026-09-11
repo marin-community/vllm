@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2414,3 +2415,45 @@ def test_hma_not_disabled_when_kv_events_enabled():
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
         "kv_events_config must not force-disable the hybrid KV cache manager."
     )
+
+
+@pytest.mark.parametrize("draft_depth", [1, 2, 3])
+def test_eagle3_hybrid_draft_shares_block_table_without_extra_memory(draft_depth):
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=5, head_size=128, dtype=torch.bfloat16
+    )
+    sliding = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=5,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    specs = {
+        f"model.layers.{i}.self_attn.attn": (
+            full if (i + 1) % 4 == 0 or i == 25 else sliding
+        )
+        for i in range(26)
+    }
+    drafts = {f"model.layers.{i}.self_attn.attn" for i in range(26, 26 + draft_depth)}
+    specs.update({name: sliding for name in sorted(drafts)})
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=26)),
+        speculative_config=None,
+    )
+    baseline = kv_cache_utils.get_kv_cache_groups(config, specs.copy())
+    config.speculative_config = SimpleNamespace(
+        method="eagle3",
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=draft_depth)
+        ),
+    )
+    groups = kv_cache_utils.get_kv_cache_groups(config, specs.copy())
+    assert sum(bool(drafts.intersection(g.layer_names)) for g in groups) == 1
+    assert sorted(n for g in groups for n in g.layer_names) == sorted(specs)
+    assert [len(g.layer_names) for g in groups] == [
+        len(g.layer_names) for g in baseline
+    ]
+    assert [g.kv_cache_spec for g in groups] == [g.kv_cache_spec for g in baseline]
+    assert all(specs[name] == g.kv_cache_spec for g in groups for name in g.layer_names)
