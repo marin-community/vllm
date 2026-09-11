@@ -60,6 +60,7 @@ RELEASE_ABI_KEYS = (*BUILD_ABI_KEYS, "cuda_runtime_version")
 WHEEL_SHA_GATE = "wheel_sha256"
 DISTRIBUTION_GATE = "distribution_metadata"
 CUMEM_GATE = "cumem_allocator"
+TORCHAUDIO_GATE = "torchaudio.resample"
 SOURCE_TESTS_GATE = "source_tests"
 SERVE_GATE = "serve_smoke"
 REQUIRED_RUNTIME_GATES = (
@@ -68,6 +69,7 @@ REQUIRED_RUNTIME_GATES = (
     "vllm._C_stable_libtorch",
     GRUG_ARCHITECTURE,
     CUMEM_GATE,
+    TORCHAUDIO_GATE,
     SERVE_GATE,
 )
 

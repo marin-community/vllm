@@ -23,6 +23,7 @@ from gpu_release import (
     GRUG_ARCHITECTURE,
     SERVE_GATE,
     SOURCE_TESTS_GATE,
+    TORCHAUDIO_GATE,
     VALIDATION_SENTINEL,
     WHEEL_SHA_GATE,
     validate_candidate,
@@ -73,6 +74,7 @@ def initial_result(
             "vllm._C_stable_libtorch": gate("not_run"),
             GRUG_ARCHITECTURE: gate("not_run"),
             CUMEM_GATE: gate("not_run"),
+            TORCHAUDIO_GATE: gate("not_run"),
             SOURCE_TESTS_GATE: gate("not_run"),
             SERVE_GATE: gate("not_run"),
         },
@@ -109,6 +111,7 @@ def probe_installed(args: argparse.Namespace) -> int:
             "vllm._C_stable_libtorch": gate("not_run"),
             GRUG_ARCHITECTURE: gate("not_run"),
             CUMEM_GATE: gate("not_run"),
+            TORCHAUDIO_GATE: gate("not_run"),
         },
     }
     failed = False
@@ -209,6 +212,22 @@ def probe_installed(args: argparse.Namespace) -> int:
     except Exception as exc:
         failed = True
         result["gates"][CUMEM_GATE] = gate("failed", repr(exc))
+
+    try:
+        import torchaudio  # noqa: PLC0415
+
+        waveform = torch.linspace(-1.0, 1.0, 4800).unsqueeze(0)
+        expected = torchaudio.functional.resample(waveform, 48000, 16000)
+        actual = torchaudio.functional.resample(waveform.cuda(), 48000, 16000).cpu()
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+        result["environment"]["torchaudio_version"] = torchaudio.__version__
+        result["gates"][TORCHAUDIO_GATE] = {
+            "status": "passed",
+            "max_error": (actual - expected).abs().max().item(),
+        }
+    except Exception as exc:
+        failed = True
+        result["gates"][TORCHAUDIO_GATE] = gate("failed", repr(exc))
 
     write_json(args.output, result)
     return int(failed)
