@@ -214,6 +214,7 @@ def validation(candidate_manifest: dict, architecture: str) -> dict:
         "gates": {
             "wheel_sha256": {"status": "passed"},
             "distribution_metadata": {"status": "passed"},
+            "torchaudio.resample": {"status": "passed", "max_error": 0.0},
             "vllm._C_stable_libtorch": {"status": "passed"},
             GRUG_ARCHITECTURE: {"status": "passed"},
             "cumem_allocator": {
