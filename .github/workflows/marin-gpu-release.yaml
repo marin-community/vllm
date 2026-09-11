@@ -377,6 +377,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$SOURCE_COMMIT" \
             --title "Marin vLLM GPU ${RELEASE_TAG#marin-vllm-gpu-}" \
+            --latest="${{ github.ref_name == github.event.repository.default_branch }}" \
             --notes-file release-notes.md \
             release-assets/*.whl \
             release-assets/*.json
