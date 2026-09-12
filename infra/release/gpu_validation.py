@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import base64
 import gc
+import http.client
 import importlib
 import json
 import os
@@ -16,7 +17,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
+import urllib.error
 import urllib.request
 from importlib import metadata
 from pathlib import Path
@@ -46,6 +49,7 @@ SOURCE_TEST_DESELECTS = (
     "tests/models/test_grugmoe.py::test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads",
     "tests/v1/core/test_scheduler.py::test_async_scheduling_pp_allows_rescheduling_with_output_placeholders",
 )
+DOWNLOAD_ATTEMPTS = 5
 
 
 class ValidationFailure(RuntimeError):
@@ -83,12 +87,31 @@ def require_command(
 
 
 def download_wheel(url: str, destination: Path) -> None:
-    request = urllib.request.Request(url, headers={"User-Agent": "marin-vllm-release"})
-    with (
-        urllib.request.urlopen(request, timeout=900) as response,
-        destination.open("wb") as output,
-    ):
-        shutil.copyfileobj(response, output, length=1024 * 1024)
+    retryable_errors = (OSError, urllib.error.URLError, http.client.HTTPException)
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        offset = destination.stat().st_size if destination.exists() else 0
+        headers = {"User-Agent": "marin-vllm-release"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=900) as response:
+                append = offset > 0 and response.status == http.client.PARTIAL_CONTENT
+                with destination.open("ab" if append else "wb") as output:
+                    shutil.copyfileobj(response, output, length=1024 * 1024)
+            return
+        except retryable_errors as exc:
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise ValidationFailure(
+                    f"wheel download failed after {DOWNLOAD_ATTEMPTS} attempts"
+                ) from exc
+            delay_seconds = min(30, 2 ** (attempt - 1))
+            print(
+                f"::: wheel download attempt {attempt} failed: {exc}; "
+                f"retrying in {delay_seconds}s",
+                flush=True,
+            )
+            time.sleep(delay_seconds)
 
 
 def initial_result(
@@ -343,6 +366,7 @@ def install_wheel_environment(
             "--extra-index-url",
             config["torch_index_url"],
             str(wheel),
+            f"transformers=={config['transformers_version']}",
             "pytest",
             "tblib",
         ],
@@ -414,9 +438,7 @@ def run_source_suite(
         *(source_node_id(validation_source_root, test) for test in SOURCE_TESTS),
     ]
     for test in SOURCE_TEST_DESELECTS:
-        command.extend(
-            ["--deselect", source_node_id(validation_source_root, test)]
-        )
+        command.extend(["--deselect", source_node_id(validation_source_root, test)])
     return_code = run_command(command, cwd=workdir, environment=environment)
     if return_code != 0:
         raise ValidationFailure(f"source behavior tests exited with code {return_code}")
@@ -511,9 +533,7 @@ def validate(args: argparse.Namespace) -> int:
                     "VLLM_USE_FLASHINFER_SAMPLER": "0",
                 }
             )
-            python = install_wheel_environment(
-                workdir, wheel, config, environment
-            )
+            python = install_wheel_environment(workdir, wheel, config, environment)
             probe, probe_return_code = run_installed_probe(
                 python,
                 workdir,
@@ -587,9 +607,7 @@ def parse_args() -> argparse.Namespace:
     validate_parser.add_argument("--hardware", required=True)
     validate_parser.add_argument("--task-image", required=True)
     validate_parser.add_argument("--model", required=True)
-    validate_parser.add_argument(
-        "--validation-source-root", type=Path, required=True
-    )
+    validate_parser.add_argument("--validation-source-root", type=Path, required=True)
 
     probe_parser = subparsers.add_parser("probe-installed")
     probe_parser.add_argument("--distribution", required=True)

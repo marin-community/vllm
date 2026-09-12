@@ -217,7 +217,7 @@ jobs:
         if: always()
         run: |
           if [[ -n "${JOB_NAME:-}" ]]; then
-            iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
+            iris --cluster marin job cancel --exact "/$JOB_USER/$JOB_NAME" || true
           fi
 
       - name: Extract the validation record

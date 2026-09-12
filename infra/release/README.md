@@ -7,10 +7,10 @@ a moving `latest` alias.
 ## Build configuration
 
 [`config.json`](config.json) is the release ABI contract. It pins CPython 3.12,
-Torch 2.11.0+cu129, CUDA 12.9.1, digest-pinned upstream manylinux builder
-images, deployment-specific SM targets, Iris validation hardware, and the digest-pinned
-multi-architecture validation image. Update the config and workflows in one PR
-when an ABI changes.
+Torch 2.11.0+cu129, CUDA 12.9.1, the Transformers version used by the source
+tests, digest-pinned upstream manylinux builder images, deployment-specific SM
+targets, Iris validation hardware, and the digest-pinned multi-architecture
+validation image. Update the config and workflows in one PR when an ABI changes.
 
 Native x86_64 and aarch64 builds reuse the `build` target in
 [`docker/Dockerfile`](../../docker/Dockerfile). That is the same CUDA 12.9 path
@@ -89,7 +89,10 @@ into a separate validation-source tree, while the release harness comes from
 the workflow commit. The H100 test runner imports and verifies `vllm` from the
 venv before adding that tree to `sys.path` for the `tests` package. It keeps its
 working directory outside the tree as well, so model-inspection subprocesses
-also import the wheel instead of an unbuilt source package.
+also import the wheel instead of an unbuilt source package. Validation installs
+the exact Transformers version in the release config rather than allowing a
+newer incompatible version to change the result. Large wheel downloads retry
+transient failures and resume when the release server supports byte ranges.
 
 Both results must pass before the workflow creates
 `marin-vllm-gpu-<UTC-date>-<12-character-sha>`. The final release contains the
