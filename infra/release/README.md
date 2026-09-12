@@ -78,7 +78,7 @@ input selects an exact candidate; an empty input selects the newest candidate.
 
 The workflow qualifies the x86_64 wheel on H100:
 
-- H100x1 on `cw-us-east-02a` installs the x86_64 wheel, checks `_C` and
+- H100x1 on `cw-rno2a` installs the x86_64 wheel, checks `_C` and
   `GrugMoeForCausalLM`, validates the sparse NCCL trainer and worker contract,
   allocates through cuMem, runs the Marin delta tests, and serves
   Qwen/Qwen3-0.6B against the H100 spec.
