@@ -11,8 +11,6 @@ import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
-from vllm.env_override import force_ipv4_enabled
-
 if TYPE_CHECKING:
     VLLM_HOST_IP: str = ""
     VLLM_FORCE_IPV4: bool = False
@@ -616,7 +614,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
     "VLLM_TARGET_DEVICE": lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda").lower(),
-    "VLLM_FORCE_IPV4": force_ipv4_enabled,
+    "VLLM_FORCE_IPV4": lambda: (
+        os.getenv("VLLM_FORCE_IPV4", "0").strip().lower() in ("1", "true")
+    ),
     # Main CUDA version of vLLM. This follows PyTorch but can be overridden.
     "VLLM_MAIN_CUDA_VERSION": lambda: (
         os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0"
