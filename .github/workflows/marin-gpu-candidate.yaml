@@ -7,6 +7,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      python_overlay_base_release:
+        description: Existing GPU release whose compiled artifacts should be reused for a pure-Python overlay
+        required: false
+        type: string
+      python_overlay_base_commit:
+        description: Exact source commit used to build the overlay base release
+        required: false
+        type: string
 
 concurrency:
   group: marin-vllm-gpu-candidate-${{ github.sha }}
@@ -64,6 +73,8 @@ jobs:
     env:
       DOCKER_BUILDKIT: "1"
       DOCKER_BUILD_SUMMARY: "false"
+      PYTHON_OVERLAY_BASE_RELEASE: ${{ inputs.python_overlay_base_release || '' }}
+      PYTHON_OVERLAY_BASE_COMMIT: ${{ inputs.python_overlay_base_commit || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -103,9 +114,11 @@ jobs:
             echo "upstream_base=${UPSTREAM_BASE}"
             echo "base_image_digest=${{ matrix.build_base_image }}"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "version=${VERSION_TAG#v}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and export the CUDA 12.9 wheel
+        if: env.PYTHON_OVERLAY_BASE_RELEASE == ''
         run: |
           mkdir -p artifacts
           docker buildx build \
@@ -126,7 +139,34 @@ jobs:
             --progress plain \
             -f docker/Dockerfile .
 
+      - name: Repack the CUDA 12.9 wheel with a Python overlay
+        if: env.PYTHON_OVERLAY_BASE_RELEASE != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -z "$PYTHON_OVERLAY_BASE_COMMIT" ]]; then
+            echo "python_overlay_base_commit is required with python_overlay_base_release" >&2
+            exit 1
+          fi
+          mkdir -p artifacts/dist base-wheel
+          gh release download "$PYTHON_OVERLAY_BASE_RELEASE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "vllm-*-manylinux_2_28_${{ matrix.architecture }}.whl" \
+            --dir base-wheel
+          BASE_WHEELS=(base-wheel/*.whl)
+          if [[ ${#BASE_WHEELS[@]} -ne 1 ]]; then
+            echo "Expected one base wheel, found ${#BASE_WHEELS[@]}" >&2
+            exit 1
+          fi
+          .venv/bin/python infra/release/python_overlay_wheel.py \
+            --base-wheel "${BASE_WHEELS[0]}" \
+            --base-commit "$PYTHON_OVERLAY_BASE_COMMIT" \
+            --head-commit "$GITHUB_SHA" \
+            --version "${{ steps.provenance.outputs.version }}" \
+            --output-dir artifacts/dist
+
       - name: Tag the wheel
+        if: env.PYTHON_OVERLAY_BASE_RELEASE == ''
         run: |
           source .buildkite/scripts/lib/manylinux.sh
           WHEELS=(artifacts/dist/*.whl)
@@ -149,6 +189,12 @@ jobs:
             --base-image "${{ matrix.build_base_image }}" \
             --base-image-digest "${{ steps.provenance.outputs.base_image_digest }}" \
             --output "artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json"
+          if [[ -n "$PYTHON_OVERLAY_BASE_RELEASE" ]]; then
+            .venv/bin/python infra/release/python_overlay_provenance.py \
+              --fragment "artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json" \
+              --base-release "$PYTHON_OVERLAY_BASE_RELEASE" \
+              --base-commit "$PYTHON_OVERLAY_BASE_COMMIT"
+          fi
           mv "${WHEELS[0]}" artifacts/
 
       - uses: actions/upload-artifact@v4
