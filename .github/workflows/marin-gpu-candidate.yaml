@@ -108,7 +108,7 @@ jobs:
         run: |
           # The CUDA-13 compile peaks past the runner's ~16GB RAM and OOM-kills the
           # runner agent mid-build. Free disk and back the memory spikes with a
-          # large swapfile so both architectures fit the standard runners.
+          # large swapfile so the x86_64 build fits the standard runner.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
           sudo swapoff -a || true
           sudo rm -f /mnt/swapfile /swapfile

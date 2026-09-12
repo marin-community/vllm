@@ -45,7 +45,8 @@ MANIFEST_NAME = "marin-vllm-gpu-manifest.json"
 VALIDATION_SENTINEL = "MARIN_GPU_VALIDATION_JSON="
 SOURCE_REPOSITORY = "https://github.com/marin-community/vllm"
 UPSTREAM_REPOSITORY = "https://github.com/vllm-project/vllm"
-REQUIRED_EXTENSIONS = ("vllm._C_stable_libtorch", "vllm.cumem_allocator")
+STABLE_LIBTORCH_GATE = "vllm._C_stable_libtorch"
+REQUIRED_EXTENSIONS = (STABLE_LIBTORCH_GATE, "vllm.cumem_allocator")
 GRUG_ARCHITECTURE = "GrugMoeForCausalLM"
 CANDIDATE_TAG_PREFIX = "marin-vllm-gpu-candidate-"
 RELEASE_TAG_PREFIX = "marin-vllm-gpu-"
@@ -67,7 +68,7 @@ SERVE_GATE = "serve_smoke"
 REQUIRED_RUNTIME_GATES = (
     WHEEL_SHA_GATE,
     DISTRIBUTION_GATE,
-    "vllm._C_stable_libtorch",
+    STABLE_LIBTORCH_GATE,
     GRUG_ARCHITECTURE,
     CUMEM_GATE,
     TORCHAUDIO_GATE,
@@ -90,7 +91,7 @@ def _packaged_contents(wheel: Path) -> dict[str, str]:
             if b"class GrugMoeForCausalLM" in source:
                 grug_state = "included"
         return {
-            "vllm._C_stable_libtorch": (
+            STABLE_LIBTORCH_GATE: (
                 "included"
                 if any(
                     re.fullmatch(r"vllm/_C_stable_libtorch(?:\.[^/]*)?\.so", name)

@@ -2,10 +2,10 @@ name: Marin CI
 
 # Marin fork only: CPU-only, no accelerators, no cluster access, a few minutes.
 #
-# It gates the Marin delta and nothing else. Upstream's own workflows and pre-commit
-# matrix still run as upstream wrote them; this deliberately does not invoke them, and
-# the marin-style checks are scoped by [tool.marin-style] to Marin-authored files so
-# they can never reformat upstream code.
+# It gates the Marin delta and nothing else. Upstream workflow files stay byte-for-byte
+# in the fork and are disabled through repository settings. The marin-style checks are
+# scoped by [tool.marin-style] to Marin-authored files so they cannot reformat upstream
+# code.
 #
 # What the delta smoke can and cannot cover: vLLM cannot infer a device from a
 # python-only build, so the behavior tests in tests/models/test_grugmoe.py (which need a

@@ -128,10 +128,8 @@ def server_command(
 def pick_free_port() -> int:
     """Return a currently-free localhost TCP port.
 
-    The GB200 validation lane runs with host networking, so a fixed serve port
-    collides with anything already bound on the node (including a prior run's
-    server that outlived its job). Letting the kernel assign a free port avoids
-    that class of "address already in use" startup failure.
+    Iris validation runs with host networking, so a fixed serve port can collide
+    with another process on the node. Let the kernel assign a free port.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))

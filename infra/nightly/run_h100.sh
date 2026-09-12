@@ -13,8 +13,11 @@
 # silently falling back to upstream's nightly ones).
 set -euo pipefail
 
-MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 SPEC="${SPEC:-infra/nightly/specs/qwen3-0.6b-h100.json}"
+MODEL_ARGS=()
+if [[ -n "${MODEL:-}" ]]; then
+  MODEL_ARGS=(--model "$MODEL")
+fi
 
 cd "${IRIS_WORKDIR:-$PWD}"
 
@@ -36,7 +39,7 @@ echo "::: running the delta's tests on the GPU"
   --deselect tests/models/test_grugmoe.py::test_parallel_config_allows_tpu_heads_but_preserves_gpu_checks \
   --deselect tests/v1/core/test_scheduler.py::test_async_scheduling_pp_allows_rescheduling_with_output_placeholders
 
-echo "::: serving ${MODEL} and gating against ${SPEC}"
+echo "::: serving the model in ${SPEC}"
 # vLLM's default sampler is flashinfer's, which JIT-compiles its kernels on first use. The
 # Iris task image is a slim Python image with no CUDA toolkit, so that compile cannot run:
 # it wants nvcc, then ninja, and once both are installed from wheels the build still fails
@@ -47,4 +50,4 @@ echo "::: serving ${MODEL} and gating against ${SPEC}"
 # sampler needs no toolchain and exercises the same serving path for our purposes; the
 # consequence, stated plainly, is that the flashinfer sampling path is not covered here.
 export VLLM_USE_FLASHINFER_SAMPLER=0
-.venv/bin/python infra/nightly/gpu_serve_smoke.py --model "$MODEL" --spec "$SPEC"
+.venv/bin/python infra/nightly/gpu_serve_smoke.py --spec "$SPEC" "${MODEL_ARGS[@]}"

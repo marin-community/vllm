@@ -24,6 +24,7 @@ from gpu_release import (
     SERVE_GATE,
     SOURCE_TESTS_GATE,
     SPARSE_NCCL_GATE,
+    STABLE_LIBTORCH_GATE,
     TORCHAUDIO_GATE,
     VALIDATION_SENTINEL,
     WHEEL_SHA_GATE,
@@ -48,7 +49,7 @@ SOURCE_TESTS = (
     "tests/v1/worker/test_gpu_worker_weight_transfer.py",
 )
 SOURCE_TEST_EXCLUDES = (
-    "test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads",
+    "test_parallel_config_allows_tpu_heads_but_preserves_gpu_checks",
     "test_async_scheduling_pp_allows_rescheduling_with_output_placeholders",
 )
 
@@ -74,7 +75,7 @@ def initial_result(
         "gates": {
             WHEEL_SHA_GATE: gate("not_run"),
             DISTRIBUTION_GATE: gate("not_run"),
-            "vllm._C_stable_libtorch": gate("not_run"),
+            STABLE_LIBTORCH_GATE: gate("not_run"),
             GRUG_ARCHITECTURE: gate("not_run"),
             CUMEM_GATE: gate("not_run"),
             TORCHAUDIO_GATE: gate("not_run"),
@@ -112,7 +113,7 @@ def probe_installed(args: argparse.Namespace) -> int:
         "hardware": {},
         "gates": {
             DISTRIBUTION_GATE: gate("not_run"),
-            "vllm._C_stable_libtorch": gate("not_run"),
+            STABLE_LIBTORCH_GATE: gate("not_run"),
             GRUG_ARCHITECTURE: gate("not_run"),
             CUMEM_GATE: gate("not_run"),
             TORCHAUDIO_GATE: gate("not_run"),
@@ -163,11 +164,11 @@ def probe_installed(args: argparse.Namespace) -> int:
             result["hardware"]["status"] = "passed"
 
     try:
-        importlib.import_module("vllm._C_stable_libtorch")
-        result["gates"]["vllm._C_stable_libtorch"] = gate("passed")
+        importlib.import_module(STABLE_LIBTORCH_GATE)
+        result["gates"][STABLE_LIBTORCH_GATE] = gate("passed")
     except Exception as exc:
         failed = True
-        result["gates"]["vllm._C_stable_libtorch"] = gate("failed", repr(exc))
+        result["gates"][STABLE_LIBTORCH_GATE] = gate("failed", repr(exc))
 
     try:
         module = importlib.import_module("vllm.model_executor.models.grugmoe")
@@ -222,7 +223,10 @@ def probe_installed(args: argparse.Namespace) -> int:
 
     try:
         importlib.import_module("vllm.cumem_allocator")
-        from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+        from vllm.device_allocator.cumem import (  # noqa: PLC0415
+            CuMemAllocator,
+            cumem_available,
+        )
 
         if not cumem_available:
             failed = True

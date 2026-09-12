@@ -20,6 +20,7 @@ import zmq.asyncio
 from urllib3.util import parse_url
 
 import vllm.envs as envs
+from vllm.env_override import force_ipv4_enabled
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -130,11 +131,7 @@ def join_host_port(host: str, port: int) -> str:
 
 def resolve_ipv4_host(host: str, port: int) -> str:
     """Resolve hostnames before handing them to native network clients."""
-    force_ipv4 = os.environ.get("VLLM_FORCE_IPV4", "0").strip().lower() in (
-        "1",
-        "true",
-    )
-    if not force_ipv4:
+    if not force_ipv4_enabled():
         return host
     try:
         ipaddress.ip_address(host)

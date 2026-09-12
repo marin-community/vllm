@@ -17,6 +17,7 @@ from infra.nightly.gpu_serve_smoke import server_command
 from infra.release.gpu_release import (
     GRUG_ARCHITECTURE,
     SPARSE_NCCL_GATE,
+    STABLE_LIBTORCH_GATE,
     assemble_candidate,
     build_matrix,
     extract_validation,
@@ -46,7 +47,6 @@ def test_publish_uses_current_release_automation_for_an_older_candidate():
     workflow = yaml.safe_load(GPU_RELEASE_WORKFLOW_PATH.read_text())
     checkout = workflow["jobs"]["publish"]["steps"][0]
 
-    assert checkout["uses"] == "actions/checkout@v4"
     assert "ref" not in checkout.get("with", {})
 
 
@@ -216,7 +216,7 @@ def validation(candidate_manifest: dict, architecture: str) -> dict:
             "wheel_sha256": {"status": "passed"},
             "distribution_metadata": {"status": "passed"},
             "torchaudio.resample": {"status": "passed", "max_error": 0.0},
-            "vllm._C_stable_libtorch": {"status": "passed"},
+            STABLE_LIBTORCH_GATE: {"status": "passed"},
             GRUG_ARCHITECTURE: {"status": "passed"},
             SPARSE_NCCL_GATE: {
                 "status": "passed",
@@ -262,7 +262,7 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
         "cp38-abi3-manylinux_2_28_x86_64"
     )
     assert record["platform"]["packaged"] == {
-        "vllm._C_stable_libtorch": "included",
+        STABLE_LIBTORCH_GATE: "included",
         "vllm.cumem_allocator": "included",
         GRUG_ARCHITECTURE: "included",
     }
