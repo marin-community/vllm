@@ -12,13 +12,12 @@ images, deployment-specific SM targets, Iris validation hardware, and the digest
 multi-architecture validation image. Update the config and workflows in one PR
 when an ABI changes.
 
-The x86_64 and aarch64 builds reuse the `build` target in
+Native x86_64 and aarch64 builds reuse the `build` target in
 [`docker/Dockerfile`](../../docker/Dockerfile). That is the same CUDA 12.9 path
-used by upstream's release pipeline. Release code does not edit
-`requirements/cuda.txt`, `requirements/build/cuda.txt`, or the `vllm`
-distribution metadata. A final scratch stage contains only `/dist`; BuildKit
-exports that directory directly instead of loading the build image into the
-runner's Docker image store.
+used by upstream's release pipeline. Native release code does not edit
+`requirements/cuda.txt` or `requirements/build/cuda.txt`. A final scratch stage
+contains only `/dist`; BuildKit exports that directory directly instead of
+loading the build image into the runner's Docker image store.
 
 Each native wheel contains code for the GPU on which it is promoted: SM90 for
 the x86_64 H100 lane and SM100 for the aarch64 GB200 lane. These are Marin
@@ -46,6 +45,13 @@ export within the hosted runners' root filesystems.
 runs on every merge to `main`. It builds both native wheels, derives the
 manylinux tag from each wheel's ELF symbols, and publishes a prerelease named
 `marin-vllm-gpu-candidate-<12-character-sha>`.
+
+A manual dispatch may instead overlay a pure-Python descendant onto an existing
+qualified release. This path rejects non-descendant commits and every package
+change outside `vllm/**/*.py`, preserves the base wheel's compiled artifacts,
+and regenerates the distribution version and RECORD. Its manifest provenance
+records the immutable base release and source commit. The resulting candidate
+still passes both GPU validation lanes before promotion.
 
 The candidate manifest records:
 

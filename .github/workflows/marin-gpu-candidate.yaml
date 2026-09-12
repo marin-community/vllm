@@ -126,8 +126,8 @@ jobs:
             --output type=local,dest=artifacts \
             --build-arg BUILD_OS=manylinux \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
-            --build-arg CUDA_VERSION=12.9.1 \
-            --build-arg PYTHON_VERSION=3.12 \
+            --build-arg CUDA_VERSION="${{ matrix.cuda_toolkit_version }}" \
+            --build-arg PYTHON_VERSION="${{ matrix.python_version }}" \
             --build-arg torch_cuda_arch_list="${{ matrix.sm_targets }}" \
             --build-arg max_jobs="${{ matrix.max_jobs }}" \
             --build-arg VLLM_MAX_SIZE_MB="${{ matrix.max_wheel_size_mb }}" \

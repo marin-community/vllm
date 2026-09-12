@@ -259,6 +259,8 @@ def test_build_matrix_targets_only_the_validated_gpu():
     for item in matrix["include"]:
         platform = config["platforms"][item["architecture"]]
         assert item["sm_targets"] == platform["validation"]["compute_capability"]
+        assert item["python_version"] == config["python_version"]
+        assert item["cuda_toolkit_version"] == config["cuda_toolkit_version"]
         assert item["max_jobs"] == 2
         assert item["max_wheel_size_mb"] == 800
         assert item["nvcc_threads"] == 1
