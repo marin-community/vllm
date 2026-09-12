@@ -486,7 +486,7 @@ def run_source_suite(
 def run_serving_smoke(
     python: Path,
     workdir: Path,
-    validation_source_root: Path,
+    package_source_root: Path,
     model: str,
     spec: str,
     attention_backend: str,
@@ -496,11 +496,11 @@ def run_serving_smoke(
     return_code = run_command(
         [
             str(python),
-            str(validation_source_root / "infra/nightly/gpu_serve_smoke.py"),
+            str(package_source_root / "infra/nightly/gpu_serve_smoke.py"),
             "--model",
             model,
             "--spec",
-            str(validation_source_root / spec),
+            str(package_source_root / spec),
             "--attention-backend",
             attention_backend,
             "--result-json",
@@ -620,7 +620,7 @@ def validate(args: argparse.Namespace) -> int:
                 serve_metrics = run_serving_smoke(
                     python,
                     workdir,
-                    validation_source_root,
+                    package_source_root,
                     args.model,
                     expected_validation["spec"],
                     expected_validation["attention_backend"],
