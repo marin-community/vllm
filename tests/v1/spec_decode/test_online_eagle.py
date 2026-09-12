@@ -95,7 +95,15 @@ def test_async_capture_copy_survives_source_allocator_reuse() -> None:
         head_input_hidden_states=head,
     )
     del values, aux, head
-    allocator_pressure = [torch.full((4096, 3), -1.0, device="cuda") for _ in range(8)]
+    allocator_pressure = []
+    for _ in range(512):
+        allocator_pressure.extend(
+            (
+                torch.full((3,), -1, device="cuda", dtype=torch.long),
+                torch.full((3, 3), -1.0, device="cuda"),
+                torch.full((3, 2), -1.0, device="cuda"),
+            )
+        )
     assert event is not None
     event.synchronize()
 
