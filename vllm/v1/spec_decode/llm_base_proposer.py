@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import os
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
@@ -90,6 +91,21 @@ class SpecDecodeBaseProposer:
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+
+        draft_dp_sync = os.environ.get("VLLM_DRAFT_DP_SYNC", "auto").strip().lower()
+        if draft_dp_sync in ("0", "false", "off"):
+            self.draft_dp_sync = False
+        elif draft_dp_sync in ("1", "true", "on"):
+            self.draft_dp_sync = True
+        else:
+            self.draft_dp_sync = bool(self.draft_model_config.is_moe)
+        if vllm_config.parallel_config.data_parallel_size > 1:
+            logger.info_once(
+                "Draft DP batch coordination: %s (VLLM_DRAFT_DP_SYNC=%s, draft is_moe=%s)",
+                "collective" if self.draft_dp_sync else "local",
+                draft_dp_sync,
+                self.draft_model_config.is_moe,
+            )
 
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -1815,7 +1831,12 @@ class SpecDecodeBaseProposer:
         # coordinate across ranks
         # TODO(Flechman): support DBO ubatching
         should_ubatch, num_tokens_across_dp = False, None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
+        if data_parallel_size > 1 and not self.draft_dp_sync:
+            num_tokens_across_dp = torch.full(
+                (data_parallel_size,), num_tokens_padded, dtype=torch.int32
+            )
+        elif data_parallel_size > 1:
             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,

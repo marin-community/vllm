@@ -3,7 +3,9 @@
 
 import functools
 import gc
+import hashlib
 import itertools
+import json
 import threading
 import time
 from collections import defaultdict
@@ -12,6 +14,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import replace
 from functools import reduce
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -46,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     GraphCaptureContext,
     get_dcp_group,
+    get_dp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -205,6 +209,10 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.online_eagle import (
+    OnlineEagleCapture,
+    OnlineEagleCaptureConfig,
+)
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
@@ -253,6 +261,14 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _online_eagle_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
@@ -719,6 +735,7 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self.online_eagle_capture: OnlineEagleCapture | None = None
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -1224,7 +1241,9 @@ class GPUModelRunner(
         req_state: CachedRequestState | None,
     ) -> None:
         """Hook for platform runners to clean request-scoped side caches."""
-        del req_id, req_state
+        capture = self.online_eagle_capture
+        if capture is not None and req_state is not None:
+            capture.finalize_request(req_id, req_state.output_token_ids)
 
     def _process_encoder_cache_scheduler_output(
         self,
@@ -1352,6 +1371,14 @@ class GPUModelRunner(
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            capture = self.online_eagle_capture
+            if capture is not None and sampling_params is not None:
+                max_completion_tokens = sampling_params.max_tokens or 1
+                capture.observe_request(
+                    req_id,
+                    new_req_data.prompt_token_ids,
+                    max_completion_tokens,
+                )
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
@@ -3405,6 +3432,165 @@ class GPUModelRunner(
             return cast(nn.Module, model.unwrap())
         return cast(nn.Module | None, model)
 
+    def begin_online_eagle_capture(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Begin one bounded capture interval before admitting rollout requests."""
+        if self.online_eagle_capture is not None:
+            raise RuntimeError("An online EAGLE capture interval is already active")
+        if (
+            self.speculative_config is None
+            or self.speculative_config.method != "eagle3"
+        ):
+            raise RuntimeError("Online EAGLE capture requires an EAGLE-3 drafter")
+        if self.use_async_scheduling:
+            raise RuntimeError("Online EAGLE capture requires synchronous scheduling")
+        if get_pp_group().world_size != 1:
+            raise RuntimeError("Online EAGLE capture requires pipeline_parallel_size=1")
+        resolved = dict(config)
+        resolved["worker_rank"] = self.parallel_config.data_parallel_rank
+        resolved.setdefault("max_window_tokens", self.effective_drafter_max_model_len)
+        resolved.setdefault(
+            "aux_layer_ids", list(self._get_eagle3_aux_layers_from_config())
+        )
+        capture_config = OnlineEagleCaptureConfig.from_mapping(resolved)
+        self.online_eagle_capture = OnlineEagleCapture(capture_config)
+        return {
+            "active": self.online_eagle_capture.active,
+            "worker_rank": capture_config.worker_rank,
+            "step": capture_config.step,
+        }
+
+    def seal_online_eagle_capture(self, output_dir: str) -> dict[str, Any]:
+        """Seal the active interval before target weights can be synchronized."""
+        capture = self.online_eagle_capture
+        if capture is None:
+            raise RuntimeError("No online EAGLE capture interval is active")
+        for request_id, request in self.requests.items():
+            capture.finalize_request(request_id, request.output_token_ids)
+        hf_config = self.model_config.hf_config
+        target_config = (
+            hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
+        )
+        try:
+            return capture.seal(
+                output_dir,
+                target_model=self.get_model(),
+                target_config=target_config,
+            )
+        finally:
+            self.online_eagle_capture = None
+
+    def discard_online_eagle_capture(self) -> None:
+        """Discard an active interval after a failed rollout."""
+        self.online_eagle_capture = None
+
+    @staticmethod
+    def _online_eagle_embedding_weight(model: nn.Module) -> nn.Parameter:
+        matches = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if name.endswith("embed_tokens.weight")
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Expected exactly one embed_tokens.weight parameter, found "
+                f"{len(matches)}"
+            )
+        return matches[0]
+
+    def install_online_eagle_speculator(
+        self, candidate_dir: str, trainer_rank: int
+    ) -> dict[str, Any]:
+        """Broadcast and load one complete draft candidate without replacing tensors."""
+        draft_model = self.get_draft_model()
+        if draft_model is None:
+            raise RuntimeError("Online EAGLE install requires a resident draft model")
+        dp_group = get_dp_group()
+        is_trainer = self.parallel_config.data_parallel_rank == trainer_rank
+        candidate: dict[str, torch.Tensor] | None = None
+        metadata: dict[str, Any] | None = None
+        if is_trainer:
+            from safetensors.torch import load_file  # noqa: PLC0415
+
+            directory = Path(candidate_dir)
+            manifest_path = directory / "manifest.json"
+            metadata = json.loads(manifest_path.read_text())
+            if metadata.get("format") != "marinskyrl-online-eagle-candidate":
+                raise ValueError(
+                    f"Invalid online EAGLE candidate manifest: {manifest_path}"
+                )
+            if not metadata.get("complete", False):
+                raise ValueError(f"Incomplete online EAGLE candidate: {manifest_path}")
+            weights_path = directory / metadata["weights_path"]
+            digest = _online_eagle_file_sha256(weights_path)
+            if digest != metadata["weights_sha256"]:
+                raise ValueError(
+                    f"Online EAGLE candidate digest mismatch: expected "
+                    f"{metadata['weights_sha256']}, got {digest}"
+                )
+            candidate = load_file(weights_path)
+            if set(candidate) != set(metadata["tensor_inventory"]):
+                raise ValueError(
+                    "Online EAGLE candidate tensor inventory does not match "
+                    "its manifest"
+                )
+            mismatched = [
+                name
+                for name, value in candidate.items()
+                if metadata["tensor_inventory"][name]
+                != {"shape": list(value.shape), "dtype": str(value.dtype)}
+            ]
+            if mismatched:
+                raise ValueError(
+                    "Online EAGLE candidate tensor metadata does not match "
+                    "its weights: " + ", ".join(sorted(mismatched))
+                )
+            forbidden = [
+                name
+                for name in candidate
+                if "embed_tokens" in name or name.startswith("verifier_")
+            ]
+            if forbidden:
+                raise ValueError(
+                    "Online EAGLE candidate contains target-owned tensors: "
+                    + ", ".join(sorted(forbidden))
+                )
+        metadata = dp_group.broadcast_object(metadata, src=trainer_rank)
+        candidate = dp_group.broadcast_tensor_dict(candidate, src=trainer_rank)
+        if metadata is None or candidate is None:
+            raise RuntimeError("Online EAGLE candidate broadcast returned no data")
+
+        target_embedding = self._online_eagle_embedding_weight(self.get_model())
+        draft_embedding = self._online_eagle_embedding_weight(draft_model)
+        if draft_embedding is not target_embedding:
+            raise RuntimeError(
+                "Embedding-free EAGLE draft no longer shares the target "
+                "embedding parameter"
+            )
+        storage_before = {
+            name: (id(parameter), parameter.data_ptr())
+            for name, parameter in draft_model.named_parameters()
+        }
+        draft_model.load_weights(candidate.items())
+        storage_after = {
+            name: (id(parameter), parameter.data_ptr())
+            for name, parameter in draft_model.named_parameters()
+        }
+        if storage_after != storage_before:
+            raise RuntimeError(
+                "Online EAGLE install replaced a resident parameter or its storage"
+            )
+        if self._online_eagle_embedding_weight(draft_model) is not target_embedding:
+            raise RuntimeError(
+                "Online EAGLE install broke shared target embedding identity"
+            )
+        return {
+            "active": True,
+            "worker_rank": self.parallel_config.data_parallel_rank,
+            "draft_revision": metadata["draft_revision"],
+            "weights_sha256": metadata["weights_sha256"],
+            "tensor_count": len(candidate),
+        }
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
@@ -4552,6 +4738,26 @@ class GPUModelRunner(
                 # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
+
+            capture = self.online_eagle_capture
+            if capture is not None:
+                if aux_hidden_states is None or isinstance(
+                    hidden_states, IntermediateTensors
+                ):
+                    raise RuntimeError(
+                        "Online EAGLE capture requires target auxiliary and final "
+                        "hidden states on a single pipeline stage"
+                    )
+                capture.record_forward(
+                    request_ids=self.input_batch.req_ids[:num_reqs],
+                    num_scheduled_tokens=num_scheduled_tokens_np,
+                    num_computed_tokens=self.input_batch.num_computed_tokens_cpu[
+                        :num_reqs
+                    ],
+                    input_ids=self.input_ids.gpu[:num_scheduled_tokens],
+                    aux_hidden_states=aux_hidden_states,
+                    head_input_hidden_states=hidden_states,
+                )
 
             if not self.broadcast_pp_output:
                 # Common case.
