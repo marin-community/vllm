@@ -162,7 +162,7 @@ jobs:
             --base-wheel "${BASE_WHEELS[0]}" \
             --base-commit "$PYTHON_OVERLAY_BASE_COMMIT" \
             --head-commit "$GITHUB_SHA" \
-            --version "${{ steps.provenance.outputs.version }}" \
+            --version "${{ steps.provenance.outputs.version }}.${{ matrix.cuda_variant }}" \
             --output-dir artifacts/dist
 
       - name: Tag the wheel

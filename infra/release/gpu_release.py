@@ -610,6 +610,7 @@ def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 "runner": platform["runner"],
                 "python_version": config["python_version"],
                 "cuda_toolkit_version": config["cuda_toolkit_version"],
+                "cuda_variant": config["cuda_variant"],
                 "build_base_image": platform["build_base_image"],
                 "max_jobs": platform["max_jobs"],
                 "max_wheel_size_mb": platform["max_wheel_size_mb"],
