@@ -85,8 +85,8 @@ def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
     capture = OnlineEagleCapture(config)
     request_id = "skyrl-group-deadbeef-attempt0"
     assert request_group_from_id(request_id) == "deadbeef"
-    assert capture.observe_request(request_id, [10, 11], 4)
-    assert not capture.observe_request("skyrl-group-deadbeef-attempt1", [10], 4)
+    assert capture.admit_request(request_id, [10, 11], 4)
+    assert not capture.admit_request("skyrl-group-deadbeef-attempt1", [10], 4)
 
     aux, head = _states([0, 1])
     capture.record_forward(
@@ -159,7 +159,7 @@ def test_capture_crops_a_long_prefill_before_copying() -> None:
     capture = OnlineEagleCapture(config)
     request_id = "skyrl-group-cafebabe-attempt0"
     prompt = list(range(10))
-    assert capture.observe_request(request_id, prompt, 1)
+    assert capture.admit_request(request_id, prompt, 1)
     aux, head = _states(prompt)
 
     capture.record_forward(
