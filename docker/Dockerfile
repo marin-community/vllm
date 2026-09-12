@@ -218,6 +218,7 @@ ARG PYTORCH_NIGHTLY
 # Check whether to install torch nightly instead of release for this build
 COPY requirements/common.txt requirements/common.txt
 COPY requirements/cuda.txt requirements/cuda.txt
+COPY requirements/build-constraints.txt requirements/build-constraints.txt
 COPY use_existing_torch.py use_existing_torch.py
 COPY pyproject.toml pyproject.toml
 # nvidia-cutlass-dsl[cu13] installs -libs-base and -libs-cu13 wheels that
@@ -236,9 +237,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && echo "Installing other requirements..." \
         && /opt/venv/bin/python3 use_existing_torch.py --prefix \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
+        --build-constraints requirements/build-constraints.txt \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     else \
         uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
+        --build-constraints requirements/build-constraints.txt \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi \
     && if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "13" ]; then \

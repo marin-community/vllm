@@ -1,0 +1,3 @@
+# TileLang 0.1.9 generates a cp38-abi3 extension that Cython 3.3 refuses to
+# compile because its limited-API floor moved to Python 3.9.
+cython<3.3
