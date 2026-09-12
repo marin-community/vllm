@@ -508,6 +508,7 @@ def validate_validation_result(
         raise ReleaseError(f"{architecture} validation used a different wheel")
     environment = result.get("environment", {})
     expected_environment = {
+        "attention_backend": expected_validation["attention_backend"],
         "machine": architecture,
         "torch_version": config["torch_version"],
         "torch_cuda_runtime": config["cuda_runtime_version"],

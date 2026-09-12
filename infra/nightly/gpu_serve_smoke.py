@@ -98,21 +98,8 @@ def post_json(url: str, payload: dict, timeout: float) -> dict:
         return json.loads(response.read())
 
 
-@contextlib.contextmanager
-def serve(model: str, port: int, startup_timeout: float) -> Iterator[str]:
-    """Run `vllm serve` for the duration of the block, yielding its base URL.
-
-    Args:
-        model: HF model id to serve.
-        port: Port for the OpenAI server to listen on.
-        startup_timeout: Seconds to wait for the server to report ready.
-
-    Yields:
-        The server's OpenAI base URL.
-
-    Raises:
-        RuntimeError: If the server exits or fails to become ready in time.
-    """
+def server_command(model: str, port: int, attention_backend: str | None) -> list[str]:
+    """Build the OpenAI server command for this smoke."""
     command = [
         sys.executable,
         "-m",
@@ -124,6 +111,34 @@ def serve(model: str, port: int, startup_timeout: float) -> Iterator[str]:
         "--max-model-len",
         "4096",
     ]
+    if attention_backend is not None:
+        command.extend(("--attention-backend", attention_backend))
+    return command
+
+
+@contextlib.contextmanager
+def serve(
+    model: str,
+    port: int,
+    startup_timeout: float,
+    attention_backend: str | None,
+) -> Iterator[str]:
+    """Run `vllm serve` for the duration of the block, yielding its base URL.
+
+    Args:
+        model: HF model id to serve.
+        port: Port for the OpenAI server to listen on.
+        startup_timeout: Seconds to wait for the server to report ready.
+        attention_backend: Explicit vLLM attention backend, or auto-selection when
+            unset.
+
+    Yields:
+        The server's OpenAI base URL.
+
+    Raises:
+        RuntimeError: If the server exits or fails to become ready in time.
+    """
+    command = server_command(model, port, attention_backend)
     logger.info("starting server: %s", " ".join(command))
     server = subprocess.Popen(command)
     try:
@@ -254,6 +269,10 @@ def main() -> int:
     parser.add_argument("--model", help="Override the model id in the spec.")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
+        "--attention-backend",
+        help="Pass an explicit attention backend to vLLM instead of auto-selecting.",
+    )
+    parser.add_argument(
         "--startup-timeout",
         type=float,
         default=900.0,
@@ -275,7 +294,12 @@ def main() -> int:
     spec = GateSpec.load(args.spec)
     model = args.model or spec.model
 
-    with serve(model, args.port, args.startup_timeout) as base_url:
+    with serve(
+        model,
+        args.port,
+        args.startup_timeout,
+        args.attention_backend,
+    ) as base_url:
         result = run_prompts(base_url, model)
 
     logger.info("result: %s", result)
