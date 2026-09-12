@@ -3206,6 +3206,17 @@ class GPUModelRunner(
             return self.model.unwrap()
         return self.model
 
+    def get_draft_model(self) -> nn.Module | None:
+        drafter = getattr(self, "drafter", None)
+        if drafter is None:
+            return None
+        model = getattr(drafter, "model", None)
+        if isinstance(
+            model, (CUDAGraphWrapper, UBatchWrapper, BreakableCUDAGraphWrapper)
+        ):
+            return cast(nn.Module, model.unwrap())
+        return cast(nn.Module | None, model)
+
     def apply_sparse_weight_patches(self, patches: Iterable[SparseWeightPatch]) -> None:
         """Apply sparse flat-index patches directly to existing model params."""
         model = self.get_model()
