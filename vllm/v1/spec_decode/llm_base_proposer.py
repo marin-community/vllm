@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
-import os
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
@@ -92,18 +91,11 @@ class SpecDecodeBaseProposer:
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
-        draft_dp_sync = os.environ.get("VLLM_DRAFT_DP_SYNC", "auto").strip().lower()
-        if draft_dp_sync in ("0", "false", "off"):
-            self.draft_dp_sync = False
-        elif draft_dp_sync in ("1", "true", "on"):
-            self.draft_dp_sync = True
-        else:
-            self.draft_dp_sync = bool(self.draft_model_config.is_moe)
+        self.draft_dp_sync = bool(self.draft_model_config.is_moe)
         if vllm_config.parallel_config.data_parallel_size > 1:
             logger.info_once(
-                "Draft DP batch coordination: %s (VLLM_DRAFT_DP_SYNC=%s, draft is_moe=%s)",
+                "Draft DP batch coordination: %s (draft is_moe=%s)",
                 "collective" if self.draft_dp_sync else "local",
-                draft_dp_sync,
                 self.draft_model_config.is_moe,
             )
 
