@@ -24,7 +24,7 @@
         "gpu": "H100",
         "gpu_resource": "H100x1",
         "compute_capability": "9.0",
-        "target_cluster": "cw-us-east-02a",
+        "target_cluster": "cw-rno2a",
         "cpu": 8,
         "memory": "64GB",
         "run_source_tests": true,
