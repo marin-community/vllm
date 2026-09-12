@@ -354,6 +354,23 @@ def test_validation_log_extracts_machine_readable_result(tmp_path):
     assert extract_validation(log_path) == expected
 
 
+def test_validation_log_uses_latest_prefixed_result(tmp_path):
+    stale = {"architecture": "x86_64", "result": "failed"}
+    expected = {"architecture": "x86_64", "result": "passed"}
+    stale_encoded = base64.b64encode(json.dumps(stale).encode()).decode()
+    expected_encoded = base64.b64encode(json.dumps(expected).encode()).decode()
+    log_path = tmp_path / "validation.log"
+    log_path.write_text(
+        "task=/job/0:0 | "
+        f"MARIN_GPU_VALIDATION_JSON={stale_encoded}\n"
+        "replayed history finished\n"
+        "task=/job/0:0 | "
+        f"MARIN_GPU_VALIDATION_JSON={expected_encoded}\n"
+    )
+
+    assert extract_validation(log_path) == expected
+
+
 def test_validation_log_records_missing_result_as_failure(tmp_path):
     log_path = tmp_path / "validation.log"
     log_path.write_text("Iris job exited before validation\n")

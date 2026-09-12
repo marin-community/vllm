@@ -642,8 +642,11 @@ def extract_validation(log_path: Path) -> dict[str, Any]:
     encoded_payload = None
     with log_path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
-            if line.startswith(VALIDATION_SENTINEL):
-                encoded_payload = line.removeprefix(VALIDATION_SENTINEL).strip()
+            sentinel_offset = line.rfind(VALIDATION_SENTINEL)
+            if sentinel_offset >= 0:
+                encoded_payload = line[
+                    sentinel_offset + len(VALIDATION_SENTINEL) :
+                ].strip()
     if encoded_payload is None:
         return {
             "schema_version": 1,
