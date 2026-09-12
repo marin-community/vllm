@@ -26,9 +26,22 @@ Compilation uses two jobs with one NVCC thread each and an 800 MiB wheel limit.
 
 `gpu-constraints.txt` pins the Python build and runtime dependencies for CPython
 3.12 on Linux x86_64. Both the release Docker build and wheel validation consume
-it. Regenerate from `requirements/cuda.txt`, `requirements/build/cuda.txt`, and
-`cuda-toolkit[nvcc,cccl]==13.2.1` with the configured PyTorch index when changing
-the ABI. The toolkit extras pin the compiler and headers used by runtime JIT
+it. Its direct inputs live in `gpu-constraints.in`, including the Transformers
+and Tokenizers versions qualified by the selected upstream CUDA test environment.
+Regenerate it from the repository root with:
+
+```bash
+uv pip compile infra/release/gpu-constraints.in \
+  --index-strategy unsafe-best-match \
+  --index https://download.pytorch.org/whl/cu132 \
+  --index https://flashinfer.ai/whl/ \
+  --python-platform x86_64-manylinux_2_28 \
+  --python-version 3.12 \
+  --output-file infra/release/gpu-constraints.txt \
+  --no-annotate --no-header --upgrade
+```
+
+The toolkit extras pin the compiler and headers used by runtime JIT
 compilation. Preserve the direct
 TorchAudio CPU wheel constraint: the available CUDA 13.0 TorchAudio wheel
 rejects Torch cu132, while audio preprocessing uses Torch's tensor operators.
@@ -66,8 +79,9 @@ input selects an exact candidate; an empty input selects the newest candidate.
 The workflow qualifies the x86_64 wheel on H100:
 
 - H100x1 on `cw-us-east-02a` installs the x86_64 wheel, checks `_C` and
-  `GrugMoeForCausalLM`, allocates through cuMem, runs the Marin delta tests, and
-  serves Qwen/Qwen3-0.6B against the H100 spec.
+  `GrugMoeForCausalLM`, validates the sparse NCCL trainer and worker contract,
+  allocates through cuMem, runs the Marin delta tests, and serves
+  Qwen/Qwen3-0.6B against the H100 spec.
 
 An absent cuMem extension is recorded as `absent` and fails promotion. Iris
 setup failures and missing validation output also become explicit failed JSON

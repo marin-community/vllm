@@ -23,6 +23,7 @@ from gpu_release import (
     GRUG_ARCHITECTURE,
     SERVE_GATE,
     SOURCE_TESTS_GATE,
+    SPARSE_NCCL_GATE,
     TORCHAUDIO_GATE,
     VALIDATION_SENTINEL,
     WHEEL_SHA_GATE,
@@ -43,6 +44,8 @@ SOURCE_TESTS = (
     "tests/v1/core/test_scheduler.py",
     "tests/engine/test_arg_utils.py::TestDpDeviceIdSharding",
     "tests/distributed/test_mq_connect_ip.py::test_mq_bind_with_local_ip",
+    "tests/model_executor/model_loader/test_checkpoint_weight_patch.py",
+    "tests/v1/worker/test_gpu_worker_weight_transfer.py",
 )
 SOURCE_TEST_EXCLUDES = (
     "test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads",
@@ -75,6 +78,7 @@ def initial_result(
             GRUG_ARCHITECTURE: gate("not_run"),
             CUMEM_GATE: gate("not_run"),
             TORCHAUDIO_GATE: gate("not_run"),
+            SPARSE_NCCL_GATE: gate("not_run"),
             SOURCE_TESTS_GATE: gate("not_run"),
             SERVE_GATE: gate("not_run"),
         },
@@ -112,6 +116,7 @@ def probe_installed(args: argparse.Namespace) -> int:
             GRUG_ARCHITECTURE: gate("not_run"),
             CUMEM_GATE: gate("not_run"),
             TORCHAUDIO_GATE: gate("not_run"),
+            SPARSE_NCCL_GATE: gate("not_run"),
         },
     }
     failed = False
@@ -173,6 +178,47 @@ def probe_installed(args: argparse.Namespace) -> int:
     except Exception as exc:
         failed = True
         result["gates"][GRUG_ARCHITECTURE] = gate("failed", repr(exc))
+
+    try:
+        from vllm.distributed.weight_transfer import (  # noqa: PLC0415
+            WeightTransferEngineFactory,
+            WeightTransferTrainerFactory,
+        )
+        from vllm.distributed.weight_transfer.sparse_nccl_engine import (  # noqa: PLC0415
+            SparseNCCLTrainerWeightTransferEngine,
+            SparseNCCLWeightTransferEngine,
+            SparseNCCLWeightTransferUpdateInfo,
+            SparseWeightPatch,
+        )
+
+        worker_class = WeightTransferEngineFactory._registry["sparse_nccl"]()
+        trainer_class = WeightTransferTrainerFactory._registry["sparse_nccl"]()
+        if worker_class is not SparseNCCLWeightTransferEngine:
+            raise ValidationFailure("sparse NCCL worker backend is misregistered")
+        if trainer_class is not SparseNCCLTrainerWeightTransferEngine:
+            raise ValidationFailure("sparse NCCL trainer backend is misregistered")
+        update_info = SparseNCCLWeightTransferUpdateInfo(
+            names=["model.layers.0.mlp.experts.0.gate_proj.weight"],
+            dtype_names=["float32"],
+            shapes=[[2, 2]],
+            num_updates_list=[2],
+        )
+        patch = SparseWeightPatch(
+            name=update_info.names[0],
+            indices=torch.tensor([0, 3], dtype=torch.int32),
+            values=torch.tensor([1.0, 2.0]),
+            full_shape=tuple(update_info.shapes[0]),
+        )
+        trainer_class._validate_patch(patch)
+        result["gates"][SPARSE_NCCL_GATE] = {
+            "status": "passed",
+            "backend": "sparse_nccl",
+            "checkpoint_shape": list(patch.full_shape),
+            "patch_entries": patch.indices.numel(),
+        }
+    except Exception as exc:
+        failed = True
+        result["gates"][SPARSE_NCCL_GATE] = gate("failed", repr(exc))
 
     try:
         importlib.import_module("vllm.cumem_allocator")

@@ -16,6 +16,7 @@ import yaml
 from infra.nightly.gpu_serve_smoke import server_command
 from infra.release.gpu_release import (
     GRUG_ARCHITECTURE,
+    SPARSE_NCCL_GATE,
     assemble_candidate,
     build_matrix,
     extract_validation,
@@ -217,6 +218,12 @@ def validation(candidate_manifest: dict, architecture: str) -> dict:
             "torchaudio.resample": {"status": "passed", "max_error": 0.0},
             "vllm._C_stable_libtorch": {"status": "passed"},
             GRUG_ARCHITECTURE: {"status": "passed"},
+            SPARSE_NCCL_GATE: {
+                "status": "passed",
+                "backend": "sparse_nccl",
+                "checkpoint_shape": [2, 2],
+                "patch_entries": 2,
+            },
             "cumem_allocator": {
                 "status": "passed",
                 "allocated_bytes": 16384,
@@ -360,6 +367,23 @@ def test_release_rejects_allocator_absence_from_gpu_result(tmp_path):
     validations[0] = broken
 
     with pytest.raises(ReleaseError, match="cumem_allocator.*absent"):
+        finalize_release(
+            candidate_manifest,
+            validations,
+            config=config,
+            release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
+            published_at="2026-08-04T00:00:00Z",
+            provenance={"run_id": "456"},
+        )
+
+
+def test_release_rejects_missing_sparse_nccl_contract(tmp_path):
+    config, candidate_manifest, validations, _ = release_fixture(tmp_path)
+    broken = copy.deepcopy(validations[0])
+    broken["gates"][SPARSE_NCCL_GATE] = {"status": "failed"}
+    validations[0] = broken
+
+    with pytest.raises(ReleaseError, match="sparse_nccl_contract.*failed"):
         finalize_release(
             candidate_manifest,
             validations,

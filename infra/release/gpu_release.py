@@ -61,6 +61,7 @@ WHEEL_SHA_GATE = "wheel_sha256"
 DISTRIBUTION_GATE = "distribution_metadata"
 CUMEM_GATE = "cumem_allocator"
 TORCHAUDIO_GATE = "torchaudio.resample"
+SPARSE_NCCL_GATE = "sparse_nccl_contract"
 SOURCE_TESTS_GATE = "source_tests"
 SERVE_GATE = "serve_smoke"
 REQUIRED_RUNTIME_GATES = (
@@ -70,6 +71,7 @@ REQUIRED_RUNTIME_GATES = (
     GRUG_ARCHITECTURE,
     CUMEM_GATE,
     TORCHAUDIO_GATE,
+    SPARSE_NCCL_GATE,
     SERVE_GATE,
 )
 
