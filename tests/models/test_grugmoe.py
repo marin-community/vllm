@@ -31,6 +31,7 @@ from vllm.model_executor.models.grugmoe import (
     GrugMoeDecoderLayer,
     GrugMoeGatedNorm,
     GrugMoeMLP,
+    GrugMoeModel,
     GrugMoeRouter,
     GrugMoeRuntimeConfig,
     _try_load_grug_expert_weight,
@@ -181,6 +182,44 @@ class _FakeDenseMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _reference_dense_mlp(x, self)
+
+
+class _AddLayer(nn.Module):
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.value = value
+
+    def forward(
+        self,
+        _positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden_states + self.value
+
+
+def test_grug_model_returns_requested_eagle3_auxiliary_states():
+    model = GrugMoeModel.__new__(GrugMoeModel)
+    nn.Module.__init__(model)
+    model.start_layer = 0
+    model.end_layer = 3
+    model.embed_tokens = nn.Embedding.from_pretrained(
+        torch.arange(16).reshape(4, 4).float()
+    )
+    model.embed_norm = nn.Identity()
+    model.embed_gated_norm = nn.Identity()
+    model.layers = nn.ModuleList([_AddLayer(1), _AddLayer(2), _AddLayer(4)])
+    model.norm = nn.Identity()
+    model.final_gated_norm = nn.Identity()
+    model._set_aux_hidden_state_layers((0, 2))
+    input_ids = torch.tensor([1, 3])
+
+    final_hidden_state, auxiliary_states = model(input_ids, torch.arange(2))
+
+    embedded = model.embed_tokens(input_ids)
+    assert torch.equal(final_hidden_state, embedded + 7)
+    assert len(auxiliary_states) == 2
+    assert torch.equal(auxiliary_states[0], embedded)
+    assert torch.equal(auxiliary_states[1], embedded + 3)
 
 
 def test_grug_moe_config_parses_hf_aliases_and_rope_theta():
