@@ -25,6 +25,14 @@ _SKYRL_REQUEST_PREFIX = "skyrl-group-"
 _MIN_TRAINING_WINDOW_TOKENS = 2
 
 
+def _record_stream_for_async_copy(
+    tensors: Sequence[torch.Tensor], stream: torch.cuda.Stream
+) -> None:
+    """Keep temporary CUDA storage alive until its side-stream copy finishes."""
+    for tensor in tensors:
+        tensor.record_stream(stream)
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -323,6 +331,10 @@ class OnlineEagleCapture:
             host_tokens.copy_(selected_tokens, non_blocking=True)
             host_aux.copy_(selected_aux, non_blocking=True)
             host_head_inputs.copy_(selected_head_inputs, non_blocking=True)
+            _record_stream_for_async_copy(
+                (selected_tokens, selected_aux, selected_head_inputs),
+                self._copy_stream,
+            )
             event = torch.cuda.Event()
             event.record(self._copy_stream)
         return host_tokens, host_aux, host_head_inputs, event
