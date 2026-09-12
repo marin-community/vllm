@@ -6,6 +6,7 @@
   "torch_version": "2.11.0+cu129",
   "torch_metadata_requirement": "torch==2.11.0",
   "transformers_version": "5.5.3",
+  "validation_system_packages": ["build-essential"],
   "torch_index_url": "https://download.pytorch.org/whl/cu129",
   "cuda_toolkit_version": "12.9.1",
   "cuda_runtime_version": "12.9",

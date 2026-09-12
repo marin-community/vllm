@@ -8,9 +8,10 @@ a moving `latest` alias.
 
 [`config.json`](config.json) is the release ABI contract. It pins CPython 3.12,
 Torch 2.11.0+cu129, CUDA 12.9.1, the Transformers version used by the source
-tests, digest-pinned upstream manylinux builder images, deployment-specific SM
-targets, Iris validation hardware, and the digest-pinned multi-architecture
-validation image. Update the config and workflows in one PR when an ABI changes.
+tests, the validation image's system build tools, digest-pinned upstream
+manylinux builder images, deployment-specific SM targets, Iris validation
+hardware, and the digest-pinned multi-architecture validation image. Update the
+config and workflows in one PR when an ABI changes.
 
 Native x86_64 and aarch64 builds reuse the `build` target in
 [`docker/Dockerfile`](../../docker/Dockerfile). That is the same CUDA 12.9 path
@@ -92,7 +93,10 @@ working directory outside the tree as well, so model-inspection subprocesses
 also import the wheel instead of an unbuilt source package. Validation installs
 the exact Transformers version in the release config rather than allowing a
 newer incompatible version to change the result. Large wheel downloads retry
-transient failures and resume when the release server supports byte ranges.
+transient failures and resume when the release server supports byte ranges. The
+slim task image installs the configured build tools before Triton and Inductor
+compile their runtime helpers. Source validation selects the speculative-decoding
+delta tests rather than unrelated tests whose topology exceeds a single GPU.
 
 Both results must pass before the workflow creates
 `marin-vllm-gpu-<UTC-date>-<12-character-sha>`. The final release contains the

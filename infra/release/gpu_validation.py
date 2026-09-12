@@ -40,14 +40,9 @@ from gpu_release import (
 )
 
 SOURCE_TESTS = (
-    "tests/models/test_grugmoe.py",
-    "tests/v1/core/test_scheduler.py",
-    "tests/engine/test_arg_utils.py::TestDpDeviceIdSharding",
-    "tests/distributed/test_mq_connect_ip.py::test_mq_bind_with_local_ip",
-)
-SOURCE_TEST_DESELECTS = (
-    "tests/models/test_grugmoe.py::test_grug_moe_parallel_config_rejects_tp_larger_than_attention_heads",
-    "tests/v1/core/test_scheduler.py::test_async_scheduling_pp_allows_rescheduling_with_output_placeholders",
+    "tests/models/test_grugmoe.py::test_grug_model_returns_requested_eagle3_auxiliary_states",
+    "tests/v1/core/test_kv_cache_utils.py::test_eagle3_hybrid_draft_shares_block_table_without_extra_memory",
+    "tests/v1/spec_decode/test_online_eagle.py",
 )
 DOWNLOAD_ATTEMPTS = 5
 
@@ -298,10 +293,22 @@ def run_wheel_tests(args: argparse.Namespace) -> int:
     # directory rather than this process's already-populated sys.modules.
     import pytest  # noqa: PLC0415
 
-    sys.path.insert(0, str(validation_source_root))
     pytest_args = args.pytest_args
     if pytest_args and pytest_args[0] == "--":
         pytest_args = pytest_args[1:]
+    if any(
+        "test_grug_model_returns_requested_eagle3_auxiliary_states" in argument
+        for argument in pytest_args
+    ):
+        from vllm.model_executor.models.grugmoe import (  # noqa: PLC0415
+            GrugMoeModel,
+        )
+
+        # This test deliberately constructs GrugMoeModel with __new__ to
+        # isolate forward semantics, so it does not run the compile
+        # decorator's normal __init__ path that sets this instance attribute.
+        GrugMoeModel.do_not_compile = True
+    sys.path.insert(0, str(validation_source_root))
     return pytest.main(pytest_args)
 
 
@@ -377,6 +384,40 @@ def install_wheel_environment(
     return python
 
 
+def ensure_validation_compiler(
+    workdir: Path,
+    config: dict[str, Any],
+    environment: dict[str, str],
+) -> None:
+    if shutil.which("cc") is not None and shutil.which("c++") is not None:
+        return
+    apt_get = shutil.which("apt-get")
+    if apt_get is None:
+        raise ValidationFailure("validation image has no C/C++ compiler or apt-get")
+    require_command(
+        [apt_get, "update"],
+        cwd=workdir,
+        environment=environment,
+        phase="validation package index update",
+    )
+    require_command(
+        [
+            apt_get,
+            "install",
+            "--yes",
+            "--no-install-recommends",
+            *config["validation_system_packages"],
+        ],
+        cwd=workdir,
+        environment=environment,
+        phase="validation system package installation",
+    )
+    if shutil.which("cc") is None or shutil.which("c++") is None:
+        raise ValidationFailure(
+            "validation system packages did not provide C and C++ compilers"
+        )
+
+
 def run_installed_probe(
     python: Path,
     workdir: Path,
@@ -437,8 +478,6 @@ def run_source_suite(
         "-v",
         *(source_node_id(validation_source_root, test) for test in SOURCE_TESTS),
     ]
-    for test in SOURCE_TEST_DESELECTS:
-        command.extend(["--deselect", source_node_id(validation_source_root, test)])
     return_code = run_command(command, cwd=workdir, environment=environment)
     if return_code != 0:
         raise ValidationFailure(f"source behavior tests exited with code {return_code}")
@@ -533,6 +572,7 @@ def validate(args: argparse.Namespace) -> int:
                     "VLLM_USE_FLASHINFER_SAMPLER": "0",
                 }
             )
+            ensure_validation_compiler(workdir, config, environment)
             python = install_wheel_environment(workdir, wheel, config, environment)
             probe, probe_return_code = run_installed_probe(
                 python,

@@ -65,3 +65,40 @@ def test_download_wheel_restarts_if_server_ignores_range(tmp_path, monkeypatch):
     gpu_validation.download_wheel("https://example.invalid/candidate.whl", destination)
 
     assert destination.read_bytes() == content
+
+
+def test_validation_compiler_installs_configured_system_packages(tmp_path, monkeypatch):
+    commands: list[list[str]] = []
+    lookups = {"cc": None, "c++": None, "apt-get": "/usr/bin/apt-get"}
+
+    def which(command: str):
+        return lookups[command]
+
+    def require_command(command, *, cwd, environment, phase):
+        assert cwd == tmp_path
+        assert environment == {"PATH": "/usr/bin"}
+        assert phase
+        commands.append(command)
+        if command[1] == "install":
+            lookups["cc"] = "/usr/bin/cc"
+            lookups["c++"] = "/usr/bin/c++"
+
+    monkeypatch.setattr(gpu_validation.shutil, "which", which)
+    monkeypatch.setattr(gpu_validation, "require_command", require_command)
+
+    gpu_validation.ensure_validation_compiler(
+        tmp_path,
+        {"validation_system_packages": ["build-essential"]},
+        {"PATH": "/usr/bin"},
+    )
+
+    assert commands == [
+        ["/usr/bin/apt-get", "update"],
+        [
+            "/usr/bin/apt-get",
+            "install",
+            "--yes",
+            "--no-install-recommends",
+            "build-essential",
+        ],
+    ]
