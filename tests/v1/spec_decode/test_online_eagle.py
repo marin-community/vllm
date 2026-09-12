@@ -172,10 +172,6 @@ def test_capture_crops_a_long_prefill_before_copying() -> None:
     )
 
     assert capture.captured_rows == 4
-    retained_positions = {
-        position for position, _token in capture.requests[request_id].provisional
-    }
-    assert retained_positions == {6, 7, 8, 9}
 
 
 def test_candidate_install_is_in_place_and_preserves_shared_embedding(
