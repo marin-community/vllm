@@ -3,9 +3,7 @@
 
 import functools
 import gc
-import hashlib
 import itertools
-import json
 import threading
 import time
 from collections import defaultdict
@@ -14,7 +12,6 @@ from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -195,6 +192,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 from vllm.v1.spec_decode.online_eagle import (
     OnlineEagleCapture,
     OnlineEagleCaptureConfig,
+    load_candidate,
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -238,12 +236,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-def _online_eagle_file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -1255,7 +1247,7 @@ class GPUModelRunner(
             capture = self.online_eagle_capture
             if capture is not None and sampling_params is not None:
                 max_completion_tokens = sampling_params.max_tokens or 1
-                capture.observe_request(
+                capture.admit_request(
                     req_id,
                     new_req_data.prompt_token_ids,
                     max_completion_tokens,
@@ -3287,9 +3279,7 @@ class GPUModelRunner(
         for request_id, request in self.requests.items():
             capture.finalize_request(request_id, request.output_token_ids)
         hf_config = self.model_config.hf_config
-        target_config = (
-            hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
-        )
+        target_config = hf_config.to_dict()
         try:
             return capture.seal(
                 output_dir,
@@ -3329,51 +3319,7 @@ class GPUModelRunner(
         candidate: dict[str, torch.Tensor] | None = None
         metadata: dict[str, Any] | None = None
         if is_trainer:
-            from safetensors.torch import load_file  # noqa: PLC0415
-
-            directory = Path(candidate_dir)
-            manifest_path = directory / "manifest.json"
-            metadata = json.loads(manifest_path.read_text())
-            if metadata.get("format") != "marinskyrl-online-eagle-candidate":
-                raise ValueError(
-                    f"Invalid online EAGLE candidate manifest: {manifest_path}"
-                )
-            if not metadata.get("complete", False):
-                raise ValueError(f"Incomplete online EAGLE candidate: {manifest_path}")
-            weights_path = directory / metadata["weights_path"]
-            digest = _online_eagle_file_sha256(weights_path)
-            if digest != metadata["weights_sha256"]:
-                raise ValueError(
-                    f"Online EAGLE candidate digest mismatch: expected "
-                    f"{metadata['weights_sha256']}, got {digest}"
-                )
-            candidate = load_file(weights_path)
-            if set(candidate) != set(metadata["tensor_inventory"]):
-                raise ValueError(
-                    "Online EAGLE candidate tensor inventory does not match "
-                    "its manifest"
-                )
-            mismatched = [
-                name
-                for name, value in candidate.items()
-                if metadata["tensor_inventory"][name]
-                != {"shape": list(value.shape), "dtype": str(value.dtype)}
-            ]
-            if mismatched:
-                raise ValueError(
-                    "Online EAGLE candidate tensor metadata does not match "
-                    "its weights: " + ", ".join(sorted(mismatched))
-                )
-            forbidden = [
-                name
-                for name in candidate
-                if "embed_tokens" in name or name.startswith("verifier_")
-            ]
-            if forbidden:
-                raise ValueError(
-                    "Online EAGLE candidate contains target-owned tensors: "
-                    + ", ".join(sorted(forbidden))
-                )
+            metadata, candidate = load_candidate(candidate_dir)
         metadata = dp_group.broadcast_object(metadata, src=trainer_rank)
         candidate = dp_group.broadcast_tensor_dict(candidate, src=trainer_rank)
         if metadata is None or candidate is None:
