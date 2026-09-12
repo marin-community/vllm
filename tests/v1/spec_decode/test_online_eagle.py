@@ -66,6 +66,45 @@ def _states(values: list[int]) -> tuple[list[torch.Tensor], torch.Tensor]:
     return aux, torch.cat([base + 400, base + 500], dim=-1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA side streams")
+def test_async_capture_copy_survives_source_allocator_reuse() -> None:
+    capture = OnlineEagleCapture(
+        OnlineEagleCaptureConfig.from_mapping(
+            {
+                "step": 1,
+                "max_tokens": 32,
+                "max_window_tokens": 8,
+                "max_sequences_per_prompt_group": 1,
+                "trainer_rank": 0,
+                "worker_rank": 0,
+                "target_revision": "target-0",
+                "draft_revision": "draft-0",
+                "aux_layer_ids": [2, 13, 23],
+            }
+        )
+    )
+    values = torch.arange(4096, device="cuda", dtype=torch.float32)
+    aux = [values[:, None] + offset for offset in (100, 200, 300)]
+    head = torch.stack((values + 400, values + 500), dim=-1)
+    expected_rows = [17, 2049, 4095]
+
+    tokens, selected_aux, selected_head, event = capture._copy_selected_rows(
+        selected_rows=expected_rows,
+        input_ids=values.to(torch.long),
+        aux_hidden_states=aux,
+        head_input_hidden_states=head,
+    )
+    del values, aux, head
+    allocator_pressure = [torch.full((4096, 3), -1.0, device="cuda") for _ in range(8)]
+    assert event is not None
+    event.synchronize()
+
+    assert tokens.tolist() == expected_rows
+    assert selected_aux[:, 0].tolist() == [117.0, 2149.0, 4195.0]
+    assert selected_head[:, 0].tolist() == [417.0, 2449.0, 4495.0]
+    assert allocator_pressure
+
+
 def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
     tmp_path,
 ) -> None:
