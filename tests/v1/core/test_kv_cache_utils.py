@@ -3992,3 +3992,51 @@ def test_deepseek_v4_annotation_requires_model_type():
     )
 
     assert not any(g.is_eagle_group for g in groups)
+
+
+@pytest.mark.parametrize("draft_depth", [1, 2, 3])
+def test_eagle3_hybrid_draft_layers_share_one_block_table(draft_depth):
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=5, head_size=128, dtype=torch.bfloat16
+    )
+    sliding = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=5,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    specs = {
+        f"model.layers.{index}.self_attn.attn": (
+            full if (index + 1) % 4 == 0 or index == 25 else sliding
+        )
+        for index in range(26)
+    }
+    draft_names = {
+        f"model.layers.{index}.self_attn.attn"
+        for index in range(26, 26 + draft_depth)
+    }
+    specs.update({name: sliding for name in draft_names})
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=26)),
+        speculative_config=None,
+    )
+    baseline = get_kv_cache_groups(config, specs.copy())
+    config.speculative_config = SimpleNamespace(
+        method="eagle3",
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=draft_depth)
+        ),
+    )
+
+    groups = get_kv_cache_groups(config, specs.copy())
+
+    assert sum(bool(draft_names.intersection(group.layer_names)) for group in groups) == 1
+    assert sorted(name for group in groups for name in group.layer_names) == sorted(specs)
+    assert [len(group.layer_names) for group in groups] == [
+        len(group.layer_names) for group in baseline
+    ]
+    assert [group.kv_cache_spec for group in groups] == [
+        group.kv_cache_spec for group in baseline
+    ]

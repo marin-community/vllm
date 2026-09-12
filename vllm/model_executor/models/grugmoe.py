@@ -61,7 +61,14 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 
-from .interfaces import HasInnerState, IsHybrid, SupportsPP
+from .interfaces import (
+    EagleModelMixin,
+    HasInnerState,
+    IsHybrid,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsPP,
+)
 
 logger = init_logger(__name__)
 
@@ -1130,7 +1137,7 @@ class GrugMoeDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class GrugMoeModel(nn.Module):
+class GrugMoeModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
@@ -1210,7 +1217,7 @@ class GrugMoeModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1225,11 +1232,23 @@ class GrugMoeModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states = self._maybe_add_hidden_state(
+            [], self.start_layer, hidden_states, None
+        )
+        for layer_index, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states = layer(positions, hidden_states)
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_index + 1, hidden_states, None
+            )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
-        return self.final_gated_norm(self.norm(hidden_states))
+        hidden_states = self.final_gated_norm(self.norm(hidden_states))
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
@@ -1315,7 +1334,14 @@ def _try_load_grug_expert_weight(
     return None
 
 
-class GrugMoeForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
+class GrugMoeForCausalLM(
+    nn.Module,
+    HasInnerState,
+    IsHybrid,
+    SupportsPP,
+    SupportsEagle,
+    SupportsEagle3,
+):
     fall_back_to_pt_during_load = False
 
     @classmethod
