@@ -7,7 +7,7 @@ import itertools
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import replace
@@ -209,7 +209,9 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 from vllm.v1.spec_decode.online_eagle import (
     OnlineEagleCapture,
     OnlineEagleCaptureConfig,
+    draft_vocab_target_ids,
     load_candidate,
+    validate_candidate_tensors,
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -3462,6 +3464,7 @@ class GPUModelRunner(
             return capture.seal(
                 output_dir,
                 target_model=self.get_model(),
+                draft_model=self.get_draft_model(),
                 target_config=target_config,
             )
         finally:
@@ -3488,10 +3491,7 @@ class GPUModelRunner(
     def install_online_eagle_speculator(
         self, candidate_dir: str, trainer_rank: int
     ) -> dict[str, Any]:
-        """Broadcast and load one complete draft candidate without replacing tensors."""
-        draft_model = self.get_draft_model()
-        if draft_model is None:
-            raise RuntimeError("Online EAGLE install requires a resident draft model")
+        """Load a checkpoint candidate and broadcast it within the vLLM DP group."""
         dp_group = get_dp_group()
         is_trainer = self.parallel_config.data_parallel_rank == trainer_rank
         candidate: dict[str, torch.Tensor] | None = None
@@ -3502,6 +3502,61 @@ class GPUModelRunner(
         candidate = dp_group.broadcast_tensor_dict(candidate, src=trainer_rank)
         if metadata is None or candidate is None:
             raise RuntimeError("Online EAGLE candidate broadcast returned no data")
+        return self.install_online_eagle_speculator_tensors(metadata, candidate)
+
+    def snapshot_online_eagle_speculator(
+        self, tensor_names: Sequence[str]
+    ) -> dict[str, torch.Tensor]:
+        """Copy the current draft-owned tensors to host for transactional rollback."""
+        draft_model = self.get_draft_model()
+        if draft_model is None:
+            raise RuntimeError("Online EAGLE snapshot requires a resident draft model")
+        state = draft_model.state_dict()
+        missing = set(tensor_names) - set(state)
+        if missing:
+            raise ValueError(
+                "Online EAGLE snapshot names are absent from the draft: "
+                + ", ".join(sorted(missing))
+            )
+        return {
+            name: state[name].detach().to(device="cpu").contiguous().clone()
+            for name in tensor_names
+        }
+
+    def refresh_online_eagle_target_owned_weights(self) -> None:
+        """Refresh the draft-vocabulary head after target policy synchronization."""
+        draft_model = self.get_draft_model()
+        if draft_model is None:
+            return
+        if getattr(draft_model, "draft_id_to_target_id", None) is None:
+            return
+        target_parameters = dict(self.get_model().named_parameters())
+        target_head = target_parameters.get("lm_head.weight")
+        if target_head is None:
+            target_head = self._online_eagle_embedding_weight(self.get_model())
+        draft_parameters = dict(draft_model.named_parameters())
+        draft_head = draft_parameters.get("lm_head.weight")
+        if draft_head is None:
+            raise RuntimeError("Embedding-free EAGLE draft has no lm_head.weight")
+        target_ids = draft_vocab_target_ids(draft_model, target_head.shape[0])
+        projected = target_head[target_ids]
+        if projected.shape != draft_head.shape:
+            raise RuntimeError(
+                "Projected target head does not match the EAGLE draft head"
+            )
+        with torch.no_grad():
+            draft_head.copy_(projected)
+
+    def install_online_eagle_speculator_tensors(
+        self,
+        metadata: Mapping[str, Any],
+        candidate: Mapping[str, torch.Tensor],
+    ) -> dict[str, Any]:
+        """Load validated tensors without replacing resident parameter storage."""
+        validate_candidate_tensors(metadata, candidate)
+        draft_model = self.get_draft_model()
+        if draft_model is None:
+            raise RuntimeError("Online EAGLE install requires a resident draft model")
 
         target_embedding = self._online_eagle_embedding_weight(self.get_model())
         draft_embedding = self._online_eagle_embedding_weight(draft_model)

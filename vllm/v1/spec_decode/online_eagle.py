@@ -60,6 +60,23 @@ def load_candidate(
             f"expected {metadata['weights_sha256']}, got {digest}"
         )
     candidate = load_file(weights_path)
+    # Older served checkpoints included a target-derived draft-vocabulary head.
+    # Keep their immutable file identity, but never install that stale snapshot
+    # after the target policy has been restored and synchronized.
+    if "lm_head.weight" in candidate:
+        candidate = dict(candidate)
+        candidate.pop("lm_head.weight")
+        metadata = dict(metadata)
+        metadata["tensor_inventory"] = dict(metadata["tensor_inventory"])
+        metadata["tensor_inventory"].pop("lm_head.weight")
+    validate_candidate_tensors(metadata, candidate)
+    return metadata, candidate
+
+
+def validate_candidate_tensors(
+    metadata: Mapping[str, Any], candidate: Mapping[str, torch.Tensor]
+) -> None:
+    """Reject incomplete or target-owned candidate tensor payloads."""
     inventory = metadata["tensor_inventory"]
     if set(candidate) != set(inventory):
         raise ValueError(
@@ -78,14 +95,34 @@ def load_candidate(
     forbidden = [
         name
         for name in candidate
-        if "embed_tokens" in name or name.startswith("verifier_")
+        if "embed_tokens" in name
+        or name == "lm_head.weight"
+        or name.startswith("verifier_")
     ]
     if forbidden:
         raise ValueError(
             "Online EAGLE candidate contains target-owned tensors: "
             + ", ".join(sorted(forbidden))
         )
-    return metadata, candidate
+
+
+def draft_vocab_target_ids(
+    draft_model: nn.Module, target_vocab_size: int
+) -> torch.Tensor:
+    """Resolve vLLM's compact draft-vocabulary rows into target row IDs."""
+    offsets = getattr(draft_model, "draft_id_to_target_id", None)
+    if offsets is None or offsets.ndim != 1:
+        raise ValueError("EAGLE draft has no target vocabulary row mapping")
+    target_ids = torch.arange(offsets.numel(), device=offsets.device) + offsets
+    if (
+        target_ids.dtype not in {torch.int32, torch.int64}
+        or target_ids.numel() == 0
+        or int(target_ids.min()) < 0
+        or int(target_ids.max()) >= target_vocab_size
+        or target_ids.unique().numel() != target_ids.numel()
+    ):
+        raise ValueError("EAGLE draft vocabulary row mapping is invalid")
+    return target_ids.to(dtype=torch.long)
 
 
 def request_group_from_id(request_id: str) -> str:
@@ -109,6 +146,7 @@ class OnlineEagleCaptureConfig:
     target_revision: str
     draft_revision: str
     aux_layer_ids: tuple[int, ...]
+    capture_target_snapshot: bool = True
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> OnlineEagleCaptureConfig:
@@ -122,6 +160,7 @@ class OnlineEagleCaptureConfig:
             "target_revision",
             "draft_revision",
             "aux_layer_ids",
+            "capture_target_snapshot",
         }
         unknown = set(value) - allowed
         if unknown:
@@ -159,6 +198,9 @@ class OnlineEagleCaptureConfig:
             raise ValueError("target_revision must be a nonempty string")
         if not isinstance(draft_revision, str) or not draft_revision:
             raise ValueError("draft_revision must be a nonempty string")
+        capture_target_snapshot = value.get("capture_target_snapshot", True)
+        if not isinstance(capture_target_snapshot, bool):
+            raise ValueError("capture_target_snapshot must be a boolean")
         return cls(
             step=step,
             max_tokens=positive_int("max_tokens"),
@@ -171,6 +213,7 @@ class OnlineEagleCaptureConfig:
             target_revision=target_revision,
             draft_revision=draft_revision,
             aux_layer_ids=aux_layers,
+            capture_target_snapshot=capture_target_snapshot,
         )
 
 
@@ -415,7 +458,9 @@ class OnlineEagleCapture:
         return hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
 
     @staticmethod
-    def _target_snapshot(model: nn.Module) -> tuple[dict[str, torch.Tensor], dict]:
+    def _target_snapshot(
+        model: nn.Module, draft_model: nn.Module
+    ) -> tuple[dict[str, torch.Tensor], dict]:
         parameters = dict(model.named_parameters())
         embedding = parameters.get("model.embed_tokens.weight")
         if embedding is None:
@@ -423,9 +468,10 @@ class OnlineEagleCapture:
         head = parameters.get("lm_head.weight")
         if head is None:
             head = embedding
+        target_ids = draft_vocab_target_ids(draft_model, head.shape[0])
         tensors = {
             "model.embed_tokens.weight": embedding.detach().cpu().contiguous(),
-            "lm_head.weight": head.detach().cpu().contiguous().clone(),
+            "lm_head.weight": head[target_ids].detach().cpu().contiguous(),
         }
         return tensors, {
             name: {
@@ -491,6 +537,7 @@ class OnlineEagleCapture:
         output_dir: str | os.PathLike[str],
         *,
         target_model: nn.Module,
+        draft_model: nn.Module,
         target_config: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Write an immutable atomic capture directory and return its manifest."""
@@ -520,13 +567,27 @@ class OnlineEagleCapture:
                     }
                 )
 
-            target_tensors, target_inventory = self._target_snapshot(target_model)
-            target_path = staging / "target.safetensors"
-            save_file(target_tensors, str(target_path), metadata={"format": "pt"})
-            config_path = staging / "target-config.json"
-            config_path.write_text(
-                json.dumps(dict(target_config), sort_keys=True, separators=(",", ":"))
-            )
+            target = None
+            if self.config.capture_target_snapshot:
+                target_tensors, target_inventory = self._target_snapshot(
+                    target_model, draft_model
+                )
+                target_path = staging / "target.safetensors"
+                save_file(target_tensors, str(target_path), metadata={"format": "pt"})
+                config_path = staging / "target-config.json"
+                config_path.write_text(
+                    json.dumps(
+                        dict(target_config), sort_keys=True, separators=(",", ":")
+                    )
+                )
+                target = {
+                    "weights_path": target_path.name,
+                    "weights_sha256": file_sha256(target_path),
+                    "config_path": config_path.name,
+                    "config_sha256": file_sha256(config_path),
+                    "inventory": target_inventory,
+                    "lm_head_vocabulary": "draft",
+                }
             manifest = {
                 "format": "vllm-online-eagle-capture",
                 "format_version": _FORMAT_VERSION,
@@ -541,13 +602,7 @@ class OnlineEagleCapture:
                 "captured_rows": self.captured_rows,
                 "dropped_requests": self.dropped_requests,
                 "dropped_windows": self.dropped_windows,
-                "target": {
-                    "weights_path": target_path.name,
-                    "weights_sha256": file_sha256(target_path),
-                    "config_path": config_path.name,
-                    "config_sha256": file_sha256(config_path),
-                    "inventory": target_inventory,
-                },
+                "target": target,
             }
             manifest_path = staging / "manifest.json"
             manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
@@ -566,6 +621,8 @@ __all__ = [
     "OnlineEagleCapture",
     "OnlineEagleCaptureConfig",
     "file_sha256",
+    "draft_vocab_target_ids",
     "load_candidate",
     "request_group_from_id",
+    "validate_candidate_tensors",
 ]
