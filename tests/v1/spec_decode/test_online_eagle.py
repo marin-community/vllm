@@ -58,7 +58,7 @@ class _SingleRankDPGroup:
 
 @pytest.fixture
 def should_do_global_cleanup_after_test() -> bool:
-    """This module is CPU-only and does not initialize distributed state."""
+    """This module does not initialize distributed state."""
     return False
 
 
@@ -112,7 +112,9 @@ def test_async_capture_copy_survives_source_allocator_reuse() -> None:
     assert tokens.tolist() == expected_rows
     assert selected_aux[:, 0].tolist() == [117.0, 2149.0, 4195.0]
     assert selected_head[:, 0].tolist() == [417.0, 2449.0, 4495.0]
-    assert allocator_pressure
+    # Retain these allocations through synchronization so the CUDA allocator
+    # gets a chance to reuse the released source blocks.
+    del allocator_pressure
 
 
 def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
