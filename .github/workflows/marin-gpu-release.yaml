@@ -30,6 +30,10 @@ on:
         default: Qwen/Qwen3-0.6B
         required: false
         type: string
+      stale_job_ids:
+        description: "Exact Iris job IDs to inspect and cancel before GPU qualification"
+        required: false
+        type: string
 
 concurrency:
   group: marin-vllm-${{ inputs.lane || 'gpu' }}-release
@@ -199,6 +203,24 @@ jobs:
           uv tool install --prerelease allow "marin-core>=0.2.46.dev202607131620"
           echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
 
+      - name: Inspect and cancel requested Iris jobs
+        if: github.event_name == 'workflow_dispatch' && inputs.stale_job_ids != ''
+        env:
+          STALE_JOB_IDS: ${{ inputs.stale_job_ids }}
+        run: |
+          while read -r job_id; do
+            description=$(iris --cluster marin job describe "$job_id")
+            printf '%s\n' "$description"
+            state=$(sed -n 's/^State: \([^ ]*\).*/\1/p' <<< "$description")
+            case "$state" in
+              succeeded|failed|killed|worker_failed|unschedulable) ;;
+              *)
+                iris --cluster marin job cancel --exact "$job_id"
+                iris --cluster marin job describe "$job_id"
+                ;;
+            esac
+          done < <(printf '%s\n' "$STALE_JOB_IDS" | tr ' ' '\n' | sed '/^$/d')
+
       - name: Validate the published wheel on ${{ matrix.hardware }}
         id: iris
         continue-on-error: true
@@ -212,6 +234,7 @@ jobs:
           set -o pipefail
           iris --cluster marin job run \
             --target-cluster "${{ matrix.target_cluster }}" \
+            --priority production \
             --job-name "$JOB_NAME" \
             --user "$JOB_USER" \
             --task-image "$TASK_IMAGE" \
@@ -232,11 +255,11 @@ jobs:
               --model "$MODEL" \
               --validation-source-root candidate-source 2>&1 | tee validation.log
 
-      - name: Stop any Iris job left behind
+      - name: Cancel any Iris job left behind
         if: always()
         run: |
           if [[ -n "${JOB_NAME:-}" ]]; then
-            iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
+            iris --cluster marin job cancel --exact "/$JOB_USER/$JOB_NAME" || true
           fi
 
       - name: Wait for the federated validation record
