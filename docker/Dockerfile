@@ -440,7 +440,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Build the vLLM wheel
 # if USE_SCCACHE is set, use sccache to speed up compilation
 # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)
-RUN --mount=type=cache,target=/opt/uv/cache \
+RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi \
@@ -450,9 +451,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && export VLLM_MAIN_CUDA_VERSION="${VLLM_MAIN_CUDA_VERSION}" \
         && export VLLM_DOCKER_BUILD_CONTEXT=1 \
         && export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) \
-        && sccache --show-stats \
+        && echo "Compiler launcher: $(command -v sccache)" \
+        && sccache --version \
+        && sccache --zero-stats \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
-        && sccache --show-stats; \
+        && sccache --show-stats \
+        && du -sh /root/.cache/sccache; \
     fi
 
 ARG vllm_target_device="cuda"
