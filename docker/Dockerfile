@@ -336,7 +336,11 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
-        if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi; \
+        if [ -z "${SCCACHE_BUCKET}" ]; then \
+            unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
+        elif [ -n "${SCCACHE_ENDPOINT}" ]; then \
+            export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; \
+        fi; \
         export RUSTC_WRAPPER=sccache; \
         sccache --show-stats; \
     fi \
@@ -444,7 +448,11 @@ RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
-        if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi \
+        if [ -z "${SCCACHE_BUCKET}" ]; then \
+            unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
+        elif [ -n "${SCCACHE_ENDPOINT}" ]; then \
+            export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; \
+        fi \
         && export CMAKE_BUILD_TYPE=Release \
         && export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" \
         && export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" \
