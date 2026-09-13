@@ -23,6 +23,8 @@ _FORMAT_VERSION = 1
 _CANDIDATE_FORMAT = "marinskyrl-online-eagle-candidate"
 _SKYRL_REQUEST_PREFIX = "skyrl-group-"
 _MIN_TRAINING_WINDOW_TOKENS = 2
+DRAFT_LM_HEAD_NAME = "lm_head.weight"
+TARGET_EMBEDDING_NAME = "model.embed_tokens.weight"
 
 
 def _record_stream_for_async_copy(
@@ -60,15 +62,15 @@ def load_candidate(
             f"expected {metadata['weights_sha256']}, got {digest}"
         )
     candidate = load_file(weights_path)
-    # Older served checkpoints included a target-derived draft-vocabulary head.
-    # Keep their immutable file identity, but never install that stale snapshot
-    # after the target policy has been restored and synchronized.
-    if "lm_head.weight" in candidate:
+    # Candidate format v1 initially included a target-derived draft-vocabulary
+    # head. Retain this shim until v1 checkpoint restore is removed, but never
+    # install that stale snapshot after the target policy has been synchronized.
+    if DRAFT_LM_HEAD_NAME in candidate:
         candidate = dict(candidate)
-        candidate.pop("lm_head.weight")
+        candidate.pop(DRAFT_LM_HEAD_NAME)
         metadata = dict(metadata)
         metadata["tensor_inventory"] = dict(metadata["tensor_inventory"])
-        metadata["tensor_inventory"].pop("lm_head.weight")
+        metadata["tensor_inventory"].pop(DRAFT_LM_HEAD_NAME)
     validate_candidate_tensors(metadata, candidate)
     return metadata, candidate
 
@@ -96,7 +98,7 @@ def validate_candidate_tensors(
         name
         for name in candidate
         if "embed_tokens" in name
-        or name == "lm_head.weight"
+        or name == DRAFT_LM_HEAD_NAME
         or name.startswith("verifier_")
     ]
     if forbidden:
@@ -125,6 +127,13 @@ def draft_vocab_target_ids(
     return target_ids.to(dtype=torch.long)
 
 
+def project_target_head(
+    draft_model: nn.Module, target_head: torch.Tensor
+) -> torch.Tensor:
+    """Select target-head rows in the resident draft vocabulary order."""
+    return target_head[draft_vocab_target_ids(draft_model, target_head.shape[0])]
+
+
 def request_group_from_id(request_id: str) -> str:
     """Return a SkyRL group digest, or the full ID for an ungrouped request."""
     if request_id.startswith(_SKYRL_REQUEST_PREFIX):
@@ -150,18 +159,7 @@ class OnlineEagleCaptureConfig:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> OnlineEagleCaptureConfig:
-        allowed = {
-            "step",
-            "max_tokens",
-            "max_window_tokens",
-            "max_sequences_per_prompt_group",
-            "trainer_rank",
-            "worker_rank",
-            "target_revision",
-            "draft_revision",
-            "aux_layer_ids",
-            "capture_target_snapshot",
-        }
+        allowed = set(cls.__dataclass_fields__)
         unknown = set(value) - allowed
         if unknown:
             raise ValueError(
@@ -468,10 +466,12 @@ class OnlineEagleCapture:
         head = parameters.get("lm_head.weight")
         if head is None:
             head = embedding
-        target_ids = draft_vocab_target_ids(draft_model, head.shape[0])
         tensors = {
-            "model.embed_tokens.weight": embedding.detach().cpu().contiguous(),
-            "lm_head.weight": head[target_ids].detach().cpu().contiguous(),
+            TARGET_EMBEDDING_NAME: embedding.detach().cpu().contiguous(),
+            DRAFT_LM_HEAD_NAME: project_target_head(draft_model, head)
+            .detach()
+            .cpu()
+            .contiguous(),
         }
         return tensors, {
             name: {
@@ -618,11 +618,14 @@ class OnlineEagleCapture:
 
 
 __all__ = [
+    "DRAFT_LM_HEAD_NAME",
     "OnlineEagleCapture",
     "OnlineEagleCaptureConfig",
+    "TARGET_EMBEDDING_NAME",
     "file_sha256",
     "draft_vocab_target_ids",
     "load_candidate",
+    "project_target_head",
     "request_group_from_id",
     "validate_candidate_tensors",
 ]

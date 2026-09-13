@@ -209,8 +209,8 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 from vllm.v1.spec_decode.online_eagle import (
     OnlineEagleCapture,
     OnlineEagleCaptureConfig,
-    draft_vocab_target_ids,
     load_candidate,
+    project_target_head,
     validate_candidate_tensors,
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
@@ -3538,8 +3538,7 @@ class GPUModelRunner(
         draft_head = draft_parameters.get("lm_head.weight")
         if draft_head is None:
             raise RuntimeError("Embedding-free EAGLE draft has no lm_head.weight")
-        target_ids = draft_vocab_target_ids(draft_model, target_head.shape[0])
-        projected = target_head[target_ids]
+        projected = project_target_head(draft_model, target_head)
         if projected.shape != draft_head.shape:
             raise RuntimeError(
                 "Projected target head does not match the EAGLE draft head"
