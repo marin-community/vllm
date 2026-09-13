@@ -33,6 +33,8 @@ class _DraftModel(nn.Module):
         self.model = nn.Module()
         self.model.embed_tokens = embedding
         self.owned = nn.Linear(2, 2, bias=False)
+        self.lm_head = nn.Linear(2, 4, bias=False)
+        self.register_buffer("draft_id_to_target_id", torch.tensor([1, 2, 3, 4]))
 
     def load_weights(self, weights) -> None:
         for name, value in weights:
@@ -168,9 +170,11 @@ def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
     capture.finalize_request(request_id, [20, 30])
 
     destination = tmp_path / "capture"
+    draft_model = SimpleNamespace(draft_id_to_target_id=torch.tensor([1, 2, 3, 4]))
     manifest = capture.seal(
         destination,
         target_model=_TargetModel(),
+        draft_model=draft_model,
         target_config={"hidden_size": 2, "vocab_size": 64},
     )
 
@@ -184,7 +188,7 @@ def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
     assert not torch.any(window["hidden_states"] == 399)
     on_disk_manifest = json.loads((destination / "manifest.json").read_text())
     assert on_disk_manifest["target"]["inventory"]["lm_head.weight"]["shape"] == [
-        64,
+        4,
         2,
     ]
 
@@ -223,6 +227,33 @@ def test_capture_crops_a_long_prefill_before_copying() -> None:
         position for position, _token in capture.requests[request_id].provisional
     }
     assert retained_positions == {6, 7, 8, 9}
+
+
+def test_nonowner_capture_does_not_snapshot_target(tmp_path) -> None:
+    config = OnlineEagleCaptureConfig.from_mapping(
+        {
+            "step": 1,
+            "max_tokens": 4,
+            "max_window_tokens": 4,
+            "max_sequences_per_prompt_group": 1,
+            "trainer_rank": 0,
+            "worker_rank": 0,
+            "target_revision": "target-0",
+            "draft_revision": "draft-0",
+            "aux_layer_ids": [2, 13, 23],
+            "capture_target_snapshot": False,
+        }
+    )
+
+    manifest = OnlineEagleCapture(config).seal(
+        tmp_path / "capture",
+        target_model=_TargetModel(),
+        draft_model=SimpleNamespace(),
+        target_config={"hidden_size": 2, "vocab_size": 64},
+    )
+
+    assert manifest["target"] is None
+    assert not (tmp_path / "capture" / "target.safetensors").exists()
 
 
 def test_candidate_install_is_in_place_and_preserves_shared_embedding(
@@ -274,3 +305,77 @@ def test_candidate_install_is_in_place_and_preserves_shared_embedding(
         "weights_sha256": weights_sha256,
         "tensor_count": 1,
     }
+
+
+def test_candidate_tensor_install_and_snapshot_are_transactional() -> None:
+    target = _TargetModel()
+    draft = _DraftModel(target.model.embed_tokens)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model = target
+    runner.drafter = SimpleNamespace(model=draft)
+    runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
+    original = runner.snapshot_online_eagle_speculator(["owned.weight"])
+    candidate = {"owned.weight": torch.full((2, 2), 7.0)}
+    metadata = {
+        "draft_revision": "draft-step-7",
+        "weights_sha256": "payload-digest",
+        "tensor_inventory": {
+            "owned.weight": {
+                "shape": [2, 2],
+                "dtype": "torch.float32",
+            }
+        },
+    }
+    parameter_id = id(draft.owned.weight)
+    storage_pointer = draft.owned.weight.data_ptr()
+
+    installed = runner.install_online_eagle_speculator_tensors(metadata, candidate)
+    runner.install_online_eagle_speculator_tensors(
+        {
+            **metadata,
+            "draft_revision": "draft-initial",
+            "weights_sha256": "incumbent-digest",
+        },
+        original,
+    )
+
+    assert installed["weights_sha256"] == "payload-digest"
+    assert torch.equal(draft.owned.weight, original["owned.weight"])
+    assert id(draft.owned.weight) == parameter_id
+    assert draft.owned.weight.data_ptr() == storage_pointer
+
+
+def test_direct_candidate_install_rejects_target_owned_head() -> None:
+    target = _TargetModel()
+    draft = _DraftModel(target.model.embed_tokens)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model = target
+    runner.drafter = SimpleNamespace(model=draft)
+    runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
+    candidate = {"lm_head.weight": torch.ones_like(draft.lm_head.weight)}
+    metadata = {
+        "draft_revision": "draft-step-7",
+        "weights_sha256": "payload-digest",
+        "tensor_inventory": {
+            "lm_head.weight": {
+                "shape": list(draft.lm_head.weight.shape),
+                "dtype": str(draft.lm_head.weight.dtype),
+            }
+        },
+    }
+
+    with pytest.raises(ValueError, match="target-owned tensors"):
+        runner.install_online_eagle_speculator_tensors(metadata, candidate)
+
+
+def test_target_sync_refreshes_draft_vocabulary_head() -> None:
+    target = _TargetModel()
+    draft = _DraftModel(target.model.embed_tokens)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model = target
+    runner.drafter = SimpleNamespace(model=draft)
+    target.lm_head.weight.data.copy_(torch.arange(128).reshape(64, 2))
+
+    runner.refresh_online_eagle_target_owned_weights()
+
+    assert torch.equal(draft.lm_head.weight, target.lm_head.weight[[1, 3, 5, 7]])
