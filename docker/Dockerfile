@@ -463,8 +463,17 @@ RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
         && sccache --version \
         && sccache --zero-stats \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
-        && sccache --show-stats \
-        && du -sh /root/.cache/sccache; \
+        && sccache --show-stats > /tmp/sccache-stats.txt \
+        && du -sh /root/.cache/sccache > /tmp/sccache-size.txt; \
+    fi
+
+# Keep the summary outside the verbose compile step so BuildKit's per-step log
+# limit cannot clip the cache evidence.
+RUN if [ "$USE_SCCACHE" = "1" ]; then \
+        echo "Final sccache statistics:"; \
+        cat /tmp/sccache-stats.txt; \
+        echo "Final sccache size:"; \
+        cat /tmp/sccache-size.txt; \
     fi
 
 ARG vllm_target_device="cuda"
