@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -16,11 +15,10 @@ from typing import Any
 from uuid import uuid4
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 from torch import nn
 
 _FORMAT_VERSION = 1
-_CANDIDATE_FORMAT = "marinskyrl-online-eagle-candidate"
 _MANIFEST_FILENAME = "manifest.json"
 _SKYRL_REQUEST_PREFIX = "skyrl-group-"
 _MIN_TRAINING_WINDOW_TOKENS = 2
@@ -34,103 +32,6 @@ def _record_stream_for_async_copy(
     """Keep temporary CUDA storage alive until its side-stream copy finishes."""
     for tensor in tensors:
         tensor.record_stream(stream)
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-@dataclass(frozen=True)
-class OnlineEagleCandidateMetadata:
-    draft_revision: str
-    weights_sha256: str
-    tensor_inventory: Mapping[str, Mapping[str, Any]]
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> OnlineEagleCandidateMetadata:
-        draft_revision = value.get("draft_revision")
-        weights_sha256 = value.get("weights_sha256")
-        tensor_inventory = value.get("tensor_inventory")
-        if not isinstance(draft_revision, str) or not draft_revision:
-            raise ValueError("Online EAGLE candidate has no draft revision")
-        if not isinstance(weights_sha256, str) or not weights_sha256:
-            raise ValueError("Online EAGLE candidate has no weights digest")
-        if not isinstance(tensor_inventory, Mapping):
-            raise ValueError("Online EAGLE candidate has no tensor inventory")
-        return cls(
-            draft_revision=draft_revision,
-            weights_sha256=weights_sha256,
-            tensor_inventory=tensor_inventory,
-        )
-
-    def as_mapping(self) -> dict[str, Any]:
-        return {
-            "draft_revision": self.draft_revision,
-            "weights_sha256": self.weights_sha256,
-            "tensor_inventory": self.tensor_inventory,
-        }
-
-
-def load_candidate(
-    candidate_dir: str | os.PathLike[str],
-) -> tuple[OnlineEagleCandidateMetadata, dict[str, torch.Tensor]]:
-    """Load and validate a complete candidate before its collective broadcast."""
-    directory = Path(candidate_dir)
-    manifest_path = directory / _MANIFEST_FILENAME
-    manifest = json.loads(manifest_path.read_text())
-    if manifest.get("format") != _CANDIDATE_FORMAT:
-        raise ValueError(f"Invalid online EAGLE candidate manifest: {manifest_path}")
-    if not manifest.get("complete", False):
-        raise ValueError(f"Incomplete online EAGLE candidate: {manifest_path}")
-    weights_path = directory / manifest["weights_path"]
-    digest = file_sha256(weights_path)
-    if digest != manifest["weights_sha256"]:
-        raise ValueError(
-            "Online EAGLE candidate digest mismatch: "
-            f"expected {manifest['weights_sha256']}, got {digest}"
-        )
-    candidate = load_file(weights_path)
-    metadata = OnlineEagleCandidateMetadata.from_mapping(manifest)
-    validate_candidate_tensors(metadata, candidate)
-    return metadata, candidate
-
-
-def validate_candidate_tensors(
-    metadata: OnlineEagleCandidateMetadata,
-    candidate: Mapping[str, torch.Tensor],
-) -> None:
-    """Reject incomplete or target-owned candidate tensor payloads."""
-    inventory = metadata.tensor_inventory
-    if set(candidate) != set(inventory):
-        raise ValueError(
-            "Online EAGLE candidate tensor inventory does not match its manifest"
-        )
-    mismatched = [
-        name
-        for name, value in candidate.items()
-        if inventory[name] != {"shape": list(value.shape), "dtype": str(value.dtype)}
-    ]
-    if mismatched:
-        raise ValueError(
-            "Online EAGLE candidate tensor metadata does not match its weights: "
-            + ", ".join(sorted(mismatched))
-        )
-    forbidden = [
-        name
-        for name in candidate
-        if "embed_tokens" in name
-        or name == LM_HEAD_WEIGHT_NAME
-        or name.startswith("verifier_")
-    ]
-    if forbidden:
-        raise ValueError(
-            "Online EAGLE candidate contains target-owned tensors: "
-            + ", ".join(sorted(forbidden))
-        )
 
 
 def _unique_parameter(model: nn.Module, name: str) -> nn.Parameter | None:
@@ -202,7 +103,6 @@ class OnlineEagleCaptureConfig:
     max_tokens: int
     max_window_tokens: int
     max_sequences_per_prompt_group: int
-    trainer_rank: int
     worker_rank: int
     target_revision: str
     draft_revision: str
@@ -227,10 +127,9 @@ class OnlineEagleCaptureConfig:
         step = value.get("step")
         if isinstance(step, bool) or not isinstance(step, int) or step < 0:
             raise ValueError(f"step must be a nonnegative integer, got {step!r}")
-        trainer_rank = value.get("trainer_rank", 0)
         worker_rank = value.get("worker_rank", 0)
-        if not isinstance(trainer_rank, int) or not isinstance(worker_rank, int):
-            raise ValueError("trainer_rank and worker_rank must be integers")
+        if not isinstance(worker_rank, int):
+            raise ValueError("worker_rank must be an integer")
         aux_layer_ids = value.get("aux_layer_ids")
         if not isinstance(aux_layer_ids, Sequence) or isinstance(
             aux_layer_ids, (str, bytes)
@@ -258,7 +157,6 @@ class OnlineEagleCaptureConfig:
             max_sequences_per_prompt_group=positive_int(
                 "max_sequences_per_prompt_group"
             ),
-            trainer_rank=trainer_rank,
             worker_rank=worker_rank,
             target_revision=target_revision,
             draft_revision=draft_revision,
@@ -292,7 +190,6 @@ class OnlineEagleCapture:
 
     def __init__(self, config: OnlineEagleCaptureConfig):
         self.config = config
-        self.active = config.worker_rank == config.trainer_rank
         self.requests: dict[str, _RequestCapture] = {}
         self._group_counts: dict[str, int] = {}
         self._reserved_tokens = 0
@@ -309,8 +206,6 @@ class OnlineEagleCapture:
         max_completion_tokens: int,
     ) -> bool:
         """Admit one request before prefill and reserve a complete bounded window."""
-        if not self.active:
-            return False
         if (
             prompt_token_ids is None
             or isinstance(max_completion_tokens, bool)
@@ -451,8 +346,6 @@ class OnlineEagleCapture:
         head_input_hidden_states: torch.Tensor,
     ) -> None:
         """Copy selected target rows to pinned host buffers on a side stream."""
-        if not self.active:
-            return
         self._drain_pending(wait=False)
         if len(request_ids) != len(num_scheduled_tokens) or len(request_ids) != len(
             num_computed_tokens
@@ -510,11 +403,6 @@ class OnlineEagleCapture:
         self._pending = remaining
 
     @staticmethod
-    def _tensor_sha256(tensor: torch.Tensor) -> str:
-        value = tensor.detach().cpu().contiguous()
-        return hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
-
-    @staticmethod
     def _target_snapshot(
         model: nn.Module, draft_model: nn.Module
     ) -> tuple[dict[str, torch.Tensor], dict]:
@@ -528,11 +416,7 @@ class OnlineEagleCapture:
             .contiguous(),
         }
         return tensors, {
-            name: {
-                "shape": list(tensor.shape),
-                "dtype": str(tensor.dtype),
-                "sha256": OnlineEagleCapture._tensor_sha256(tensor),
-            }
+            name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
             for name, tensor in tensors.items()
         }
 
@@ -601,7 +485,6 @@ class OnlineEagleCapture:
                     "group_id": request.group_id,
                     "tokens": int(tensors["input_ids"].shape[0]),
                     "supervised_tokens": int(tensors["loss_mask"].sum().item()),
-                    "sha256": file_sha256(window_path),
                 }
             )
         return windows
@@ -627,9 +510,7 @@ class OnlineEagleCapture:
         )
         return {
             "weights_path": target_path.name,
-            "weights_sha256": file_sha256(target_path),
             "config_path": config_path.name,
-            "config_sha256": file_sha256(config_path),
             "inventory": target_inventory,
             "lm_head_vocabulary": "draft",
         }
@@ -665,8 +546,6 @@ class OnlineEagleCapture:
         target_config: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Write an immutable atomic capture directory and return its manifest."""
-        if not self.active:
-            return {"active": False, "worker_rank": self.config.worker_rank}
         self._drain_pending(wait=True)
         destination = Path(output_dir)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -698,14 +577,10 @@ __all__ = [
     "LM_HEAD_WEIGHT_NAME",
     "OnlineEagleCapture",
     "OnlineEagleCaptureConfig",
-    "OnlineEagleCandidateMetadata",
     "TARGET_EMBEDDING_NAME",
     "draft_vocab_target_ids",
-    "file_sha256",
-    "load_candidate",
     "project_target_head",
     "request_group_from_id",
     "target_embedding_weight",
     "target_head_weight",
-    "validate_candidate_tensors",
 ]

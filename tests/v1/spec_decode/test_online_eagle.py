@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import hashlib
 import json
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 from torch import nn
 
 from vllm.v1.spec_decode.online_eagle import (
@@ -42,20 +42,6 @@ class _DraftModel(nn.Module):
                 self.owned.weight.data.copy_(value)
 
 
-class _SingleRankDPGroup:
-    rank_in_group = 0
-
-    @staticmethod
-    def broadcast_object(value, src=0):
-        assert src == 0
-        return value
-
-    @staticmethod
-    def broadcast_tensor_dict(value, src=0):
-        assert src == 0
-        return value
-
-
 @pytest.fixture
 def should_do_global_cleanup_after_test() -> bool:
     """This module does not initialize distributed state."""
@@ -74,7 +60,6 @@ def _capture_config(**overrides) -> OnlineEagleCaptureConfig:
         "max_tokens": 32,
         "max_window_tokens": 8,
         "max_sequences_per_prompt_group": 1,
-        "trainer_rank": 0,
         "worker_rank": 0,
         "target_revision": "target-0",
         "draft_revision": "draft-0",
@@ -238,38 +223,49 @@ def test_capture_can_skip_target_snapshot(tmp_path) -> None:
     assert not (tmp_path / "capture" / "target.safetensors").exists()
 
 
-def test_candidate_install_is_in_place_and_preserves_shared_embedding(
-    tmp_path, monkeypatch
+def test_begin_capture_replaces_unsealed_scratch(monkeypatch) -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    old_capture = OnlineEagleCapture(_capture_config(step=1))
+    runner.online_eagle_capture = old_capture
+    runner.speculative_config = SimpleNamespace(method="eagle3")
+    runner.use_async_scheduling = False
+    runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
+    runner.effective_drafter_max_model_len = 8
+    runner._get_eagle3_aux_layers_from_config = lambda: (2, 13, 23)
+    monkeypatch.setattr(
+        gpu_model_runner,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+
+    result = runner.begin_online_eagle_capture(asdict(_capture_config(step=2)))
+
+    assert runner.online_eagle_capture is not old_capture
+    assert result == {"active": True, "worker_rank": 0, "step": 2}
+
+
+def test_candidate_refresh_streams_from_uri_in_place_and_preserves_shared_embedding(
+    monkeypatch,
 ) -> None:
     target, draft, runner = _runner_with_shared_embedding()
-    candidate_dir = tmp_path / "candidate"
-    candidate_dir.mkdir()
-    weights_path = candidate_dir / "model.safetensors"
     candidate = {"owned.weight": torch.full((2, 2), 7.0)}
-    save_file(candidate, str(weights_path))
-    weights_sha256 = hashlib.sha256(weights_path.read_bytes()).hexdigest()
-    (candidate_dir / "manifest.json").write_text(
-        json.dumps(
-            {
-                "format": "marinskyrl-online-eagle-candidate",
-                "complete": True,
-                "draft_revision": "draft-step-7",
-                "weights_path": weights_path.name,
-                "weights_sha256": weights_sha256,
-                "tensor_inventory": {
-                    "owned.weight": {
-                        "shape": list(candidate["owned.weight"].shape),
-                        "dtype": str(candidate["owned.weight"].dtype),
-                    }
-                },
-            }
-        )
+    monkeypatch.setattr(
+        gpu_model_runner,
+        "list_safetensors",
+        lambda uri: [f"{uri}/model.safetensors"],
     )
-    monkeypatch.setattr(gpu_model_runner, "get_dp_group", _SingleRankDPGroup)
+    monkeypatch.setattr(
+        gpu_model_runner,
+        "runai_safetensors_weights_iterator",
+        lambda files, use_tqdm_on_load: iter(candidate.items()),
+    )
     parameter_id = id(draft.owned.weight)
     storage_pointer = draft.owned.weight.data_ptr()
 
-    result = runner.install_online_eagle_speculator(str(candidate_dir), 0)
+    result = runner.refresh_online_eagle_speculator(
+        "s3://bucket/drafts/draft-step-7",
+        "draft-step-7",
+    )
 
     assert torch.equal(draft.owned.weight, candidate["owned.weight"])
     assert id(draft.owned.weight) == parameter_id
@@ -279,7 +275,6 @@ def test_candidate_install_is_in_place_and_preserves_shared_embedding(
         "active": True,
         "worker_rank": 0,
         "draft_revision": "draft-step-7",
-        "weights_sha256": weights_sha256,
         "tensor_count": 1,
     }
 
@@ -287,19 +282,11 @@ def test_candidate_install_is_in_place_and_preserves_shared_embedding(
 def test_direct_candidate_install_rejects_target_owned_head() -> None:
     _target, draft, runner = _runner_with_shared_embedding()
     candidate = {"lm_head.weight": torch.ones_like(draft.lm_head.weight)}
-    metadata = {
-        "draft_revision": "draft-step-7",
-        "weights_sha256": "payload-digest",
-        "tensor_inventory": {
-            "lm_head.weight": {
-                "shape": list(draft.lm_head.weight.shape),
-                "dtype": str(draft.lm_head.weight.dtype),
-            }
-        },
-    }
 
-    with pytest.raises(ValueError, match="target-owned tensors"):
-        runner.install_online_eagle_speculator_tensors(metadata, candidate)
+    with pytest.raises(ValueError, match="target-owned tensor"):
+        runner.install_online_eagle_speculator_weights(
+            "draft-step-7", iter(candidate.items())
+        )
 
 
 def test_target_sync_refreshes_draft_vocabulary_head() -> None:
