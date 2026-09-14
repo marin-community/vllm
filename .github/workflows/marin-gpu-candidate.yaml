@@ -150,25 +150,31 @@ jobs:
           done < <(git tag --points-at "$GITHUB_SHA")
           git tag "$VERSION_TAG" "$GITHUB_SHA"
 
+          printf '%s\n' \
+            "Source: $GITHUB_SHA" \
+            "Upstream base: $UPSTREAM_BASE" \
+            "Build base: ${{ matrix.build_base_image }}" \
+            "CUDA: ${{ matrix.cuda_version }}; SM targets: ${{ matrix.sm_targets }}" \
+            "MAX_JOBS: ${{ matrix.max_jobs }}; NVCC_THREADS: ${{ matrix.nvcc_threads }}"
+
           {
             echo "upstream_base=${UPSTREAM_BASE}"
             echo "base_image_digest=${{ matrix.build_base_image }}"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } >> "$GITHUB_OUTPUT"
 
-      # Persist the compiler cache (compact object outputs, not the multi-GB base
-      # layers) across runs. Our overlay only touches Python, so at a fixed base an
-      # overlay-only rebuild is an all-hit ccache pass that finishes in minutes; the
-      # first build at a new base is a full cold compile that seeds the cache. Both
+      # Persist compiler outputs, not the multi-GB base layers. sccache hashes the
+      # compiler, flags, environment, architecture, and preprocessed native inputs,
+      # so this cache can span commits without reusing incompatible outputs. These
       # steps are best-effort so a cache hiccup never fails the pin-critical build.
       - name: Restore the CUDA compile cache
         continue-on-error: true
         uses: actions/cache@v4
         with:
-          path: ccache-cache
-          key: marin-vllm-cu132-ccache-${{ matrix.architecture }}-${{ github.sha }}
+          path: sccache-cache
+          key: marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-${{ github.sha }}
           restore-keys: |
-            marin-vllm-cu132-ccache-${{ matrix.architecture }}-
+            marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-
 
       - name: Load the compile cache into the builder
         continue-on-error: true
@@ -176,12 +182,14 @@ jobs:
         with:
           cache-map: |
             {
-              "ccache-cache": "/root/.cache/ccache"
+              "sccache-cache": "/root/.cache/sccache"
             }
 
       - name: Build and export the CUDA 13.2 wheel
         run: |
           mkdir -p artifacts
+          # GitHub Actions transports the mounted local cache. Clear upstream's
+          # default S3 bucket so sccache uses that directory instead.
           docker buildx build \
             --target marin-wheel-export \
             --output type=local,dest=artifacts \
@@ -194,6 +202,8 @@ jobs:
             --build-arg max_jobs="${{ matrix.max_jobs }}" \
             --build-arg VLLM_MAX_SIZE_MB="${{ matrix.max_wheel_size_mb }}" \
             --build-arg nvcc_threads="${{ matrix.nvcc_threads }}" \
+            --build-arg USE_SCCACHE=1 \
+            --build-arg SCCACHE_BUCKET_NAME= \
             --build-arg GIT_REPO_CHECK=1 \
             --build-arg RUN_WHEEL_CHECK=true \
             --progress plain \
