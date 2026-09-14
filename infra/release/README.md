@@ -12,7 +12,7 @@ images, deployment-specific SM targets, Iris validation hardware, and the digest
 multi-architecture validation image. Update the config and workflows in one PR
 when an ABI changes.
 
-The x86_64 build reuses the `wheel-build` target in
+The x86_64 and aarch64 builds reuse the `wheel-build` target in
 [`docker/Dockerfile`](../../docker/Dockerfile). That is the same build path
 used by upstream's release pipeline. Release code does not edit
 `requirements/cuda.txt`, `requirements/build/cuda.txt`, or the `vllm`
@@ -20,44 +20,53 @@ distribution metadata. A final scratch stage contains only `/dist`; BuildKit
 exports that directory directly instead of loading the build image into the
 runner's Docker image store.
 
-The wheel targets SM90 on x86_64 H100. This release does not build or qualify
-an aarch64 vLLM wheel. The configured H100 validation gates must all pass.
-Compilation uses two jobs with one NVCC thread each and an 800 MiB wheel limit.
+The x86_64 wheel targets SM90 on H100, and the aarch64 wheel targets SM100 on
+GB200. Every configured validation gate must pass. Compilation uses two jobs
+with one NVCC thread each and an 800 MiB wheel limit.
 
 `gpu-constraints.txt` pins the Python build and runtime dependencies for CPython
-3.12 on Linux x86_64. Both the release Docker build and wheel validation consume
-it. Its direct inputs live in `gpu-constraints.in`, including the Transformers
-and Tokenizers versions qualified by the selected upstream CUDA test environment.
-Regenerate it from the repository root with:
+3.12 on manylinux 2.28 for both architectures. The release Docker build and
+wheel validation consume it. Its direct inputs live in `gpu-constraints.in`,
+including one `torchaudio==2.11.0+cpu` constraint and the Transformers and
+Tokenizers versions qualified by the selected upstream CUDA test environment.
+The generated file records the PyPI, CUDA 13.2, CPU Torch, and FlashInfer
+indexes. uv selects compatible wheels for the builder architecture from those
+indexes.
+
+Use uv 0.11.21 and regenerate the file from the repository root with:
 
 ```bash
 uv pip compile infra/release/gpu-constraints.in \
   --index-strategy unsafe-best-match \
   --index https://download.pytorch.org/whl/cu132 \
+  --index https://download.pytorch.org/whl/cpu \
   --index https://flashinfer.ai/whl/ \
   --python-platform x86_64-manylinux_2_28 \
   --python-version 3.12 \
   --output-file infra/release/gpu-constraints.txt \
-  --no-annotate --no-header --upgrade
+  --emit-index-url --no-annotate --no-header
 ```
 
-The toolkit extras pin the compiler and headers used by runtime JIT
-compilation. Preserve the direct
-TorchAudio CPU wheel constraint: the available CUDA 13.0 TorchAudio wheel
-rejects Torch cu132, while audio preprocessing uses Torch's tensor operators.
+The checked-in output seeds regeneration, so this command retains the frozen
+dependency closure. Use `--upgrade` only when intentionally requalifying that
+closure. The same inputs resolve for `aarch64-manylinux_2_28`; only the selected
+platform wheel changes. The toolkit extras pin the compiler and headers used by
+runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the
+available CUDA 13.0 TorchAudio wheel rejects Torch cu132, while audio
+preprocessing uses Torch's tensor operators.
 
-The x86_64 candidate job removes unused Android, .NET, and GHC toolchains from
-its ephemeral hosted runner before compiling. The wheel-only BuildKit export
-also avoids duplicating the build toolchains and intermediate objects in the
+Each candidate job removes unused Android, .NET, and GHC toolchains from its
+ephemeral hosted runner before compiling. The wheel-only BuildKit export also
+avoids duplicating the build toolchains and intermediate objects in the
 runner's Docker image store. Together these keep compilation and artifact
 export within the hosted runners' root filesystems.
 
 ## GPU candidate publication
 
 [`marin-gpu-candidate.yaml`](../../.github/workflows/marin-gpu-candidate.yaml)
-runs on every merge to `main`. It builds the H100 native wheel, derives the
-manylinux tag from each wheel's ELF symbols, and publishes a prerelease named
-`marin-vllm-gpu-candidate-<12-character-sha>`.
+runs on every merge to `main`. It builds x86_64 SM90 and aarch64 SM100 wheels,
+derives the manylinux tag from each wheel's ELF symbols, and publishes a
+prerelease named `marin-vllm-gpu-candidate-<12-character-sha>`.
 
 The candidate manifest records:
 
@@ -76,12 +85,15 @@ candidate instead of replacing it.
 on a schedule and through `workflow_dispatch`. The optional `candidate_tag`
 input selects an exact candidate; an empty input selects the newest candidate.
 
-The workflow qualifies the x86_64 wheel on H100:
+The workflow qualifies both wheels on their configured hardware:
 
 - H100x1 on `cw-rno2a` installs the x86_64 wheel, checks `_C` and
   `GrugMoeForCausalLM`, validates the sparse NCCL trainer and worker contract,
   allocates through cuMem, runs the Marin delta tests, and serves
   Qwen/Qwen3-0.6B against the H100 spec.
+- GB200x1 on `cw-us-east-08a` installs the aarch64 wheel, checks `_C` and
+  `GrugMoeForCausalLM`, allocates through cuMem, and serves Qwen/Qwen3-0.6B
+  against the GB200 spec.
 
 An absent cuMem extension is recorded as `absent` and fails promotion. Iris
 setup failures and missing validation output also become explicit failed JSON
@@ -90,14 +102,14 @@ records.
 The runtime probe and serving process run with the temporary venv outside the
 checkout. The workflow extracts the candidate commit's tests and serving smoke
 into a separate validation-source tree, while the release harness comes from
-the workflow commit. The H100 test runner imports and verifies `vllm` from the
-venv before adding that tree to `sys.path` for the `tests` package. It keeps its
-working directory outside the tree as well, so model-inspection subprocesses
-also import the wheel instead of an unbuilt source package.
+the workflow commit. Each validation runner imports and verifies `vllm` from
+the venv before adding that tree to `sys.path` for the `tests` package. It keeps
+its working directory outside the tree as well, so model-inspection
+subprocesses also import the wheel instead of an unbuilt source package.
 
-The H100 result must pass before the workflow creates
+Both GPU results must pass before the workflow creates
 `marin-vllm-gpu-<UTC-date>-<12-character-sha>`. The final release contains the
-unchanged candidate wheel, its validation record, and a final manifest that
+unchanged candidate wheels, their validation records, and a final manifest that
 binds every result to a wheel digest. The workflow never overwrites an existing
 release tag or asset.
 
