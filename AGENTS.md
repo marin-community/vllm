@@ -55,11 +55,16 @@ infra/pre-commit.py --changed-files    # diff-scoped, for local iteration
 
 ## Refreshes
 
-Marin pins this fork by exact SHA in `marin`'s root `pyproject.toml`, alongside a
-matching `tpu-inference` SHA; the two move together. Refreshes rebase the delta
-onto a newer upstream base and re-pin both, driven by marin's
-`.agents/skills/refresh-tpu-vllm-forks/SKILL.md`. A smaller delta is a cheaper
-refresh.
+`main` is the only maintained Marin vLLM source branch. GPU releases build an
+immutable wheel from an exact `main` commit. TPU releases build a separate wheel
+from an exact commit on the same lineage and pair it with an exact
+`tpu-inference` commit. The device-specific wheels and dependency environments
+remain independent.
+
+Marin records both TPU source SHAs in `config/external/vllm/tpu.toml` and the
+promoted GPU artifact in `config/external/vllm/gpu.toml`. Refreshes follow
+Marin's `.agents/skills/refresh-fork/SKILL.md`; they never stage or promote a
+`tpu` or `tpu-next` branch in this repository.
 
 ## Install, test, run
 

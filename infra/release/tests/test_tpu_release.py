@@ -11,6 +11,7 @@ from infra.release.tpu_release import (
     assemble_candidate,
     finalize_release,
     release_tag,
+    validate_qualification_run,
     validate_release,
 )
 
@@ -18,11 +19,11 @@ CONFIG_PATH = Path(__file__).parents[1] / "tpu_config.json"
 WORKFLOW_COMMIT = "c" * 40
 VLLM_COMMIT = "a" * 40
 TPU_INFERENCE_COMMIT = "b" * 40
-EXCLUDE_NEWER = "2026-08-12T00:00:00Z"
+EXCLUDE_NEWER = "2026-09-13T03:00:00Z"
 CREATED_AT = "2026-08-08T00:30:00Z"
 RUN_URL = "https://github.com/marin-community/vllm/actions/runs/123"
 VLLM_VERSION = "0.20.1rc1.dev0+marin.aaaaaaaaaaaa.tpu"
-TPU_INFERENCE_VERSION = "0.26.0+marin.bbbbbbbbbbbb"
+TPU_INFERENCE_VERSION = "0.29.0+marin.bbbbbbbbbbbb"
 
 
 def _write_wheel(
@@ -83,6 +84,18 @@ def _validation(candidate: dict) -> dict:
     }
 
 
+def _run_metadata(candidate: dict, run_id: str = "456") -> dict:
+    return {
+        "id": int(run_id),
+        "conclusion": "success",
+        "event": "workflow_dispatch",
+        "head_sha": candidate["workflow"]["commit"],
+        "path": ".github/workflows/marin-gpu-release.yaml",
+        "html_url": f"https://github.com/marin-community/vllm/actions/runs/{run_id}",
+        "repository": {"full_name": "marin-community/vllm"},
+    }
+
+
 def test_candidate_identity_changes_with_wheel_bytes(tmp_path: Path):
     before = _candidate(tmp_path / "before")
     wheels = _wheels(tmp_path / "after")
@@ -139,4 +152,66 @@ def test_promotion_rejects_qualification_for_different_candidate(tmp_path: Path)
             validation=validation,
             tag=release_tag(candidate),
             published_at="2026-08-09T00:00:00Z",
+        )
+
+
+def test_reusable_qualification_is_bound_to_successful_exact_workflow_run(
+    tmp_path: Path,
+):
+    config = load_json(CONFIG_PATH)
+    candidate = _candidate(tmp_path)
+    validate_qualification_run(
+        _run_metadata(candidate),
+        _validation(candidate),
+        candidate,
+        config,
+        repository="marin-community/vllm",
+        run_id="456",
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("conclusion", "failure", "conclusion"),
+        ("event", "push", "event"),
+        ("head_sha", "d" * 40, "workflow commit"),
+        ("path", ".github/workflows/other.yaml", "workflow path"),
+        ("html_url", "https://github.com/marin-community/vllm/actions/runs/999", "URL"),
+    ],
+)
+def test_reusable_qualification_rejects_different_run_metadata(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+):
+    config = load_json(CONFIG_PATH)
+    candidate = _candidate(tmp_path)
+    run_metadata = _run_metadata(candidate)
+    run_metadata[field] = value
+    with pytest.raises(ReleaseError, match=message):
+        validate_qualification_run(
+            run_metadata,
+            _validation(candidate),
+            candidate,
+            config,
+            repository="marin-community/vllm",
+            run_id="456",
+        )
+
+
+def test_reusable_qualification_rejects_result_for_another_run(tmp_path: Path):
+    config = load_json(CONFIG_PATH)
+    candidate = _candidate(tmp_path)
+    validation = _validation(candidate)
+    validation["run_url"] = "https://github.com/marin-community/vllm/actions/runs/999"
+    with pytest.raises(ReleaseError, match="result URL"):
+        validate_qualification_run(
+            _run_metadata(candidate),
+            validation,
+            candidate,
+            config,
+            repository="marin-community/vllm",
+            run_id="456",
         )
