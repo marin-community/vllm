@@ -4,7 +4,7 @@ The GPU release flow publishes `vllm` wheels under commit-addressed Marin vLLM
 GitHub release tags. It does not publish a `marin-vllm` distribution or maintain
 a moving `latest` alias.
 
-## Build configuration
+## GPU build configuration
 
 [`config.json`](config.json) is the release ABI contract. It pins CPython 3.12,
 Torch 2.13.0+cu132, CUDA 13.2.1, digest-pinned upstream manylinux builder
@@ -52,7 +52,7 @@ also avoids duplicating the build toolchains and intermediate objects in the
 runner's Docker image store. Together these keep compilation and artifact
 export within the hosted runners' root filesystems.
 
-## Candidate publication
+## GPU candidate publication
 
 [`marin-gpu-candidate.yaml`](../../.github/workflows/marin-gpu-candidate.yaml)
 runs on every merge to `main`. It builds the H100 native wheel, derives the
