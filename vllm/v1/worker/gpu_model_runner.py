@@ -3446,15 +3446,22 @@ class GPUModelRunner(
         if draft_model is None:
             raise RuntimeError("Online EAGLE snapshot requires a resident draft model")
         state = draft_model.state_dict()
-        missing = set(tensor_names) - set(state)
+        resolved_names = {
+            name: name if name in state else f"model.{name}" for name in tensor_names
+        }
+        missing = {
+            name
+            for name, resolved_name in resolved_names.items()
+            if resolved_name not in state
+        }
         if missing:
             raise ValueError(
                 "Online EAGLE snapshot names are absent from the draft: "
                 + ", ".join(sorted(missing))
             )
         return {
-            name: state[name].detach().to(device="cpu").contiguous().clone()
-            for name in tensor_names
+            name: state[resolved_name].detach().to(device="cpu").contiguous().clone()
+            for name, resolved_name in resolved_names.items()
         }
 
     def refresh_online_eagle_target_owned_weights(self) -> None:
