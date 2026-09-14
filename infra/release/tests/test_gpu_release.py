@@ -78,6 +78,26 @@ def test_candidate_build_ignores_release_only_changes():
     }
 
 
+def test_candidate_gpu_modes_keep_single_architecture_builds_nonpublishing():
+    workflow = yaml.load(
+        GPU_CANDIDATE_WORKFLOW_PATH.read_text(), Loader=yaml.BaseLoader
+    )
+    inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    publish = workflow["jobs"]["publish"]
+    gpu_mode = inputs["gpu_mode"]
+
+    assert gpu_mode["type"] == "choice"
+    assert gpu_mode["default"] == "publish"
+    assert gpu_mode["options"] == [
+        "publish",
+        "qualify-x86_64",
+        "qualify-aarch64",
+    ]
+    assert publish["if"] == (
+        "github.event_name == 'push' || inputs.gpu_mode == 'publish'"
+    )
+
+
 def test_server_command_pins_requested_attention_backend():
     command = server_command("Qwen/Qwen3-0.6B", 8000, "FLASH_ATTN")
 
