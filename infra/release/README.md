@@ -1,4 +1,4 @@
-# Marin vLLM GPU releases
+# Marin vLLM releases
 
 The GPU release flow publishes `vllm` wheels under commit-addressed Marin vLLM
 GitHub release tags. It does not publish a `marin-vllm` distribution or maintain
@@ -107,4 +107,39 @@ Dispatch a specific candidate with:
 gh workflow run marin-gpu-release.yaml \
   --repo marin-community/vllm \
   -f candidate_tag=marin-vllm-gpu-candidate-0123456789ab
+```
+
+## TPU wheel pairs
+
+The TPU lane uses the same `main` source lineage and builds a separate vLLM
+wheel with its own Torch, JAX, and libtpu environment. It never consumes or
+promotes a `tpu` branch. `marin-gpu-candidate.yaml` accepts full vLLM and
+tpu-inference commits plus a UTC dependency cutoff, builds both wheels once,
+and publishes an immutable content-addressed prerelease and manifest.
+
+`marin-gpu-release.yaml` redownloads that exact pair, verifies its hashes,
+cold-installs it from the candidate index, and runs the Qwen3-0.6B TP8 gate on
+one `v6e-8` in `us-east5`. A qualification dispatch with `promote=false` records
+the physical TPU result without finalizing a release. Promotion reuses the same
+candidate bytes.
+
+The GPU and TPU lanes are dispatched separately. Advancing tpu-inference does
+not rebuild a GPU wheel, and promoting a GPU candidate does not rebuild the TPU
+pair.
+
+```bash
+gh workflow run marin-gpu-candidate.yaml \
+  --repo marin-community/vllm \
+  --ref <reviewed-workflow-ref> \
+  -f lane=tpu \
+  -f vllm_commit=<full-main-line-source-sha> \
+  -f tpu_inference_commit=<full-tpu-inference-sha> \
+  -f exclude_newer=<whole-second-utc-cutoff>
+
+gh workflow run marin-gpu-release.yaml \
+  --repo marin-community/vllm \
+  --ref <same-reviewed-workflow-ref> \
+  -f lane=tpu \
+  -f candidate_tag=<exact-candidate-tag> \
+  -f promote=false
 ```

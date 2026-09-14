@@ -5,7 +5,7 @@
   "vllm_target_device": "tpu",
   "package_versions": {
     "vllm": {"base": "0.20.1rc1.dev0", "suffix": ".tpu"},
-    "tpu-inference": {"base": "0.26.0", "suffix": ""}
+    "tpu-inference": {"base": "0.29.0", "suffix": ""}
   },
   "validation": {
     "hardware": "v6e-8",
