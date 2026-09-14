@@ -523,7 +523,6 @@ class OnlineEagleCapture:
         return {
             "format": "vllm-online-eagle-capture",
             "format_version": _FORMAT_VERSION,
-            "active": True,
             "step": self.config.step,
             "worker_rank": self.config.worker_rank,
             "target_revision": self.config.target_revision,

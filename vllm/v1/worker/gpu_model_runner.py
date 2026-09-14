@@ -1215,7 +1215,7 @@ class GPUModelRunner(
         req_id: str,
         req_state: CachedRequestState | None,
     ) -> None:
-        """Finalize request-scoped capture before platform cleanup."""
+        """Finalize capture data before the scheduler drops request state."""
         capture = self.online_eagle_capture
         if capture is not None and req_state is not None:
             capture.finalize_request(req_id, req_state.output_token_ids)
@@ -3376,9 +3376,7 @@ class GPUModelRunner(
         resolved = dict(config)
         resolved["worker_rank"] = self.parallel_config.data_parallel_rank
         resolved.setdefault("max_window_tokens", self.effective_drafter_max_model_len)
-        resolved.setdefault(
-            "aux_layer_ids", list(self._get_eagle3_aux_layers_from_config())
-        )
+        resolved["aux_layer_ids"] = list(self._get_eagle3_aux_layers_from_config())
         capture_config = OnlineEagleCaptureConfig.from_mapping(resolved)
         self.online_eagle_capture = OnlineEagleCapture(capture_config)
         return {
@@ -3426,7 +3424,9 @@ class GPUModelRunner(
         draft_model = self.get_draft_model()
         if draft_model is None:
             return
-        if getattr(draft_model, "draft_id_to_target_id", None) is None:
+        if not isinstance(
+            getattr(draft_model, "draft_id_to_target_id", None), torch.Tensor
+        ):
             return
         target_head = target_head_weight(self.get_model())
         draft_parameters = dict(draft_model.named_parameters())
