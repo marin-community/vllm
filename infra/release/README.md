@@ -120,8 +120,10 @@ and publishes an immutable content-addressed prerelease and manifest.
 `marin-gpu-release.yaml` redownloads that exact pair, verifies its hashes,
 cold-installs it from the candidate index, and runs the Qwen3-0.6B TP8 gate on
 one `v6e-8` in `us-east5`. A qualification dispatch with `promote=false` records
-the physical TPU result without finalizing a release. Promotion reuses the same
-candidate bytes.
+the physical TPU result without finalizing a release. Later promotion accepts
+that successful qualification run's exact ID, revalidates its GitHub metadata
+and artifact against the candidate, and reuses the same candidate bytes without
+allocating another TPU.
 
 The GPU and TPU lanes are dispatched separately. Advancing tpu-inference does
 not rebuild a GPU wheel, and promoting a GPU candidate does not rebuild the TPU
@@ -142,4 +144,13 @@ gh workflow run marin-gpu-release.yaml \
   -f lane=tpu \
   -f candidate_tag=<exact-candidate-tag> \
   -f promote=false
+
+# After source and consumer changes land, reuse the accepted qualification.
+gh workflow run marin-gpu-release.yaml \
+  --repo marin-community/vllm \
+  --ref main \
+  -f lane=tpu \
+  -f candidate_tag=<same-exact-candidate-tag> \
+  -f qualification_run_id=<successful-qualification-run-id> \
+  -f promote=true
 ```

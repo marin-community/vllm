@@ -427,6 +427,45 @@ def validate_result(
         raise ReleaseError("qualification hardware changed")
 
 
+def validate_qualification_run(
+    run_metadata: dict[str, Any],
+    result: dict[str, Any],
+    candidate: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    repository: str,
+    run_id: str,
+) -> None:
+    """Bind a reusable validation artifact to its successful workflow run."""
+    if repository != RELEASE_REPOSITORY:
+        raise ReleaseError("qualification repository changed")
+    if not run_id.isascii() or not run_id.isdigit() or run_id.startswith("0"):
+        raise ReleaseError("qualification run ID must be a positive integer")
+    expected_url = f"https://github.com/{repository}/actions/runs/{run_id}"
+    expected_workflow_commit = candidate.get("workflow", {}).get("commit")
+    run_repository = run_metadata.get("repository", {})
+    if not isinstance(run_repository, dict):
+        raise ReleaseError("qualification run repository is malformed")
+    checks = (
+        (str(run_metadata.get("id")), run_id, "ID"),
+        (run_metadata.get("conclusion"), "success", "conclusion"),
+        (run_metadata.get("event"), "workflow_dispatch", "event"),
+        (run_metadata.get("head_sha"), expected_workflow_commit, "workflow commit"),
+        (
+            run_metadata.get("path"),
+            ".github/workflows/marin-gpu-release.yaml",
+            "workflow path",
+        ),
+        (run_metadata.get("html_url"), expected_url, "URL"),
+        (run_repository.get("full_name"), repository, "repository"),
+        (result.get("run_url"), expected_url, "result URL"),
+    )
+    for observed, expected, name in checks:
+        if observed != expected:
+            raise ReleaseError(f"qualification run {name} changed")
+    validate_result(result, candidate, config)
+
+
 def extract_validation(log: Path) -> dict[str, Any]:
     """Read the final structured TPU qualification record from an Iris log."""
     records = [
@@ -584,6 +623,14 @@ def _parser() -> argparse.ArgumentParser:
     result.add_argument("--candidate", type=Path, required=True)
     result.add_argument("--config", type=Path, required=True)
 
+    reusable_result = commands.add_parser("validate-qualification-run")
+    reusable_result.add_argument("--run-metadata", type=Path, required=True)
+    reusable_result.add_argument("--result", type=Path, required=True)
+    reusable_result.add_argument("--candidate", type=Path, required=True)
+    reusable_result.add_argument("--config", type=Path, required=True)
+    reusable_result.add_argument("--repository", required=True)
+    reusable_result.add_argument("--run-id", required=True)
+
     run = commands.add_parser("run-with-index")
     run.add_argument("--index", type=Path, required=True)
     run.add_argument("argv", nargs=argparse.REMAINDER)
@@ -652,6 +699,15 @@ def main() -> int:
                 load_json(args.result),
                 load_json(args.candidate),
                 load_json(args.config),
+            )
+        elif args.command == "validate-qualification-run":
+            validate_qualification_run(
+                load_json(args.run_metadata),
+                load_json(args.result),
+                load_json(args.candidate),
+                load_json(args.config),
+                repository=args.repository,
+                run_id=args.run_id,
             )
         elif args.command == "run-with-index":
             command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv

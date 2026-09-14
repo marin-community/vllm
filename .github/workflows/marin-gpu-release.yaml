@@ -25,6 +25,10 @@ on:
         default: false
         required: false
         type: boolean
+      qualification_run_id:
+        description: "Successful TPU qualification run to reuse during promotion"
+        required: false
+        type: string
       model:
         description: "HF model id for the GPU serving smoke"
         default: Qwen/Qwen3-0.6B
@@ -446,6 +450,7 @@ jobs:
         id: candidate
         env:
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          QUALIFICATION_RUN_ID: ${{ inputs.qualification_run_id }}
         run: |
           if [[ -z "$CANDIDATE_TAG" ]]; then
             echo "The TPU lane requires an exact candidate tag." >&2
@@ -462,7 +467,7 @@ jobs:
             --expected-tag "$CANDIDATE_TAG"
           WORKFLOW_COMMIT=$(jq -r '.workflow.commit' \
             candidate/marin-vllm-tpu-manifest.json)
-          if [[ "$WORKFLOW_COMMIT" != "$GITHUB_SHA" ]]; then
+          if [[ -z "$QUALIFICATION_RUN_ID" && "$WORKFLOW_COMMIT" != "$GITHUB_SHA" ]]; then
             echo "Candidate was built by $WORKFLOW_COMMIT, not this workflow revision $GITHUB_SHA." >&2
             echo "Build a new candidate after changing producer, manifest, or qualification code." >&2
             exit 1
@@ -492,6 +497,7 @@ jobs:
   validate_tpu:
     name: Qualify public TPU wheel pair on ${{ needs.resolve_tpu.outputs.hardware }}
     needs: resolve_tpu
+    if: inputs.qualification_run_id == ''
     runs-on: ubuntu-latest
     timeout-minutes: 80
     permissions:
@@ -635,16 +641,21 @@ jobs:
     name: Publish qualified TPU release
     needs: [resolve_tpu, validate_tpu]
     if: >-
+      always() &&
       github.event_name == 'workflow_dispatch' &&
-      inputs.lane == 'tpu' && inputs.promote == true
+      inputs.lane == 'tpu' && inputs.promote == true &&
+      needs.resolve_tpu.result == 'success' &&
+      (needs.validate_tpu.result == 'success' || inputs.qualification_run_id != '')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
+      actions: read
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       CANDIDATE_TAG: ${{ needs.resolve_tpu.outputs.candidate_tag }}
       RELEASE_TAG: ${{ needs.resolve_tpu.outputs.release_tag }}
+      QUALIFICATION_RUN_ID: ${{ inputs.qualification_run_id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -654,11 +665,6 @@ jobs:
 
       - name: Create the metadata environment
         run: uv venv --python 3.12
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: marin-vllm-tpu-validation
-          path: validation
 
       - name: Download and verify exact candidate assets
         run: |
@@ -672,6 +678,35 @@ jobs:
             --directory candidate \
             --expected-tag "$CANDIDATE_TAG"
           cp candidate/*.whl release/
+
+      - name: Download this run's qualification
+        if: inputs.qualification_run_id == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: marin-vllm-tpu-validation
+          path: validation
+
+      - name: Download and verify the accepted qualification
+        if: inputs.qualification_run_id != ''
+        run: |
+          if [[ ! "$QUALIFICATION_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "qualification_run_id must be a positive GitHub Actions run ID." >&2
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QUALIFICATION_RUN_ID" \
+            > qualification-run.json
+          mkdir validation
+          gh run download "$QUALIFICATION_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name marin-vllm-tpu-validation \
+            --dir validation
+          .venv/bin/python infra/release/tpu_release.py validate-qualification-run \
+            --run-metadata qualification-run.json \
+            --result validation/marin-vllm-tpu-validation.json \
+            --candidate candidate/marin-vllm-tpu-manifest.json \
+            --config "$TPU_RELEASE_CONFIG" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$QUALIFICATION_RUN_ID"
 
       - name: Finalize and verify the release manifest
         run: |
