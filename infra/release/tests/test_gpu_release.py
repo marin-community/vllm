@@ -321,6 +321,10 @@ def test_build_matrix_targets_only_the_validated_gpu():
 
     matrix = build_matrix(config)
 
+    assert {item["architecture"] for item in matrix["include"]} == {
+        "x86_64",
+        "aarch64",
+    }
     for item in matrix["include"]:
         platform = config["platforms"][item["architecture"]]
         assert item["sm_targets"] == platform["validation"]["compute_capability"]
@@ -348,13 +352,13 @@ def release_fixture(tmp_path: Path) -> tuple[dict, dict, list[dict], dict]:
 
 
 def test_release_binds_passed_gpu_results_to_candidate_wheel_digests(tmp_path):
-    _, _, _, manifest = release_fixture(tmp_path)
+    config, _, _, manifest = release_fixture(tmp_path)
 
     assert manifest["release"]["status"] == "released"
     assert manifest["release"]["candidate_tag"] == CANDIDATE_TAG
     assert manifest["validation"]["status"] == "passed"
     assert {item["architecture"] for item in manifest["validation"]["targets"]} == {
-        "x86_64",
+        *config["platforms"],
     }
     for platform in manifest["platforms"]:
         assert f"/{manifest['release']['tag']}/" in platform["wheel"]["url"]
