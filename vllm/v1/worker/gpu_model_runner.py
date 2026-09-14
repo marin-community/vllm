@@ -3337,32 +3337,6 @@ class GPUModelRunner(
             raise RuntimeError("Online EAGLE candidate broadcast returned no data")
         return self.install_online_eagle_speculator_tensors(metadata, candidate)
 
-    def snapshot_online_eagle_speculator(
-        self, tensor_names: Sequence[str]
-    ) -> dict[str, torch.Tensor]:
-        """Copy the current draft-owned tensors to host for transactional rollback."""
-        draft_model = self.get_draft_model()
-        if draft_model is None:
-            raise RuntimeError("Online EAGLE snapshot requires a resident draft model")
-        state = draft_model.state_dict()
-        resolved_names = {
-            name: name if name in state else f"model.{name}" for name in tensor_names
-        }
-        missing = {
-            name
-            for name, resolved_name in resolved_names.items()
-            if resolved_name not in state
-        }
-        if missing:
-            raise ValueError(
-                "Online EAGLE snapshot names are absent from the draft: "
-                + ", ".join(sorted(missing))
-            )
-        return {
-            name: state[resolved_name].detach().to(device="cpu").contiguous().clone()
-            for name, resolved_name in resolved_names.items()
-        }
-
     def refresh_online_eagle_target_owned_weights(self) -> None:
         """Refresh the draft-vocabulary head after target policy synchronization."""
         draft_model = self.get_draft_model()
