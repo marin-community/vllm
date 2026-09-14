@@ -4013,14 +4013,12 @@ def test_eagle3_hybrid_draft_layers_share_one_block_table(draft_depth):
         for index in range(26)
     }
     draft_names = {
-        f"model.layers.{index}.self_attn.attn"
-        for index in range(26, 26 + draft_depth)
+        f"model.layers.{index}.self_attn.attn" for index in range(26, 26 + draft_depth)
     }
     specs.update({name: sliding for name in draft_names})
-    config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=26)),
-        speculative_config=None,
+    config = _grouping_config()
+    config.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hidden_layers=26)
     )
     baseline = get_kv_cache_groups(config, specs.copy())
     config.speculative_config = SimpleNamespace(
@@ -4028,12 +4026,18 @@ def test_eagle3_hybrid_draft_layers_share_one_block_table(draft_depth):
         draft_model_config=SimpleNamespace(
             hf_config=SimpleNamespace(num_hidden_layers=draft_depth)
         ),
+        use_eagle=lambda: True,
+        use_eagle_block_drop=lambda: True,
     )
 
     groups = get_kv_cache_groups(config, specs.copy())
 
-    assert sum(bool(draft_names.intersection(group.layer_names)) for group in groups) == 1
-    assert sorted(name for group in groups for name in group.layer_names) == sorted(specs)
+    assert (
+        sum(bool(draft_names.intersection(group.layer_names)) for group in groups) == 1
+    )
+    assert sorted(name for group in groups for name in group.layer_names) == sorted(
+        specs
+    )
     assert [len(group.layer_names) for group in groups] == [
         len(group.layer_names) for group in baseline
     ]

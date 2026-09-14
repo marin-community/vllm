@@ -1797,8 +1797,8 @@ class SpecDecodeBaseProposer:
         )
         num_tokens_padded = batch_desc.num_tokens
 
-        # Extra coordination when running data-parallel since we need to
-        # coordinate across ranks
+        # Draft replicas with independent shapes reuse the local padded count;
+        # synchronized draft replicas coordinate the padded shape across DP.
         # TODO(Flechman): support DBO ubatching
         should_ubatch, num_tokens_across_dp = False, None
         data_parallel_size = self.vllm_config.parallel_config.data_parallel_size

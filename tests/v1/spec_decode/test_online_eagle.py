@@ -68,29 +68,42 @@ def _states(values: list[int]) -> tuple[list[torch.Tensor], torch.Tensor]:
     return aux, torch.cat([base + 400, base + 500], dim=-1)
 
 
+def _capture_config(**overrides) -> OnlineEagleCaptureConfig:
+    values = {
+        "step": 1,
+        "max_tokens": 32,
+        "max_window_tokens": 8,
+        "max_sequences_per_prompt_group": 1,
+        "trainer_rank": 0,
+        "worker_rank": 0,
+        "target_revision": "target-0",
+        "draft_revision": "draft-0",
+        "aux_layer_ids": [2, 13, 23],
+    }
+    values.update(overrides)
+    return OnlineEagleCaptureConfig.from_mapping(values)
+
+
+def _runner_with_shared_embedding() -> tuple[_TargetModel, _DraftModel, GPUModelRunner]:
+    target = _TargetModel()
+    draft = _DraftModel(target.model.embed_tokens)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model = target
+    runner.drafter = SimpleNamespace(model=draft)
+    runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
+    return target, draft, runner
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA side streams")
 def test_async_capture_copy_survives_source_allocator_reuse() -> None:
-    capture = OnlineEagleCapture(
-        OnlineEagleCaptureConfig.from_mapping(
-            {
-                "step": 1,
-                "max_tokens": 32,
-                "max_window_tokens": 8,
-                "max_sequences_per_prompt_group": 1,
-                "trainer_rank": 0,
-                "worker_rank": 0,
-                "target_revision": "target-0",
-                "draft_revision": "draft-0",
-                "aux_layer_ids": [2, 13, 23],
-            }
-        )
-    )
+    capture = OnlineEagleCapture(_capture_config())
     values = torch.arange(4096, device="cuda", dtype=torch.float32)
     aux = [values[:, None] + offset for offset in (100, 200, 300)]
     head = torch.stack((values + 400, values + 500), dim=-1)
     expected_rows = [17, 2049, 4095]
 
-    tokens, selected_aux, selected_head, event = capture._copy_selected_rows(
+    copied = capture._copy_selected_rows(
+        rows=[("request", position) for position in expected_rows],
         selected_rows=expected_rows,
         input_ids=values.to(torch.long),
         aux_hidden_states=aux,
@@ -106,12 +119,12 @@ def test_async_capture_copy_survives_source_allocator_reuse() -> None:
                 torch.full((3, 2), -1.0, device="cuda"),
             )
         )
-    assert event is not None
-    event.synchronize()
+    assert copied.event is not None
+    copied.event.synchronize()
 
-    assert tokens.tolist() == expected_rows
-    assert selected_aux[:, 0].tolist() == [117.0, 2149.0, 4195.0]
-    assert selected_head[:, 0].tolist() == [417.0, 2449.0, 4495.0]
+    assert copied.token_ids.tolist() == expected_rows
+    assert copied.aux_hidden_states[:, 0].tolist() == [117.0, 2149.0, 4195.0]
+    assert copied.head_input_hidden_states[:, 0].tolist() == [417.0, 2449.0, 4495.0]
     # Retain these allocations through synchronization so the CUDA allocator
     # gets a chance to reuse the released source blocks.
     del allocator_pressure
@@ -120,18 +133,10 @@ def test_async_capture_copy_survives_source_allocator_reuse() -> None:
 def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
     tmp_path,
 ) -> None:
-    config = OnlineEagleCaptureConfig.from_mapping(
-        {
-            "step": 7,
-            "max_tokens": 32,
-            "max_window_tokens": 8,
-            "max_sequences_per_prompt_group": 1,
-            "trainer_rank": 0,
-            "worker_rank": 0,
-            "target_revision": "target-6",
-            "draft_revision": "draft-6",
-            "aux_layer_ids": [2, 13, 23],
-        }
+    config = _capture_config(
+        step=7,
+        target_revision="target-6",
+        draft_revision="draft-6",
     )
     capture = OnlineEagleCapture(config)
     request_id = "skyrl-group-deadbeef-attempt0"
@@ -196,19 +201,7 @@ def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
 
 
 def test_capture_crops_a_long_prefill_before_copying() -> None:
-    config = OnlineEagleCaptureConfig.from_mapping(
-        {
-            "step": 1,
-            "max_tokens": 4,
-            "max_window_tokens": 4,
-            "max_sequences_per_prompt_group": 1,
-            "trainer_rank": 0,
-            "worker_rank": 0,
-            "target_revision": "target-0",
-            "draft_revision": "draft-0",
-            "aux_layer_ids": [2, 13, 23],
-        }
-    )
+    config = _capture_config(max_tokens=4, max_window_tokens=4)
     capture = OnlineEagleCapture(config)
     request_id = "skyrl-group-cafebabe-attempt0"
     prompt = list(range(10))
@@ -227,20 +220,11 @@ def test_capture_crops_a_long_prefill_before_copying() -> None:
     assert capture.captured_rows == 4
 
 
-def test_nonowner_capture_does_not_snapshot_target(tmp_path) -> None:
-    config = OnlineEagleCaptureConfig.from_mapping(
-        {
-            "step": 1,
-            "max_tokens": 4,
-            "max_window_tokens": 4,
-            "max_sequences_per_prompt_group": 1,
-            "trainer_rank": 0,
-            "worker_rank": 0,
-            "target_revision": "target-0",
-            "draft_revision": "draft-0",
-            "aux_layer_ids": [2, 13, 23],
-            "capture_target_snapshot": False,
-        }
+def test_capture_can_skip_target_snapshot(tmp_path) -> None:
+    config = _capture_config(
+        max_tokens=4,
+        max_window_tokens=4,
+        capture_target_snapshot=False,
     )
 
     manifest = OnlineEagleCapture(config).seal(
@@ -257,12 +241,7 @@ def test_nonowner_capture_does_not_snapshot_target(tmp_path) -> None:
 def test_candidate_install_is_in_place_and_preserves_shared_embedding(
     tmp_path, monkeypatch
 ) -> None:
-    target = _TargetModel()
-    draft = _DraftModel(target.model.embed_tokens)
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.model = target
-    runner.drafter = SimpleNamespace(model=draft)
-    runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
+    target, draft, runner = _runner_with_shared_embedding()
     candidate_dir = tmp_path / "candidate"
     candidate_dir.mkdir()
     weights_path = candidate_dir / "model.safetensors"
@@ -306,12 +285,7 @@ def test_candidate_install_is_in_place_and_preserves_shared_embedding(
 
 
 def test_direct_candidate_install_rejects_target_owned_head() -> None:
-    target = _TargetModel()
-    draft = _DraftModel(target.model.embed_tokens)
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.model = target
-    runner.drafter = SimpleNamespace(model=draft)
-    runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
+    _target, draft, runner = _runner_with_shared_embedding()
     candidate = {"lm_head.weight": torch.ones_like(draft.lm_head.weight)}
     metadata = {
         "draft_revision": "draft-step-7",
@@ -329,11 +303,7 @@ def test_direct_candidate_install_rejects_target_owned_head() -> None:
 
 
 def test_target_sync_refreshes_draft_vocabulary_head() -> None:
-    target = _TargetModel()
-    draft = _DraftModel(target.model.embed_tokens)
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.model = target
-    runner.drafter = SimpleNamespace(model=draft)
+    target, draft, runner = _runner_with_shared_embedding()
     target.lm_head.weight.data.copy_(torch.arange(128).reshape(64, 2))
 
     runner.refresh_online_eagle_target_owned_weights()

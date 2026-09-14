@@ -206,10 +206,14 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_scheduler_for_invalid_drafts,
 )
 from vllm.v1.spec_decode.online_eagle import (
+    LM_HEAD_WEIGHT_NAME,
     OnlineEagleCapture,
+    OnlineEagleCandidateMetadata,
     OnlineEagleCaptureConfig,
     load_candidate,
     project_target_head,
+    target_embedding_weight,
+    target_head_weight,
     validate_candidate_tensors,
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
@@ -3408,20 +3412,6 @@ class GPUModelRunner(
         """Discard an active interval after a failed rollout."""
         self.online_eagle_capture = None
 
-    @staticmethod
-    def _online_eagle_embedding_weight(model: nn.Module) -> nn.Parameter:
-        matches = [
-            parameter
-            for name, parameter in model.named_parameters()
-            if name.endswith("embed_tokens.weight")
-        ]
-        if len(matches) != 1:
-            raise RuntimeError(
-                "Expected exactly one embed_tokens.weight parameter, found "
-                f"{len(matches)}"
-            )
-        return matches[0]
-
     def install_online_eagle_speculator(
         self, candidate_dir: str, trainer_rank: int
     ) -> dict[str, Any]:
@@ -3429,14 +3419,16 @@ class GPUModelRunner(
         dp_group = get_dp_group()
         is_trainer = self.parallel_config.data_parallel_rank == trainer_rank
         candidate: dict[str, torch.Tensor] | None = None
-        metadata: dict[str, Any] | None = None
+        metadata: OnlineEagleCandidateMetadata | None = None
         if is_trainer:
             metadata, candidate = load_candidate(candidate_dir)
         metadata = dp_group.broadcast_object(metadata, src=trainer_rank)
         candidate = dp_group.broadcast_tensor_dict(candidate, src=trainer_rank)
         if metadata is None or candidate is None:
             raise RuntimeError("Online EAGLE candidate broadcast returned no data")
-        return self.install_online_eagle_speculator_tensors(metadata, candidate)
+        return self.install_online_eagle_speculator_tensors(
+            metadata.as_mapping(), candidate
+        )
 
     def refresh_online_eagle_target_owned_weights(self) -> None:
         """Refresh the draft-vocabulary head after target policy synchronization."""
@@ -3445,14 +3437,13 @@ class GPUModelRunner(
             return
         if getattr(draft_model, "draft_id_to_target_id", None) is None:
             return
-        target_parameters = dict(self.get_model().named_parameters())
-        target_head = target_parameters.get("lm_head.weight")
-        if target_head is None:
-            target_head = self._online_eagle_embedding_weight(self.get_model())
+        target_head = target_head_weight(self.get_model())
         draft_parameters = dict(draft_model.named_parameters())
-        draft_head = draft_parameters.get("lm_head.weight")
+        draft_head = draft_parameters.get(LM_HEAD_WEIGHT_NAME)
         if draft_head is None:
-            raise RuntimeError("Embedding-free EAGLE draft has no lm_head.weight")
+            raise RuntimeError(
+                f"Embedding-free EAGLE draft has no {LM_HEAD_WEIGHT_NAME}"
+            )
         projected = project_target_head(draft_model, target_head)
         if projected.shape != draft_head.shape:
             raise RuntimeError(
@@ -3467,13 +3458,14 @@ class GPUModelRunner(
         candidate: Mapping[str, torch.Tensor],
     ) -> dict[str, Any]:
         """Load validated tensors without replacing resident parameter storage."""
-        validate_candidate_tensors(metadata, candidate)
+        resolved_metadata = OnlineEagleCandidateMetadata.from_mapping(metadata)
+        validate_candidate_tensors(resolved_metadata, candidate)
         draft_model = self.get_draft_model()
         if draft_model is None:
             raise RuntimeError("Online EAGLE install requires a resident draft model")
 
-        target_embedding = self._online_eagle_embedding_weight(self.get_model())
-        draft_embedding = self._online_eagle_embedding_weight(draft_model)
+        target_embedding = target_embedding_weight(self.get_model())
+        draft_embedding = target_embedding_weight(draft_model)
         if draft_embedding is not target_embedding:
             raise RuntimeError(
                 "Embedding-free EAGLE draft no longer shares the target "
@@ -3492,15 +3484,15 @@ class GPUModelRunner(
             raise RuntimeError(
                 "Online EAGLE install replaced a resident parameter or its storage"
             )
-        if self._online_eagle_embedding_weight(draft_model) is not target_embedding:
+        if target_embedding_weight(draft_model) is not target_embedding:
             raise RuntimeError(
                 "Online EAGLE install broke shared target embedding identity"
             )
         return {
             "active": True,
             "worker_rank": self.parallel_config.data_parallel_rank,
-            "draft_revision": metadata["draft_revision"],
-            "weights_sha256": metadata["weights_sha256"],
+            "draft_revision": resolved_metadata.draft_revision,
+            "weights_sha256": resolved_metadata.weights_sha256,
             "tensor_count": len(candidate),
         }
 
