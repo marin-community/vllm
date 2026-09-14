@@ -3,7 +3,7 @@
 
 cuda-toolkit[nvcc,cccl]==13.2.1
 torch==2.13.0+cu132
-torchaudio @ https://download-r2.pytorch.org/whl/cpu/torchaudio-2.11.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=2354248848d06a9ae1e7a12165f800f0dda7df60ecac9fca892322b722b922c0
+torchaudio==2.11.0+cpu
 torchvision==0.28.0+cu132
 
 # Match the selected upstream CUDA test environment. Newer releases are not
