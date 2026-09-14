@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -16,11 +15,11 @@ from typing import Any
 from uuid import uuid4
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 from torch import nn
 
 _FORMAT_VERSION = 1
-_CANDIDATE_FORMAT = "marinskyrl-online-eagle-candidate"
+_MANIFEST_FILENAME = "manifest.json"
 _SKYRL_REQUEST_PREFIX = "skyrl-group-"
 _MIN_TRAINING_WINDOW_TOKENS = 2
 DRAFT_LM_HEAD_NAME = "lm_head.weight"
@@ -35,77 +34,31 @@ def _record_stream_for_async_copy(
         tensor.record_stream(stream)
 
 
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def load_candidate(
-    candidate_dir: str | os.PathLike[str],
-) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
-    """Load and validate a complete candidate before its collective broadcast."""
-    directory = Path(candidate_dir)
-    manifest_path = directory / "manifest.json"
-    metadata = json.loads(manifest_path.read_text())
-    if metadata.get("format") != _CANDIDATE_FORMAT:
-        raise ValueError(f"Invalid online EAGLE candidate manifest: {manifest_path}")
-    if not metadata.get("complete", False):
-        raise ValueError(f"Incomplete online EAGLE candidate: {manifest_path}")
-    weights_path = directory / metadata["weights_path"]
-    digest = file_sha256(weights_path)
-    if digest != metadata["weights_sha256"]:
-        raise ValueError(
-            "Online EAGLE candidate digest mismatch: "
-            f"expected {metadata['weights_sha256']}, got {digest}"
-        )
-    candidate = load_file(weights_path)
-    # Candidate format v1 initially included a target-derived draft-vocabulary
-    # head. Retain this shim until v1 checkpoint restore is removed, but never
-    # install that stale snapshot after the target policy has been synchronized.
-    if DRAFT_LM_HEAD_NAME in candidate:
-        candidate = dict(candidate)
-        candidate.pop(DRAFT_LM_HEAD_NAME)
-        metadata = dict(metadata)
-        metadata["tensor_inventory"] = dict(metadata["tensor_inventory"])
-        metadata["tensor_inventory"].pop(DRAFT_LM_HEAD_NAME)
-    validate_candidate_tensors(metadata, candidate)
-    return metadata, candidate
-
-
-def validate_candidate_tensors(
-    metadata: Mapping[str, Any], candidate: Mapping[str, torch.Tensor]
-) -> None:
-    """Reject incomplete or target-owned candidate tensor payloads."""
-    inventory = metadata["tensor_inventory"]
-    if set(candidate) != set(inventory):
-        raise ValueError(
-            "Online EAGLE candidate tensor inventory does not match its manifest"
-        )
-    mismatched = [
-        name
-        for name, value in candidate.items()
-        if inventory[name] != {"shape": list(value.shape), "dtype": str(value.dtype)}
+def _unique_parameter(model: nn.Module, name: str) -> nn.Parameter | None:
+    matches = [
+        parameter
+        for parameter_name, parameter in model.named_parameters()
+        if parameter_name == name or parameter_name.endswith(f".{name}")
     ]
-    if mismatched:
-        raise ValueError(
-            "Online EAGLE candidate tensor metadata does not match its weights: "
-            + ", ".join(sorted(mismatched))
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Expected at most one {name} parameter, found {len(matches)}"
         )
-    forbidden = [
-        name
-        for name in candidate
-        if "embed_tokens" in name
-        or name == DRAFT_LM_HEAD_NAME
-        or name.startswith("verifier_")
-    ]
-    if forbidden:
-        raise ValueError(
-            "Online EAGLE candidate contains target-owned tensors: "
-            + ", ".join(sorted(forbidden))
-        )
+    return matches[0] if matches else None
+
+
+def target_embedding_weight(model: nn.Module) -> nn.Parameter:
+    """Return the target embedding parameter through optional model wrappers."""
+    embedding = _unique_parameter(model, TARGET_EMBEDDING_NAME)
+    if embedding is None:
+        raise RuntimeError(f"Target model has no {TARGET_EMBEDDING_NAME}")
+    return embedding
+
+
+def target_head_weight(model: nn.Module) -> nn.Parameter:
+    """Return the target output head, falling back to tied embeddings."""
+    head = _unique_parameter(model, DRAFT_LM_HEAD_NAME)
+    return target_embedding_weight(model) if head is None else head
 
 
 def draft_vocab_target_ids(
@@ -150,7 +103,6 @@ class OnlineEagleCaptureConfig:
     max_tokens: int
     max_window_tokens: int
     max_sequences_per_prompt_group: int
-    trainer_rank: int
     worker_rank: int
     target_revision: str
     draft_revision: str
@@ -175,10 +127,9 @@ class OnlineEagleCaptureConfig:
         step = value.get("step")
         if isinstance(step, bool) or not isinstance(step, int) or step < 0:
             raise ValueError(f"step must be a nonnegative integer, got {step!r}")
-        trainer_rank = value.get("trainer_rank", 0)
         worker_rank = value.get("worker_rank", 0)
-        if not isinstance(trainer_rank, int) or not isinstance(worker_rank, int):
-            raise ValueError("trainer_rank and worker_rank must be integers")
+        if not isinstance(worker_rank, int):
+            raise ValueError("worker_rank must be an integer")
         aux_layer_ids = value.get("aux_layer_ids")
         if not isinstance(aux_layer_ids, Sequence) or isinstance(
             aux_layer_ids, (str, bytes)
@@ -206,7 +157,6 @@ class OnlineEagleCaptureConfig:
             max_sequences_per_prompt_group=positive_int(
                 "max_sequences_per_prompt_group"
             ),
-            trainer_rank=trainer_rank,
             worker_rank=worker_rank,
             target_revision=target_revision,
             draft_revision=draft_revision,
@@ -240,7 +190,6 @@ class OnlineEagleCapture:
 
     def __init__(self, config: OnlineEagleCaptureConfig):
         self.config = config
-        self.active = config.worker_rank == config.trainer_rank
         self.requests: dict[str, _RequestCapture] = {}
         self._group_counts: dict[str, int] = {}
         self._reserved_tokens = 0
@@ -257,8 +206,6 @@ class OnlineEagleCapture:
         max_completion_tokens: int,
     ) -> bool:
         """Admit one request before prefill and reserve a complete bounded window."""
-        if not self.active:
-            return False
         if (
             prompt_token_ids is None
             or isinstance(max_completion_tokens, bool)
@@ -391,8 +338,6 @@ class OnlineEagleCapture:
         head_input_hidden_states: torch.Tensor,
     ) -> None:
         """Copy selected target rows to pinned host buffers on a side stream."""
-        if not self.active:
-            return
         self._drain_pending(wait=False)
         if len(request_ids) != len(num_scheduled_tokens) or len(request_ids) != len(
             num_computed_tokens
@@ -451,11 +396,6 @@ class OnlineEagleCapture:
         self._pending = remaining
 
     @staticmethod
-    def _tensor_sha256(tensor: torch.Tensor) -> str:
-        value = tensor.detach().cpu().contiguous()
-        return hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
-
-    @staticmethod
     def _target_snapshot(
         model: nn.Module, draft_model: nn.Module
     ) -> tuple[dict[str, torch.Tensor], dict]:
@@ -474,11 +414,7 @@ class OnlineEagleCapture:
             .contiguous(),
         }
         return tensors, {
-            name: {
-                "shape": list(tensor.shape),
-                "dtype": str(tensor.dtype),
-                "sha256": OnlineEagleCapture._tensor_sha256(tensor),
-            }
+            name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
             for name, tensor in tensors.items()
         }
 
@@ -532,6 +468,72 @@ class OnlineEagleCapture:
             "position_ids": torch.tensor(positions, dtype=torch.long),
         }
 
+    def _write_windows(self, staging: Path) -> list[dict[str, Any]]:
+        windows: list[dict[str, Any]] = []
+        for request_id, request in sorted(self.requests.items()):
+            tensors = self._window_for_request(request)
+            if tensors is None:
+                continue
+            window_path = staging / f"window-{len(windows):06d}.safetensors"
+            save_file(tensors, str(window_path), metadata={"format": "pt"})
+            windows.append(
+                {
+                    "path": window_path.name,
+                    "request_id": request_id,
+                    "group_id": request.group_id,
+                    "tokens": int(tensors["input_ids"].shape[0]),
+                    "supervised_tokens": int(tensors["loss_mask"].sum().item()),
+                }
+            )
+        return windows
+
+    def _write_target_snapshot(
+        self,
+        staging: Path,
+        *,
+        target_model: nn.Module,
+        draft_model: nn.Module,
+        target_config: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self.config.capture_target_snapshot:
+            return None
+        target_tensors, target_inventory = self._target_snapshot(
+            target_model, draft_model
+        )
+        target_path = staging / "target.safetensors"
+        save_file(target_tensors, str(target_path), metadata={"format": "pt"})
+        config_path = staging / "target-config.json"
+        config_path.write_text(
+            json.dumps(dict(target_config), sort_keys=True, separators=(",", ":"))
+        )
+        return {
+            "weights_path": target_path.name,
+            "config_path": config_path.name,
+            "inventory": target_inventory,
+            "lm_head_vocabulary": "draft",
+        }
+
+    def _manifest(
+        self,
+        windows: list[dict[str, Any]],
+        target: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return {
+            "format": "vllm-online-eagle-capture",
+            "format_version": _FORMAT_VERSION,
+            "step": self.config.step,
+            "worker_rank": self.config.worker_rank,
+            "target_revision": self.config.target_revision,
+            "draft_revision": self.config.draft_revision,
+            "aux_layer_ids": list(self.config.aux_layer_ids),
+            "head_input_semantics": "post_final_norm_target_lm_head_input",
+            "windows": windows,
+            "captured_rows": self.captured_rows,
+            "dropped_requests": self.dropped_requests,
+            "dropped_windows": self.dropped_windows,
+            "target": target,
+        }
+
     def seal(
         self,
         output_dir: str | os.PathLike[str],
@@ -541,77 +543,28 @@ class OnlineEagleCapture:
         target_config: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Write an immutable atomic capture directory and return its manifest."""
-        if not self.active:
-            return {"active": False, "worker_rank": self.config.worker_rank}
         self._drain_pending(wait=True)
         destination = Path(output_dir)
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging = destination.with_name(f".{destination.name}.tmp-{uuid4().hex}")
         staging.mkdir(parents=True, exist_ok=False)
-        windows: list[dict[str, Any]] = []
         try:
-            for request_id, request in sorted(self.requests.items()):
-                tensors = self._window_for_request(request)
-                if tensors is None:
-                    continue
-                window_path = staging / f"window-{len(windows):06d}.safetensors"
-                save_file(tensors, str(window_path), metadata={"format": "pt"})
-                windows.append(
-                    {
-                        "path": window_path.name,
-                        "request_id": request_id,
-                        "group_id": request.group_id,
-                        "tokens": int(tensors["input_ids"].shape[0]),
-                        "supervised_tokens": int(tensors["loss_mask"].sum().item()),
-                        "sha256": file_sha256(window_path),
-                    }
-                )
-
-            target = None
-            if self.config.capture_target_snapshot:
-                target_tensors, target_inventory = self._target_snapshot(
-                    target_model, draft_model
-                )
-                target_path = staging / "target.safetensors"
-                save_file(target_tensors, str(target_path), metadata={"format": "pt"})
-                config_path = staging / "target-config.json"
-                config_path.write_text(
-                    json.dumps(
-                        dict(target_config), sort_keys=True, separators=(",", ":")
-                    )
-                )
-                target = {
-                    "weights_path": target_path.name,
-                    "weights_sha256": file_sha256(target_path),
-                    "config_path": config_path.name,
-                    "config_sha256": file_sha256(config_path),
-                    "inventory": target_inventory,
-                    "lm_head_vocabulary": "draft",
-                }
-            manifest = {
-                "format": "vllm-online-eagle-capture",
-                "format_version": _FORMAT_VERSION,
-                "active": True,
-                "step": self.config.step,
-                "worker_rank": self.config.worker_rank,
-                "target_revision": self.config.target_revision,
-                "draft_revision": self.config.draft_revision,
-                "aux_layer_ids": list(self.config.aux_layer_ids),
-                "head_input_semantics": "post_final_norm_target_lm_head_input",
-                "windows": windows,
-                "captured_rows": self.captured_rows,
-                "dropped_requests": self.dropped_requests,
-                "dropped_windows": self.dropped_windows,
-                "target": target,
-            }
-            manifest_path = staging / "manifest.json"
+            windows = self._write_windows(staging)
+            target = self._write_target_snapshot(
+                staging,
+                target_model=target_model,
+                draft_model=draft_model,
+                target_config=target_config,
+            )
+            manifest = self._manifest(windows, target)
+            manifest_path = staging / _MANIFEST_FILENAME
             manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
             if destination.exists():
                 raise FileExistsError(
                     f"Capture destination already exists: {destination}"
                 )
             os.replace(staging, destination)
-            return {**manifest, "path": str(destination / "manifest.json")}
+            return {**manifest, "path": str(destination / _MANIFEST_FILENAME)}
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise
@@ -622,10 +575,9 @@ __all__ = [
     "OnlineEagleCapture",
     "OnlineEagleCaptureConfig",
     "TARGET_EMBEDDING_NAME",
-    "file_sha256",
     "draft_vocab_target_ids",
-    "load_candidate",
     "project_target_head",
     "request_group_from_id",
-    "validate_candidate_tensors",
+    "target_embedding_weight",
+    "target_head_weight",
 ]

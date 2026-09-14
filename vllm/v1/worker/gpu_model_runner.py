@@ -7,7 +7,7 @@ import itertools
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -43,7 +43,6 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
-    get_dp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -73,6 +72,9 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
+)
+from vllm.model_executor.model_loader.weight_utils import (
+    runai_safetensors_weights_iterator,
 )
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
@@ -112,6 +114,7 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
+from vllm.transformers_utils.runai_utils import list_safetensors
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
@@ -190,11 +193,12 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_scheduler_for_invalid_drafts,
 )
 from vllm.v1.spec_decode.online_eagle import (
+    DRAFT_LM_HEAD_NAME,
     OnlineEagleCapture,
     OnlineEagleCaptureConfig,
-    load_candidate,
     project_target_head,
-    validate_candidate_tensors,
+    target_embedding_weight,
+    target_head_weight,
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -3259,8 +3263,6 @@ class GPUModelRunner(
 
     def begin_online_eagle_capture(self, config: dict[str, Any]) -> dict[str, Any]:
         """Begin one bounded capture interval before admitting rollout requests."""
-        if self.online_eagle_capture is not None:
-            raise RuntimeError("An online EAGLE capture interval is already active")
         if (
             self.speculative_config is None
             or self.speculative_config.method != "eagle3"
@@ -3273,13 +3275,11 @@ class GPUModelRunner(
         resolved = dict(config)
         resolved["worker_rank"] = self.parallel_config.data_parallel_rank
         resolved.setdefault("max_window_tokens", self.effective_drafter_max_model_len)
-        resolved.setdefault(
-            "aux_layer_ids", list(self._get_eagle3_aux_layers_from_config())
-        )
+        resolved["aux_layer_ids"] = list(self._get_eagle3_aux_layers_from_config())
         capture_config = OnlineEagleCaptureConfig.from_mapping(resolved)
         self.online_eagle_capture = OnlineEagleCapture(capture_config)
         return {
-            "active": self.online_eagle_capture.active,
+            "active": True,
             "worker_rank": capture_config.worker_rank,
             "step": capture_config.step,
         }
@@ -3303,51 +3303,31 @@ class GPUModelRunner(
         finally:
             self.online_eagle_capture = None
 
-    def discard_online_eagle_capture(self) -> None:
-        """Discard an active interval after a failed rollout."""
-        self.online_eagle_capture = None
-
-    @staticmethod
-    def _online_eagle_embedding_weight(model: nn.Module) -> nn.Parameter:
-        matches = [
-            parameter
-            for name, parameter in model.named_parameters()
-            if name.endswith("embed_tokens.weight")
-        ]
-        if len(matches) != 1:
-            raise RuntimeError(
-                "Expected exactly one embed_tokens.weight parameter, found "
-                f"{len(matches)}"
-            )
-        return matches[0]
-
-    def install_online_eagle_speculator(
-        self, candidate_dir: str, trainer_rank: int
+    def refresh_online_eagle_speculator(
+        self, candidate_uri: str, draft_revision: str
     ) -> dict[str, Any]:
-        """Load a checkpoint candidate and broadcast it within the vLLM DP group."""
-        dp_group = get_dp_group()
-        is_trainer = self.parallel_config.data_parallel_rank == trainer_rank
-        candidate: dict[str, torch.Tensor] | None = None
-        metadata: dict[str, Any] | None = None
-        if is_trainer:
-            metadata, candidate = load_candidate(candidate_dir)
-        metadata = dp_group.broadcast_object(metadata, src=trainer_rank)
-        candidate = dp_group.broadcast_tensor_dict(candidate, src=trainer_rank)
-        if metadata is None or candidate is None:
-            raise RuntimeError("Online EAGLE candidate broadcast returned no data")
-        return self.install_online_eagle_speculator_tensors(metadata, candidate)
+        """Stream one completed draft checkpoint into the resident model."""
+        weight_files = list_safetensors(candidate_uri)
+        if not weight_files:
+            raise FileNotFoundError(
+                f"Online EAGLE checkpoint has no safetensors files: {candidate_uri}"
+            )
+        weights = runai_safetensors_weights_iterator(
+            weight_files,
+            use_tqdm_on_load=False,
+        )
+        return self.install_online_eagle_speculator_weights(draft_revision, weights)
 
     def refresh_online_eagle_target_owned_weights(self) -> None:
         """Refresh the draft-vocabulary head after target policy synchronization."""
         draft_model = self.get_draft_model()
         if draft_model is None:
             return
-        if getattr(draft_model, "draft_id_to_target_id", None) is None:
+        if not isinstance(
+            getattr(draft_model, "draft_id_to_target_id", None), torch.Tensor
+        ):
             return
-        target_parameters = dict(self.get_model().named_parameters())
-        target_head = target_parameters.get("lm_head.weight")
-        if target_head is None:
-            target_head = self._online_eagle_embedding_weight(self.get_model())
+        target_head = target_head_weight(self.get_model())
         draft_parameters = dict(draft_model.named_parameters())
         draft_head = draft_parameters.get("lm_head.weight")
         if draft_head is None:
@@ -3360,19 +3340,20 @@ class GPUModelRunner(
         with torch.no_grad():
             draft_head.copy_(projected)
 
-    def install_online_eagle_speculator_tensors(
+    def install_online_eagle_speculator_weights(
         self,
-        metadata: Mapping[str, Any],
-        candidate: Mapping[str, torch.Tensor],
+        draft_revision: str,
+        weights: Iterable[tuple[str, torch.Tensor]],
     ) -> dict[str, Any]:
-        """Load validated tensors without replacing resident parameter storage."""
-        validate_candidate_tensors(metadata, candidate)
+        """Load draft-owned weights without replacing resident parameter storage."""
+        if not draft_revision:
+            raise ValueError("Online EAGLE draft revision must be nonempty")
         draft_model = self.get_draft_model()
         if draft_model is None:
             raise RuntimeError("Online EAGLE install requires a resident draft model")
 
-        target_embedding = self._online_eagle_embedding_weight(self.get_model())
-        draft_embedding = self._online_eagle_embedding_weight(draft_model)
+        target_embedding = target_embedding_weight(self.get_model())
+        draft_embedding = target_embedding_weight(draft_model)
         if draft_embedding is not target_embedding:
             raise RuntimeError(
                 "Embedding-free EAGLE draft no longer shares the target "
@@ -3382,7 +3363,25 @@ class GPUModelRunner(
             name: (id(parameter), parameter.data_ptr())
             for name, parameter in draft_model.named_parameters()
         }
-        draft_model.load_weights(candidate.items())
+        tensor_count = 0
+
+        def counted_weights() -> Iterator[tuple[str, torch.Tensor]]:
+            nonlocal tensor_count
+            for name, tensor in weights:
+                if (
+                    name.endswith("embed_tokens.weight")
+                    or name == DRAFT_LM_HEAD_NAME
+                    or name.startswith("verifier_")
+                ):
+                    raise ValueError(
+                        f"Online EAGLE checkpoint contains target-owned tensor {name}"
+                    )
+                tensor_count += 1
+                yield name, tensor
+
+        draft_model.load_weights(counted_weights())
+        if tensor_count == 0:
+            raise ValueError("Online EAGLE checkpoint contains no tensors")
         storage_after = {
             name: (id(parameter), parameter.data_ptr())
             for name, parameter in draft_model.named_parameters()
@@ -3391,16 +3390,15 @@ class GPUModelRunner(
             raise RuntimeError(
                 "Online EAGLE install replaced a resident parameter or its storage"
             )
-        if self._online_eagle_embedding_weight(draft_model) is not target_embedding:
+        if target_embedding_weight(draft_model) is not target_embedding:
             raise RuntimeError(
                 "Online EAGLE install broke shared target embedding identity"
             )
         return {
             "active": True,
             "worker_rank": self.parallel_config.data_parallel_rank,
-            "draft_revision": metadata["draft_revision"],
-            "weights_sha256": metadata["weights_sha256"],
-            "tensor_count": len(candidate),
+            "draft_revision": draft_revision,
+            "tensor_count": tensor_count,
         }
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
