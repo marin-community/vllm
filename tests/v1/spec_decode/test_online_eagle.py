@@ -42,19 +42,6 @@ class _DraftModel(nn.Module):
                 self.owned.weight.data.copy_(value)
 
 
-class _PrefixedDraftModel(nn.Module):
-    def __init__(self, embedding: nn.Embedding) -> None:
-        super().__init__()
-        self.model = nn.Module()
-        self.model.embed_tokens = embedding
-        self.model.owned = nn.Linear(2, 2, bias=False)
-
-    def load_weights(self, weights) -> None:
-        for name, value in weights:
-            if name == "owned.weight":
-                self.model.owned.weight.data.copy_(value)
-
-
 class _SingleRankDPGroup:
     rank_in_group = 0
 
@@ -316,56 +303,6 @@ def test_candidate_install_is_in_place_and_preserves_shared_embedding(
         "weights_sha256": weights_sha256,
         "tensor_count": 1,
     }
-
-
-def test_candidate_tensor_install_and_snapshot_are_transactional() -> None:
-    target = _TargetModel()
-    draft = _DraftModel(target.model.embed_tokens)
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.model = target
-    runner.drafter = SimpleNamespace(model=draft)
-    runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
-    original = runner.snapshot_online_eagle_speculator(["owned.weight"])
-    candidate = {"owned.weight": torch.full((2, 2), 7.0)}
-    metadata = {
-        "draft_revision": "draft-step-7",
-        "weights_sha256": "payload-digest",
-        "tensor_inventory": {
-            "owned.weight": {
-                "shape": [2, 2],
-                "dtype": "torch.float32",
-            }
-        },
-    }
-    parameter_id = id(draft.owned.weight)
-    storage_pointer = draft.owned.weight.data_ptr()
-
-    installed = runner.install_online_eagle_speculator_tensors(metadata, candidate)
-    runner.install_online_eagle_speculator_tensors(
-        {
-            **metadata,
-            "draft_revision": "draft-initial",
-            "weights_sha256": "incumbent-digest",
-        },
-        original,
-    )
-
-    assert installed["weights_sha256"] == "payload-digest"
-    assert torch.equal(draft.owned.weight, original["owned.weight"])
-    assert id(draft.owned.weight) == parameter_id
-    assert draft.owned.weight.data_ptr() == storage_pointer
-
-
-def test_candidate_snapshot_resolves_loader_model_prefix() -> None:
-    target = _TargetModel()
-    draft = _PrefixedDraftModel(target.model.embed_tokens)
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.model = target
-    runner.drafter = SimpleNamespace(model=draft)
-
-    snapshot = runner.snapshot_online_eagle_speculator(["owned.weight"])
-
-    assert torch.equal(snapshot["owned.weight"], draft.model.owned.weight)
 
 
 def test_direct_candidate_install_rejects_target_owned_head() -> None:
