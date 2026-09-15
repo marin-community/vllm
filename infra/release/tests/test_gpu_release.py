@@ -78,6 +78,26 @@ def test_candidate_build_ignores_release_only_changes():
     }
 
 
+def test_candidate_gpu_modes_keep_single_architecture_builds_nonpublishing():
+    workflow = yaml.load(
+        GPU_CANDIDATE_WORKFLOW_PATH.read_text(), Loader=yaml.BaseLoader
+    )
+    inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    publish = workflow["jobs"]["publish"]
+    gpu_mode = inputs["gpu_mode"]
+
+    assert gpu_mode["type"] == "choice"
+    assert gpu_mode["default"] == "publish"
+    assert gpu_mode["options"] == [
+        "publish",
+        "qualify-x86_64",
+        "qualify-aarch64",
+    ]
+    assert publish["if"] == (
+        "github.event_name == 'push' || inputs.gpu_mode == 'publish'"
+    )
+
+
 def test_server_command_pins_requested_attention_backend():
     command = server_command("Qwen/Qwen3-0.6B", 8000, "FLASH_ATTN")
 
@@ -97,7 +117,10 @@ def write_wheel(
     architecture: str,
     include_cumem: bool = True,
     version: str = "0.0.0.dev20260803+marin.test.cu130",
+    metadata_platform_tag: str | None = None,
 ) -> None:
+    if metadata_platform_tag is None:
+        metadata_platform_tag = f"manylinux_2_28_{architecture}"
     dist_info = f"vllm-{version}.dist-info"
     metadata = (
         "Metadata-Version: 2.4\n"
@@ -112,7 +135,7 @@ def write_wheel(
         "Wheel-Version: 1.0\n"
         "Generator: test\n"
         "Root-Is-Purelib: false\n"
-        f"Tag: cp38-abi3-linux_{architecture}\n"
+        f"Tag: cp38-abi3-{metadata_platform_tag}\n"
         "\n"
     )
     with zipfile.ZipFile(path, "w") as archive:
@@ -135,6 +158,7 @@ def fragment(
     *,
     include_cumem: bool = True,
     config: dict | None = None,
+    metadata_platform_tag: str | None = None,
 ) -> dict:
     if config is None:
         config = load_json(CONFIG_PATH)
@@ -142,7 +166,12 @@ def fragment(
         "vllm-0.0.0.dev20260803+marin.test.cu130-cp38-abi3-"
         f"manylinux_2_28_{architecture}.whl"
     )
-    write_wheel(wheel, architecture=architecture, include_cumem=include_cumem)
+    write_wheel(
+        wheel,
+        architecture=architecture,
+        include_cumem=include_cumem,
+        metadata_platform_tag=metadata_platform_tag,
+    )
     return inspect_wheel(
         wheel,
         architecture=architecture,
@@ -256,7 +285,7 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
     assert record["source"]["fork_commit"] == FORK_COMMIT
     assert record["source"]["upstream_base"] == UPSTREAM_BASE
     assert record["platform"]["wheel_tags"] == [
-        "cp38-abi3-linux_x86_64"
+        "cp38-abi3-manylinux_2_28_x86_64"
     ]
     assert record["platform"]["filename_tag"] == (
         "cp38-abi3-manylinux_2_28_x86_64"
@@ -269,6 +298,57 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
     wheel_path = tmp_path / wheel["filename"]
     assert wheel["sha256"] == sha256_file(wheel_path)
     assert wheel["size_bytes"] == wheel_path.stat().st_size
+
+
+def test_inspect_wheel_cli_runs_without_site_packages(tmp_path):
+    config = load_json(CONFIG_PATH)
+    architecture = "x86_64"
+    platform = config["platforms"][architecture]
+    wheel = tmp_path / (
+        "vllm-0.0.0.dev20260803+marin.test.cu130-cp38-abi3-"
+        f"manylinux_2_28_{architecture}.whl"
+    )
+    output = tmp_path / "fragment.json"
+    write_wheel(wheel, architecture=architecture)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-E",
+            "-S",
+            str(REPOSITORY_ROOT / "infra/release/gpu_release.py"),
+            "inspect-wheel",
+            "--config",
+            str(CONFIG_PATH),
+            "--wheel",
+            str(wheel),
+            "--architecture",
+            architecture,
+            "--fork-commit",
+            FORK_COMMIT,
+            "--upstream-base",
+            UPSTREAM_BASE,
+            "--built-at",
+            BUILT_AT,
+            "--base-image",
+            platform["build_base_image"],
+            "--base-image-digest",
+            platform["build_base_image"],
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert load_json(output)["platform"]["wheel"]["filename"] == wheel.name
+
+
+def test_inspect_wheel_rejects_filename_metadata_tag_mismatch(tmp_path):
+    with pytest.raises(ReleaseError, match="do not match filename tag"):
+        fragment(tmp_path, "x86_64", metadata_platform_tag="linux_x86_64")
 
 
 def test_missing_cumem_allocator_is_explicit_and_blocks_candidate(tmp_path):
@@ -321,6 +401,10 @@ def test_build_matrix_targets_only_the_validated_gpu():
 
     matrix = build_matrix(config)
 
+    assert {item["architecture"] for item in matrix["include"]} == {
+        "x86_64",
+        "aarch64",
+    }
     for item in matrix["include"]:
         platform = config["platforms"][item["architecture"]]
         assert item["sm_targets"] == platform["validation"]["compute_capability"]
@@ -348,13 +432,13 @@ def release_fixture(tmp_path: Path) -> tuple[dict, dict, list[dict], dict]:
 
 
 def test_release_binds_passed_gpu_results_to_candidate_wheel_digests(tmp_path):
-    _, _, _, manifest = release_fixture(tmp_path)
+    config, _, _, manifest = release_fixture(tmp_path)
 
     assert manifest["release"]["status"] == "released"
     assert manifest["release"]["candidate_tag"] == CANDIDATE_TAG
     assert manifest["validation"]["status"] == "passed"
     assert {item["architecture"] for item in manifest["validation"]["targets"]} == {
-        "x86_64",
+        *config["platforms"],
     }
     for platform in manifest["platforms"]:
         assert f"/{manifest['release']['tag']}/" in platform["wheel"]["url"]

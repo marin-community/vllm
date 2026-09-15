@@ -77,6 +77,20 @@ REQUIRED_RUNTIME_GATES = (
 )
 
 
+def _expand_wheel_tag(tag: str) -> set[str]:
+    """Expand the three dot-compressed wheel tag fields."""
+    fields = tag.split("-")
+    if len(fields) != 3 or any(not field for field in fields):
+        raise ReleaseError(f"malformed wheel compatibility tag {tag!r}")
+    python_tags, abi_tags, platform_tags = (field.split(".") for field in fields)
+    return {
+        f"{python_tag}-{abi_tag}-{platform_tag}"
+        for python_tag in python_tags
+        for abi_tag in abi_tags
+        for platform_tag in platform_tags
+    }
+
+
 def _packaged_contents(wheel: Path) -> dict[str, str]:
     with zipfile.ZipFile(wheel) as archive:
         members = archive.namelist()
@@ -166,6 +180,17 @@ def inspect_wheel(
     ):
         raise ReleaseError(
             f"wheel filename tag {filename_tag!r} is not manylinux {architecture}"
+        )
+    metadata_tags = {
+        expanded_tag
+        for wheel_tag in wheel_tags
+        for expanded_tag in _expand_wheel_tag(wheel_tag)
+    }
+    filename_tags = _expand_wheel_tag(filename_tag)
+    if metadata_tags != filename_tags:
+        raise ReleaseError(
+            f"wheel metadata tags {wheel_tags!r} do not match filename tag "
+            f"{filename_tag!r}"
         )
 
     platform_config = config["platforms"][architecture]
