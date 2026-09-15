@@ -78,6 +78,13 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.spec_decode.online_eagle import (
+    LM_HEAD_WEIGHT_NAME,
+    OnlineEagleCapture,
+    OnlineEagleCaptureConfig,
+    project_target_head,
+    target_head_weight,
+)
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.worker.block_table import get_block_table_width
@@ -156,6 +163,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     resolve_adaptive_cudagraph_mode,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+    resolve_eagle3_aux_hidden_state_layers,
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
 )
@@ -309,6 +317,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing = StepTimingCollector()
 
         # General request states.
+        self.online_eagle_capture: OnlineEagleCapture | None = None
         self.req_states = RequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -528,6 +537,81 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not isinstance(speculator, DraftModelSpeculator):
             return None
         return speculator.model
+
+    def begin_online_eagle_capture(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Begin one bounded capture interval before admitting rollout requests."""
+        if (
+            self.speculative_config is None
+            or self.speculative_config.method != "eagle3"
+        ):
+            raise RuntimeError("Online EAGLE capture requires an EAGLE-3 drafter")
+        if self.scheduler_config.async_scheduling:
+            raise RuntimeError("Online EAGLE capture requires synchronous scheduling")
+        if get_pp_group().world_size != 1:
+            raise RuntimeError("Online EAGLE capture requires pipeline_parallel_size=1")
+        resolved = dict(config)
+        reserved_fields = {"worker_rank", "aux_layer_ids"}.intersection(resolved)
+        if reserved_fields:
+            raise ValueError(
+                "Online EAGLE capture fields are worker-owned: "
+                + ", ".join(sorted(reserved_fields))
+            )
+        resolved["worker_rank"] = self.dp_rank
+        speculator = self.speculator
+        assert isinstance(speculator, DraftModelSpeculator)
+        resolved.setdefault("max_window_tokens", speculator.draft_max_seq_len)
+        _, aux_layers = resolve_eagle3_aux_hidden_state_layers(
+            self.get_model(), self.speculative_config
+        )
+        resolved["aux_layer_ids"] = list(aux_layers)
+        capture_config = OnlineEagleCaptureConfig.from_mapping(resolved)
+        self.online_eagle_capture = OnlineEagleCapture(capture_config)
+        return {
+            "active": True,
+            "worker_rank": capture_config.worker_rank,
+            "step": capture_config.step,
+        }
+
+    def seal_online_eagle_capture(self, output_dir: str) -> dict[str, Any]:
+        """Seal the active interval before target weights can be synchronized."""
+        capture = self.online_eagle_capture
+        if capture is None:
+            raise RuntimeError("No online EAGLE capture interval is active")
+        draft_model = self.get_draft_model()
+        if draft_model is None:
+            raise RuntimeError("Online EAGLE capture requires a resident draft model")
+        try:
+            return capture.seal(
+                output_dir,
+                target_model=self.get_model(),
+                draft_model=draft_model,
+                target_config=self.model_config.hf_config.to_dict(),
+            )
+        finally:
+            self.online_eagle_capture = None
+
+    def refresh_online_eagle_target_owned_weights(self) -> None:
+        """Refresh the draft-vocabulary head after target policy synchronization."""
+        draft_model = self.get_draft_model()
+        if draft_model is None:
+            return
+        if not isinstance(
+            getattr(draft_model, "draft_id_to_target_id", None), torch.Tensor
+        ):
+            return
+        target_head = target_head_weight(self.get_model())
+        draft_head = dict(draft_model.named_parameters()).get(LM_HEAD_WEIGHT_NAME)
+        if draft_head is None:
+            raise RuntimeError(
+                f"Embedding-free EAGLE draft has no {LM_HEAD_WEIGHT_NAME}"
+            )
+        projected = project_target_head(draft_model, target_head)
+        if projected.shape != draft_head.shape:
+            raise RuntimeError(
+                "Projected target head does not match the EAGLE draft head"
+            )
+        with torch.no_grad():
+            draft_head.copy_(projected)
 
     def reload_weights(self, *args, **kwargs) -> None:
         # TODO(Wentao): Use full version instead of import when fully migrated to v2
@@ -1053,6 +1137,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
+        capture = self.online_eagle_capture
+        if capture is not None:
+            for (
+                req_id,
+                output_length,
+            ) in scheduler_output.finished_req_output_lengths.items():
+                capture.finalize_request_length(req_id, output_length)
         if self.pooling_runner is not None:
             # Preempted docs keep their query-use reservation until rescheduled.
             self.pooling_runner.on_requests_finished(finished_req_ids)
@@ -1099,6 +1190,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
+            capture = self.online_eagle_capture
+            if capture is not None and sampling_params is not None:
+                capture.admit_request(
+                    req_id,
+                    new_req_data.prompt_token_ids,
+                    sampling_params.max_tokens,
+                )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
@@ -1904,6 +2002,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        capture = self.online_eagle_capture
+        if not dummy_run and capture is not None:
+            if aux_hidden_states is None or hidden_states is None:
+                raise RuntimeError(
+                    "Online EAGLE capture requires target auxiliary and final "
+                    "hidden states on a single pipeline stage"
+                )
+            capture.record_forward(
+                request_ids=input_batch.req_ids,
+                num_scheduled_tokens=input_batch.num_scheduled_tokens,
+                num_computed_tokens=input_batch.num_computed_tokens_np,
+                input_ids=input_batch.input_ids[: input_batch.num_tokens],
+                aux_hidden_states=aux_hidden_states,
+                head_input_hidden_states=hidden_states,
+            )
+
         routed_experts = None
         if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
             assert slot_mappings is not None
@@ -1988,6 +2102,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        capture = self.online_eagle_capture
+        if capture is not None:
+            capture.record_sampled(
+                request_ids=input_batch.req_ids,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                num_sampled_tokens=num_sampled,
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).

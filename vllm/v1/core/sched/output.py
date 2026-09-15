@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -263,6 +263,10 @@ class SchedulerOutput:
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
+
+    # Exact final output lengths for finished V2 requests. Model-runner features
+    # can reconcile optimistic GPU-side token state without copying trajectories.
+    finished_req_output_lengths: dict[str, int] = field(default_factory=dict)
 
     # Whether any of the scheduled requests use structured output.
     # Set only in async scheduling case.

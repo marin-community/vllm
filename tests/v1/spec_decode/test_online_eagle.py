@@ -17,6 +17,7 @@ from vllm.v1.spec_decode.online_eagle import (
     OnlineEagleCaptureConfig,
 )
 from vllm.v1.worker import gpu_model_runner
+from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -176,6 +177,39 @@ def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
     ]
 
 
+def test_sampled_capture_uses_scheduler_final_output_length(tmp_path) -> None:
+    capture = OnlineEagleCapture(_capture_config())
+    request_id = "request"
+    assert capture.admit_request(request_id, [10, 11], 4)
+
+    aux, head = _states([0, 1, 2, 3, 4])
+    capture.record_forward(
+        request_ids=[request_id],
+        num_scheduled_tokens=[5],
+        num_computed_tokens=[0],
+        input_ids=torch.tensor([10, 11, 20, 30, 99]),
+        aux_hidden_states=aux,
+        head_input_hidden_states=head,
+    )
+    capture.record_sampled(
+        request_ids=[request_id],
+        sampled_token_ids=torch.tensor([[20, 30, 99]]),
+        num_sampled_tokens=torch.tensor([3]),
+    )
+    capture.finalize_request_length(request_id, 2)
+
+    destination = tmp_path / "capture"
+    manifest = capture.seal(
+        destination,
+        target_model=_TargetModel(),
+        draft_model=SimpleNamespace(draft_id_to_target_id=torch.tensor([1, 2, 3, 4])),
+        target_config={"hidden_size": 2, "vocab_size": 64},
+    )
+
+    window = load_file(str(destination / manifest["windows"][0]["path"]))
+    assert window["input_ids"].tolist() == [10, 11, 20, 30]
+
+
 def test_capture_crops_a_long_prefill_before_copying() -> None:
     config = _capture_config(max_tokens=4, max_window_tokens=4)
     capture = OnlineEagleCapture(config)
@@ -260,6 +294,21 @@ def test_target_sync_refreshes_draft_vocabulary_head() -> None:
     assert torch.equal(draft.lm_head.weight, target.lm_head.weight[[1, 3, 5, 7]])
 
 
+def test_v2_target_sync_refreshes_draft_vocabulary_head() -> None:
+    target = _TargetModel()
+    draft = _DraftModel(target.model.embed_tokens)
+    target.lm_head.weight.data.copy_(torch.arange(128).reshape(64, 2))
+    runner = gpu_model_runner_v2.GPUModelRunner.__new__(
+        gpu_model_runner_v2.GPUModelRunner
+    )
+    runner.model = target
+    runner.get_draft_model = lambda: draft
+
+    runner.refresh_online_eagle_target_owned_weights()
+
+    assert torch.equal(draft.lm_head.weight, target.lm_head.weight[[1, 3, 5, 7]])
+
+
 def test_aux_layers_fall_back_to_target_model_defaults(monkeypatch) -> None:
     runner = GPUModelRunner.__new__(GPUModelRunner)
     model = SimpleNamespace(
@@ -267,7 +316,9 @@ def test_aux_layers_fall_back_to_target_model_defaults(monkeypatch) -> None:
     )
     runner.model = model
     runner.speculative_config = SimpleNamespace(draft_model_config=None)
-    monkeypatch.setattr(gpu_model_runner, "supports_eagle3", lambda value: value is model)
+    monkeypatch.setattr(
+        gpu_model_runner, "supports_eagle3", lambda value: value is model
+    )
 
     assert runner._resolve_eagle3_aux_layers() == (2, 13, 23)
 

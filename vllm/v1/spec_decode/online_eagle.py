@@ -160,10 +160,19 @@ class _PendingCopy:
 
 
 @dataclass
+class _PendingSamples:
+    request_ids: tuple[str, ...]
+    token_ids: torch.Tensor
+    num_sampled_tokens: torch.Tensor
+    event: torch.cuda.Event | None
+
+
+@dataclass
 class _RequestCapture:
     prompt_token_ids: tuple[int, ...]
     retention_floor: int = 0
     output_token_ids: tuple[int, ...] | None = None
+    final_output_length: int | None = None
     provisional: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = field(
         default_factory=dict
     )
@@ -176,7 +185,7 @@ class OnlineEagleCapture:
         self.config = config
         self.requests: dict[str, _RequestCapture] = {}
         self._reserved_tokens = 0
-        self._pending: list[_PendingCopy] = []
+        self._pending: list[_PendingCopy | _PendingSamples] = []
         self._copy_stream: torch.cuda.Stream | None = None
         self.dropped_requests = 0
         self.dropped_windows = 0
@@ -219,6 +228,68 @@ class OnlineEagleCapture:
         if request is None or output_token_ids is None:
             return
         request.output_token_ids = tuple(int(token) for token in output_token_ids)
+
+    def finalize_request_length(self, request_id: str, output_length: int) -> None:
+        """Record the scheduler's exact final output length for a V2 request."""
+        request = self.requests.get(request_id)
+        if request is None:
+            return
+        if output_length < 0:
+            raise ValueError("output_length must be nonnegative")
+        request.final_output_length = output_length
+        if request.output_token_ids is not None:
+            request.output_token_ids = request.output_token_ids[:output_length]
+
+    def record_sampled(
+        self,
+        *,
+        request_ids: Sequence[str],
+        sampled_token_ids: torch.Tensor,
+        num_sampled_tokens: torch.Tensor,
+    ) -> None:
+        """Append V2 sampler outputs without synchronizing the model stream."""
+        self._drain_pending(wait=False)
+        if sampled_token_ids.ndim != 2 or num_sampled_tokens.ndim != 1:
+            raise ValueError("sampled token tensors have invalid ranks")
+        if len(request_ids) != sampled_token_ids.shape[0] or len(request_ids) != len(
+            num_sampled_tokens
+        ):
+            raise ValueError("sampled token metadata lengths do not match")
+
+        if not sampled_token_ids.is_cuda:
+            pending = _PendingSamples(
+                request_ids=tuple(request_ids),
+                token_ids=sampled_token_ids.detach().cpu().clone(),
+                num_sampled_tokens=num_sampled_tokens.detach().cpu().clone(),
+                event=None,
+            )
+        else:
+            if self._copy_stream is None:
+                self._copy_stream = torch.cuda.Stream(device=sampled_token_ids.device)
+            default_stream = torch.cuda.current_stream(sampled_token_ids.device)
+            with torch.cuda.stream(self._copy_stream):
+                self._copy_stream.wait_stream(default_stream)
+                host_tokens = torch.empty_like(
+                    sampled_token_ids, device="cpu", pin_memory=True
+                )
+                host_counts = torch.empty_like(
+                    num_sampled_tokens, device="cpu", pin_memory=True
+                )
+                host_tokens.copy_(sampled_token_ids, non_blocking=True)
+                host_counts.copy_(num_sampled_tokens, non_blocking=True)
+                _record_stream_for_async_copy(
+                    (sampled_token_ids, num_sampled_tokens), self._copy_stream
+                )
+                event = torch.cuda.Event()
+                event.record(self._copy_stream)
+            pending = _PendingSamples(
+                request_ids=tuple(request_ids),
+                token_ids=host_tokens,
+                num_sampled_tokens=host_counts,
+                event=event,
+            )
+        self._pending.append(pending)
+        self._drain_pending(wait=False)
 
     def _selected_forward_rows(
         self,
@@ -351,13 +422,32 @@ class OnlineEagleCapture:
         self._drain_pending(wait=False)
 
     def _drain_pending(self, *, wait: bool) -> None:
-        remaining = []
+        remaining: list[_PendingCopy | _PendingSamples] = []
         for pending in self._pending:
             if pending.event is not None:
                 if not wait and not pending.event.query():
                     remaining.append(pending)
                     continue
                 pending.event.synchronize()
+            if isinstance(pending, _PendingSamples):
+                for index, request_id in enumerate(pending.request_ids):
+                    request = self.requests.get(request_id)
+                    if request is None:
+                        continue
+                    count = int(pending.num_sampled_tokens[index].item())
+                    if count < 0 or count > pending.token_ids.shape[1]:
+                        raise ValueError("sampled token count is out of bounds")
+                    sampled = tuple(
+                        int(token)
+                        for token in pending.token_ids[index, :count].tolist()
+                    )
+                    existing = request.output_token_ids or ()
+                    request.output_token_ids = existing + sampled
+                    if request.final_output_length is not None:
+                        request.output_token_ids = request.output_token_ids[
+                            : request.final_output_length
+                        ]
+                continue
             for index, (request_id, position) in enumerate(pending.rows):
                 request = self.requests.get(request_id)
                 if request is None:
