@@ -68,6 +68,11 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def draft_requires_dp_sync(method: str, is_moe: bool) -> bool:
+    """Keep established DP coordination except for dense EAGLE3 drafters."""
+    return method != "eagle3" or is_moe
+
+
 class SpecDecodeBaseProposer:
     def __init__(
         self,
@@ -91,7 +96,9 @@ class SpecDecodeBaseProposer:
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
-        self.draft_dp_sync = bool(self.draft_model_config.is_moe)
+        self.draft_dp_sync = draft_requires_dp_sync(
+            self.method, bool(self.draft_model_config.is_moe)
+        )
         if vllm_config.parallel_config.data_parallel_size > 1:
             logger.info_once(
                 "Draft DP batch coordination: %s (draft is_moe=%s)",

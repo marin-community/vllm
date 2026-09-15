@@ -4015,17 +4015,13 @@ def test_eagle3_hybrid_draft_layers_share_one_block_table(draft_depth):
     draft_names = {
         f"model.layers.{index}.self_attn.attn" for index in range(26, 26 + draft_depth)
     }
-    specs.update({name: sliding for name in draft_names})
-    config = _grouping_config()
-    config.model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(num_hidden_layers=26)
+    specs.update(
+        {name: replace(sliding, is_draft_attention=True) for name in draft_names}
     )
+    config = _grouping_config()
     baseline = get_kv_cache_groups(config, specs.copy())
     config.speculative_config = SimpleNamespace(
         method="eagle3",
-        draft_model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(num_hidden_layers=draft_depth)
-        ),
         use_eagle=lambda: True,
         use_eagle_block_drop=lambda: True,
     )

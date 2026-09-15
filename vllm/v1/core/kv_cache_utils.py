@@ -2182,17 +2182,18 @@ def _warn_if_unannotated_eagle_mamba(
 
 
 def _co_locate_eagle3_layers(
-    vllm_config: VllmConfig, groups: list[KVCacheGroupSpec]
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+    groups: list[KVCacheGroupSpec],
 ) -> None:
     speculative_config = vllm_config.speculative_config
     if speculative_config is None or speculative_config.method != "eagle3":
         return
-    target_layers = vllm_config.model_config.hf_config.num_hidden_layers
-    draft_layers = speculative_config.draft_model_config.hf_config.num_hidden_layers
     draft_names = {
-        f"model.layers.{index}.self_attn.attn"
-        for index in range(target_layers, target_layers + draft_layers)
+        name for name, spec in kv_cache_spec.items() if spec.is_draft_attention
     }
+    if not draft_names:
+        return
     owners = [group for group in groups if draft_names.intersection(group.layer_names)]
     if len(owners) <= 1:
         return
@@ -2302,7 +2303,7 @@ def get_kv_cache_groups(
             raise
         return fallback_groups
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
-    _co_locate_eagle3_layers(vllm_config, groups)
+    _co_locate_eagle3_layers(vllm_config, kv_cache_spec, groups)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:

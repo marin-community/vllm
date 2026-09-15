@@ -10,10 +10,11 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.online_eagle import (
     OnlineEagleCapture,
     OnlineEagleCaptureConfig,
-    request_group_from_id,
 )
 from vllm.v1.worker import gpu_model_runner
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -32,14 +33,8 @@ class _DraftModel(nn.Module):
         super().__init__()
         self.model = nn.Module()
         self.model.embed_tokens = embedding
-        self.owned = nn.Linear(2, 2, bias=False)
         self.lm_head = nn.Linear(2, 4, bias=False)
         self.register_buffer("draft_id_to_target_id", torch.tensor([1, 2, 3, 4]))
-
-    def load_weights(self, weights) -> None:
-        for name, value in weights:
-            if name == "owned.weight":
-                self.owned.weight.data.copy_(value)
 
 
 @pytest.fixture
@@ -59,7 +54,6 @@ def _capture_config(**overrides) -> OnlineEagleCaptureConfig:
         "step": 1,
         "max_tokens": 32,
         "max_window_tokens": 8,
-        "max_sequences_per_prompt_group": 1,
         "worker_rank": 0,
         "target_revision": "target-0",
         "draft_revision": "draft-0",
@@ -75,7 +69,6 @@ def _runner_with_shared_embedding() -> tuple[_TargetModel, _DraftModel, GPUModel
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.model = target
     runner.drafter = SimpleNamespace(model=draft)
-    runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
     return target, draft, runner
 
 
@@ -125,9 +118,7 @@ def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
     )
     capture = OnlineEagleCapture(config)
     request_id = "skyrl-group-deadbeef-attempt0"
-    assert request_group_from_id(request_id) == "deadbeef"
     assert capture.admit_request(request_id, [10, 11], 4)
-    assert not capture.admit_request("skyrl-group-deadbeef-attempt1", [10], 4)
 
     aux, head = _states([0, 1])
     capture.record_forward(
@@ -238,55 +229,26 @@ def test_begin_capture_replaces_unsealed_scratch(monkeypatch) -> None:
         lambda: SimpleNamespace(world_size=1),
     )
 
-    result = runner.begin_online_eagle_capture(asdict(_capture_config(step=2)))
+    request = asdict(_capture_config(step=2))
+    del request["worker_rank"], request["aux_layer_ids"]
+    result = runner.begin_online_eagle_capture(request)
 
     assert runner.online_eagle_capture is not old_capture
     assert result == {"active": True, "worker_rank": 0, "step": 2}
 
 
-def test_candidate_refresh_streams_from_uri_in_place_and_preserves_shared_embedding(
-    monkeypatch,
-) -> None:
-    target, draft, runner = _runner_with_shared_embedding()
-    candidate = {"owned.weight": torch.full((2, 2), 7.0)}
+def test_begin_capture_rejects_worker_owned_fields(monkeypatch) -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(method="eagle3")
+    runner.use_async_scheduling = False
     monkeypatch.setattr(
         gpu_model_runner,
-        "list_safetensors",
-        lambda uri: [f"{uri}/model.safetensors"],
-    )
-    monkeypatch.setattr(
-        gpu_model_runner,
-        "runai_safetensors_weights_iterator",
-        lambda files, use_tqdm_on_load: iter(candidate.items()),
-    )
-    parameter_id = id(draft.owned.weight)
-    storage_pointer = draft.owned.weight.data_ptr()
-
-    result = runner.refresh_online_eagle_speculator(
-        "s3://bucket/drafts/draft-step-7",
-        "draft-step-7",
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=1),
     )
 
-    assert torch.equal(draft.owned.weight, candidate["owned.weight"])
-    assert id(draft.owned.weight) == parameter_id
-    assert draft.owned.weight.data_ptr() == storage_pointer
-    assert draft.model.embed_tokens is target.model.embed_tokens
-    assert result == {
-        "active": True,
-        "worker_rank": 0,
-        "draft_revision": "draft-step-7",
-        "tensor_count": 1,
-    }
-
-
-def test_direct_candidate_install_rejects_target_owned_head() -> None:
-    _target, draft, runner = _runner_with_shared_embedding()
-    candidate = {"lm_head.weight": torch.ones_like(draft.lm_head.weight)}
-
-    with pytest.raises(ValueError, match="target-owned tensor"):
-        runner.install_online_eagle_speculator_weights(
-            "draft-step-7", iter(candidate.items())
-        )
+    with pytest.raises(ValueError, match="worker-owned: worker_rank"):
+        runner.begin_online_eagle_capture({"worker_rank": 3})
 
 
 def test_target_sync_refreshes_draft_vocabulary_head() -> None:
@@ -296,3 +258,46 @@ def test_target_sync_refreshes_draft_vocabulary_head() -> None:
     runner.refresh_online_eagle_target_owned_weights()
 
     assert torch.equal(draft.lm_head.weight, target.lm_head.weight[[1, 3, 5, 7]])
+
+
+def test_aux_layers_fall_back_to_target_model_defaults(monkeypatch) -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    model = SimpleNamespace(
+        get_eagle3_default_aux_hidden_state_layers=lambda: [2, 13, 23]
+    )
+    runner.model = model
+    runner.speculative_config = SimpleNamespace(draft_model_config=None)
+    monkeypatch.setattr(gpu_model_runner, "supports_eagle3", lambda value: value is model)
+
+    assert runner._resolve_eagle3_aux_layers() == (2, 13, 23)
+
+
+def test_kv_cache_specs_mark_proposer_discovered_draft_layers(monkeypatch) -> None:
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+    )
+    backend = SimpleNamespace(customize_spec=lambda value: value)
+    attention = SimpleNamespace(
+        get_kv_cache_spec=lambda _config: spec,
+        get_attn_backend=lambda: backend,
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
+    runner.speculative_config = SimpleNamespace(method="eagle3")
+    runner.shared_kv_cache_layers = {}
+    runner.drafter = EagleProposer.__new__(EagleProposer)
+    runner.drafter._draft_attn_layer_names = {"draft.attn"}
+    monkeypatch.setattr(gpu_model_runner, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(
+        gpu_model_runner,
+        "get_layers_from_vllm_config",
+        lambda *_args: {"target.attn": attention, "draft.attn": attention},
+    )
+
+    specs = runner.get_kv_cache_spec()
+
+    assert specs["draft.attn"].is_draft_attention is True
+    assert specs["target.attn"].is_draft_attention is False

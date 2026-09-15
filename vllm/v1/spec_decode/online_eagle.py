@@ -20,7 +20,6 @@ from torch import nn
 
 _FORMAT_VERSION = 1
 _MANIFEST_FILENAME = "manifest.json"
-_SKYRL_REQUEST_PREFIX = "skyrl-group-"
 _MIN_TRAINING_WINDOW_TOKENS = 2
 LM_HEAD_WEIGHT_NAME = "lm_head.weight"
 TARGET_EMBEDDING_NAME = "model.embed_tokens.weight"
@@ -87,22 +86,11 @@ def project_target_head(
     return target_head[draft_vocab_target_ids(draft_model, target_head.shape[0])]
 
 
-def request_group_from_id(request_id: str) -> str:
-    """Return a SkyRL group digest, or the full ID for an ungrouped request."""
-    if request_id.startswith(_SKYRL_REQUEST_PREFIX):
-        remainder = request_id[len(_SKYRL_REQUEST_PREFIX) :]
-        group, separator, _attempt = remainder.partition("-")
-        if separator and group:
-            return group
-    return request_id
-
-
 @dataclass(frozen=True)
 class OnlineEagleCaptureConfig:
     step: int
     max_tokens: int
     max_window_tokens: int
-    max_sequences_per_prompt_group: int
     worker_rank: int
     target_revision: str
     draft_revision: str
@@ -154,9 +142,6 @@ class OnlineEagleCaptureConfig:
             step=step,
             max_tokens=positive_int("max_tokens"),
             max_window_tokens=positive_int("max_window_tokens"),
-            max_sequences_per_prompt_group=positive_int(
-                "max_sequences_per_prompt_group"
-            ),
             worker_rank=worker_rank,
             target_revision=target_revision,
             draft_revision=draft_revision,
@@ -176,7 +161,6 @@ class _PendingCopy:
 
 @dataclass
 class _RequestCapture:
-    group_id: str
     prompt_token_ids: tuple[int, ...]
     retention_floor: int = 0
     output_token_ids: tuple[int, ...] | None = None
@@ -191,7 +175,6 @@ class OnlineEagleCapture:
     def __init__(self, config: OnlineEagleCaptureConfig):
         self.config = config
         self.requests: dict[str, _RequestCapture] = {}
-        self._group_counts: dict[str, int] = {}
         self._reserved_tokens = 0
         self._pending: list[_PendingCopy] = []
         self._copy_stream: torch.cuda.Stream | None = None
@@ -213,13 +196,6 @@ class OnlineEagleCapture:
         ):
             self.dropped_requests += 1
             return False
-        group_id = request_group_from_id(request_id)
-        if (
-            self._group_counts.get(group_id, 0)
-            >= self.config.max_sequences_per_prompt_group
-        ):
-            self.dropped_requests += 1
-            return False
         reserved = min(
             len(prompt_token_ids) + max_completion_tokens,
             self.config.max_window_tokens,
@@ -231,9 +207,7 @@ class OnlineEagleCapture:
             self.dropped_requests += 1
             return False
         self._reserved_tokens += reserved
-        self._group_counts[group_id] = self._group_counts.get(group_id, 0) + 1
         self.requests[request_id] = _RequestCapture(
-            group_id=group_id,
             prompt_token_ids=tuple(int(token) for token in prompt_token_ids),
         )
         return True
@@ -482,7 +456,6 @@ class OnlineEagleCapture:
                 {
                     "path": window_path.name,
                     "request_id": request_id,
-                    "group_id": request.group_id,
                     "tokens": int(tensors["input_ids"].shape[0]),
                     "supervised_tokens": int(tensors["loss_mask"].sum().item()),
                 }
@@ -579,7 +552,6 @@ __all__ = [
     "TARGET_EMBEDDING_NAME",
     "draft_vocab_target_ids",
     "project_target_head",
-    "request_group_from_id",
     "target_embedding_weight",
     "target_head_weight",
 ]

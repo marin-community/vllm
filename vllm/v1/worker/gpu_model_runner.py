@@ -76,9 +76,6 @@ from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    runai_safetensors_weights_iterator,
-)
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -121,7 +118,6 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
-from vllm.transformers_utils.runai_utils import list_safetensors
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -213,7 +209,6 @@ from vllm.v1.spec_decode.online_eagle import (
     OnlineEagleCapture,
     OnlineEagleCaptureConfig,
     project_target_head,
-    target_embedding_weight,
     target_head_weight,
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
@@ -1210,12 +1205,13 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
+    # Note: used for model runner overrides.
     def _on_request_state_removed(
         self,
         req_id: str,
         req_state: CachedRequestState | None,
     ) -> None:
-        """Finalize capture data before the scheduler drops request state."""
+        """Finalize capture data as a cached request is removed."""
         capture = self.online_eagle_capture
         if capture is not None and req_state is not None:
             capture.finalize_request(req_id, req_state.output_token_ids)
@@ -3374,9 +3370,15 @@ class GPUModelRunner(
         if get_pp_group().world_size != 1:
             raise RuntimeError("Online EAGLE capture requires pipeline_parallel_size=1")
         resolved = dict(config)
+        reserved_fields = {"worker_rank", "aux_layer_ids"}.intersection(resolved)
+        if reserved_fields:
+            raise ValueError(
+                "Online EAGLE capture fields are worker-owned: "
+                + ", ".join(sorted(reserved_fields))
+            )
         resolved["worker_rank"] = self.parallel_config.data_parallel_rank
         resolved.setdefault("max_window_tokens", self.effective_drafter_max_model_len)
-        resolved["aux_layer_ids"] = list(self._get_eagle3_aux_layers_from_config())
+        resolved["aux_layer_ids"] = list(self._resolve_eagle3_aux_layers())
         capture_config = OnlineEagleCaptureConfig.from_mapping(resolved)
         self.online_eagle_capture = OnlineEagleCapture(capture_config)
         return {
@@ -3404,21 +3406,6 @@ class GPUModelRunner(
         finally:
             self.online_eagle_capture = None
 
-    def refresh_online_eagle_speculator(
-        self, candidate_uri: str, draft_revision: str
-    ) -> dict[str, Any]:
-        """Stream one completed draft checkpoint into the resident model."""
-        weight_files = list_safetensors(candidate_uri)
-        if not weight_files:
-            raise FileNotFoundError(
-                f"Online EAGLE checkpoint has no safetensors files: {candidate_uri}"
-            )
-        weights = runai_safetensors_weights_iterator(
-            weight_files,
-            use_tqdm_on_load=False,
-        )
-        return self.install_online_eagle_speculator_weights(draft_revision, weights)
-
     def refresh_online_eagle_target_owned_weights(self) -> None:
         """Refresh the draft-vocabulary head after target policy synchronization."""
         draft_model = self.get_draft_model()
@@ -3442,67 +3429,6 @@ class GPUModelRunner(
             )
         with torch.no_grad():
             draft_head.copy_(projected)
-
-    def install_online_eagle_speculator_weights(
-        self,
-        draft_revision: str,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> dict[str, Any]:
-        """Load draft-owned weights without replacing resident parameter storage."""
-        if not draft_revision:
-            raise ValueError("Online EAGLE draft revision must be nonempty")
-        draft_model = self.get_draft_model()
-        if draft_model is None:
-            raise RuntimeError("Online EAGLE install requires a resident draft model")
-
-        target_embedding = target_embedding_weight(self.get_model())
-        draft_embedding = target_embedding_weight(draft_model)
-        if draft_embedding is not target_embedding:
-            raise RuntimeError(
-                "Embedding-free EAGLE draft no longer shares the target "
-                "embedding parameter"
-            )
-        storage_before = {
-            name: (id(parameter), parameter.data_ptr())
-            for name, parameter in draft_model.named_parameters()
-        }
-        tensor_count = 0
-
-        def counted_weights() -> Iterator[tuple[str, torch.Tensor]]:
-            nonlocal tensor_count
-            for name, tensor in weights:
-                if (
-                    name.endswith("embed_tokens.weight")
-                    or name == LM_HEAD_WEIGHT_NAME
-                    or name.startswith("verifier_")
-                ):
-                    raise ValueError(
-                        f"Online EAGLE checkpoint contains target-owned tensor {name}"
-                    )
-                tensor_count += 1
-                yield name, tensor
-
-        draft_model.load_weights(counted_weights())
-        if tensor_count == 0:
-            raise ValueError("Online EAGLE checkpoint contains no tensors")
-        storage_after = {
-            name: (id(parameter), parameter.data_ptr())
-            for name, parameter in draft_model.named_parameters()
-        }
-        if storage_after != storage_before:
-            raise RuntimeError(
-                "Online EAGLE install replaced a resident parameter or its storage"
-            )
-        if target_embedding_weight(draft_model) is not target_embedding:
-            raise RuntimeError(
-                "Online EAGLE install broke shared target embedding identity"
-            )
-        return {
-            "active": True,
-            "worker_rank": self.parallel_config.data_parallel_rank,
-            "draft_revision": draft_revision,
-            "tensor_count": tensor_count,
-        }
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
@@ -5689,17 +5615,25 @@ class GPUModelRunner(
                 "Model does not support EAGLE3 interface but "
                 "aux_hidden_state_outputs was requested"
             )
-        # Try to get auxiliary layers from speculative config,
-        # otherwise use model's default layers
+        aux_layers = self._resolve_eagle3_aux_layers()
+        self.model.set_aux_hidden_state_layers(aux_layers)
+
+    def _resolve_eagle3_aux_layers(self) -> tuple[int, ...]:
+        """Resolve configured EAGLE3 auxiliary layers or the target default."""
         aux_layers = self._get_eagle3_aux_layers_from_config()
         if aux_layers:
-            logger.info(
-                "Using auxiliary layers from speculative config: %s", aux_layers
-            )
-        else:
-            aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
-
-        self.model.set_aux_hidden_state_layers(aux_layers)
+            logger.info("Using EAGLE3 auxiliary layers from config: %s", aux_layers)
+            return aux_layers
+        model = self.get_model()
+        if not supports_eagle3(model):
+            raise RuntimeError("Target model does not expose EAGLE3 auxiliary layers")
+        aux_layers = tuple(model.get_eagle3_default_aux_hidden_state_layers())
+        if not aux_layers:
+            raise RuntimeError("Target model returned no EAGLE3 auxiliary layers")
+        logger.info(
+            "Using target model's default EAGLE3 auxiliary layers: %s", aux_layers
+        )
+        return aux_layers
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -7771,6 +7705,18 @@ class GPUModelRunner(
             if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                 if isinstance(spec, AttentionSpec):
                     spec = attn_module.get_attn_backend().customize_spec(spec)
+                drafter = getattr(self, "drafter", None)
+                draft_layer_names = (
+                    drafter._draft_attn_layer_names
+                    if isinstance(drafter, EagleProposer)
+                    else ()
+                )
+                if (
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "eagle3"
+                    and layer_name in draft_layer_names
+                ):
+                    spec = replace(spec, is_draft_attention=True)
                 kv_cache_spec[layer_name] = spec
 
         return kv_cache_spec
