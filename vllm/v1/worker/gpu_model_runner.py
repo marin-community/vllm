@@ -204,6 +204,11 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.online_eagle import (
+    OnlineEagleCapture,
+    refresh_target_owned_draft_weights,
+    resolve_online_eagle_capture_config,
+)
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
@@ -719,6 +724,7 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self.online_eagle_capture: OnlineEagleCapture | None = None
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -1197,13 +1203,16 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
+    # Note: used for model runner overrides.
     def _on_request_state_removed(
         self,
         req_id: str,
         req_state: CachedRequestState | None,
     ) -> None:
-        """Hook for platform runners to clean request-scoped side caches."""
-        del req_id, req_state
+        """Finalize capture data as a cached request is removed."""
+        capture = self.online_eagle_capture
+        if capture is not None and req_state is not None:
+            capture.finalize_request(req_id, req_state.output_token_ids)
 
     def _process_encoder_cache_scheduler_output(
         self,
@@ -1331,6 +1340,14 @@ class GPUModelRunner(
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            capture = self.online_eagle_capture
+            if capture is not None and sampling_params is not None:
+                max_completion_tokens = sampling_params.max_tokens or 1
+                capture.admit_request(
+                    req_id,
+                    new_req_data.prompt_token_ids,
+                    max_completion_tokens,
+                )
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
@@ -3339,6 +3356,51 @@ class GPUModelRunner(
             return cast(nn.Module, model.unwrap())
         return cast(nn.Module | None, model)
 
+    def begin_online_eagle_capture(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Begin one bounded capture interval before admitting rollout requests."""
+        capture_config = resolve_online_eagle_capture_config(
+            config,
+            speculative_method=(
+                self.speculative_config.method
+                if self.speculative_config is not None
+                else None
+            ),
+            async_scheduling=self.use_async_scheduling,
+            pipeline_parallel_size=get_pp_group().world_size,
+            worker_rank=self.parallel_config.data_parallel_rank,
+            max_window_tokens=self.effective_drafter_max_model_len,
+            aux_layer_ids=self._resolve_eagle3_aux_layers,
+        )
+        self.online_eagle_capture = OnlineEagleCapture(capture_config)
+        return {
+            "active": True,
+            "worker_rank": capture_config.worker_rank,
+            "step": capture_config.step,
+        }
+
+    def seal_online_eagle_capture(self, output_dir: str) -> dict[str, Any]:
+        """Seal the active interval before target weights can be synchronized."""
+        capture = self.online_eagle_capture
+        if capture is None:
+            raise RuntimeError("No online EAGLE capture interval is active")
+        for request_id, request in self.requests.items():
+            capture.finalize_request(request_id, request.output_token_ids)
+        hf_config = self.model_config.hf_config
+        target_config = hf_config.to_dict()
+        try:
+            return capture.seal(
+                output_dir,
+                target_model=self.get_model(),
+                draft_model=self.get_draft_model(),
+                target_config=target_config,
+            )
+        finally:
+            self.online_eagle_capture = None
+
+    def refresh_online_eagle_target_owned_weights(self) -> None:
+        """Refresh the draft-vocabulary head after target policy synchronization."""
+        refresh_target_owned_draft_weights(self.get_model(), self.get_draft_model())
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
@@ -4478,6 +4540,26 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            capture = self.online_eagle_capture
+            if capture is not None:
+                if aux_hidden_states is None or isinstance(
+                    hidden_states, IntermediateTensors
+                ):
+                    raise RuntimeError(
+                        "Online EAGLE capture requires target auxiliary and final "
+                        "hidden states on a single pipeline stage"
+                    )
+                capture.record_forward(
+                    request_ids=self.input_batch.req_ids[:num_reqs],
+                    num_scheduled_tokens=num_scheduled_tokens_np,
+                    num_computed_tokens=self.input_batch.num_computed_tokens_cpu[
+                        :num_reqs
+                    ],
+                    input_ids=self.input_ids.gpu[:num_scheduled_tokens],
+                    aux_hidden_states=aux_hidden_states,
+                    head_input_hidden_states=hidden_states,
+                )
+
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -5504,17 +5586,25 @@ class GPUModelRunner(
                 "Model does not support EAGLE3 interface but "
                 "aux_hidden_state_outputs was requested"
             )
-        # Try to get auxiliary layers from speculative config,
-        # otherwise use model's default layers
+        aux_layers = self._resolve_eagle3_aux_layers()
+        self.model.set_aux_hidden_state_layers(aux_layers)
+
+    def _resolve_eagle3_aux_layers(self) -> tuple[int, ...]:
+        """Resolve configured EAGLE3 auxiliary layers or the target default."""
         aux_layers = self._get_eagle3_aux_layers_from_config()
         if aux_layers:
-            logger.info(
-                "Using auxiliary layers from speculative config: %s", aux_layers
-            )
-        else:
-            aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
-
-        self.model.set_aux_hidden_state_layers(aux_layers)
+            logger.info("Using EAGLE3 auxiliary layers from config: %s", aux_layers)
+            return aux_layers
+        model = self.get_model()
+        if not supports_eagle3(model):
+            raise RuntimeError("Target model does not expose EAGLE3 auxiliary layers")
+        aux_layers = tuple(model.get_eagle3_default_aux_hidden_state_layers())
+        if not aux_layers:
+            raise RuntimeError("Target model returned no EAGLE3 auxiliary layers")
+        logger.info(
+            "Using target model's default EAGLE3 auxiliary layers: %s", aux_layers
+        )
+        return aux_layers
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -7586,6 +7676,18 @@ class GPUModelRunner(
             if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                 if isinstance(spec, AttentionSpec):
                     spec = attn_module.get_attn_backend().customize_spec(spec)
+                drafter = getattr(self, "drafter", None)
+                draft_layer_names = (
+                    drafter._draft_attn_layer_names
+                    if isinstance(drafter, EagleProposer)
+                    else ()
+                )
+                if (
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "eagle3"
+                    and layer_name in draft_layer_names
+                ):
+                    spec = replace(spec, is_draft_attention=True)
                 kv_cache_spec[layer_name] = spec
 
         return kv_cache_spec

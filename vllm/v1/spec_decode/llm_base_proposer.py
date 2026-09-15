@@ -68,6 +68,11 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def draft_requires_dp_sync(method: str, is_moe: bool) -> bool:
+    """Keep established DP coordination except for dense EAGLE3 drafters."""
+    return method != "eagle3" or is_moe
+
+
 class SpecDecodeBaseProposer:
     def __init__(
         self,
@@ -90,6 +95,16 @@ class SpecDecodeBaseProposer:
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+
+        self.draft_dp_sync = draft_requires_dp_sync(
+            self.method, bool(self.draft_model_config.is_moe)
+        )
+        if vllm_config.parallel_config.data_parallel_size > 1:
+            logger.info_once(
+                "Draft DP batch coordination: %s (draft is_moe=%s)",
+                "collective" if self.draft_dp_sync else "local",
+                self.draft_model_config.is_moe,
+            )
 
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -1789,11 +1804,16 @@ class SpecDecodeBaseProposer:
         )
         num_tokens_padded = batch_desc.num_tokens
 
-        # Extra coordination when running data-parallel since we need to
-        # coordinate across ranks
+        # Draft replicas with independent shapes reuse the local padded count;
+        # synchronized draft replicas coordinate the padded shape across DP.
         # TODO(Flechman): support DBO ubatching
         should_ubatch, num_tokens_across_dp = False, None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
+        if data_parallel_size > 1 and not self.draft_dp_sync:
+            num_tokens_across_dp = torch.full(
+                (data_parallel_size,), num_tokens_padded, dtype=torch.int32
+            )
+        elif data_parallel_size > 1:
             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,

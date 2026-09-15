@@ -2181,6 +2181,57 @@ def _warn_if_unannotated_eagle_mamba(
     )
 
 
+def _co_locate_eagle3_layers(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+    groups: list[KVCacheGroupSpec],
+) -> None:
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or speculative_config.method != "eagle3":
+        return
+    draft_names = {
+        name for name, spec in kv_cache_spec.items() if spec.is_draft_attention
+    }
+    if not draft_names:
+        return
+    owners = [group for group in groups if draft_names.intersection(group.layer_names)]
+    if len(owners) <= 1:
+        return
+    if draft_names != {
+        name
+        for group in owners
+        for name in group.layer_names
+        if name in draft_names
+    }:
+        return
+    if any(group.kv_cache_spec != owners[0].kv_cache_spec for group in owners):
+        return
+    compatible = [
+        group for group in groups if group.kv_cache_spec == owners[0].kv_cache_spec
+    ]
+    anchor = max(compatible, key=lambda group: len(group.layer_names))
+    if len(anchor.layer_names) < len(draft_names):
+        return
+    for group in owners:
+        if group is anchor:
+            continue
+        for index, name in enumerate(group.layer_names):
+            if name not in draft_names:
+                continue
+            slot = next(
+                position
+                for position, other in enumerate(anchor.layer_names)
+                if other not in draft_names
+            )
+            group.layer_names[index], anchor.layer_names[slot] = (
+                anchor.layer_names[slot],
+                name,
+            )
+    logger.info(
+        "Co-located %d EAGLE3 draft layers in one KV cache group", len(draft_names)
+    )
+
+
 def _largest_divisor_at_most(value: int, limit: int) -> int:
     for candidate in range(min(value, limit), 0, -1):
         if value % candidate == 0:
@@ -2252,6 +2303,7 @@ def get_kv_cache_groups(
             raise
         return fallback_groups
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    _co_locate_eagle3_layers(vllm_config, kv_cache_spec, groups)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
