@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -86,6 +86,25 @@ def project_target_head(
     return target_head[draft_vocab_target_ids(draft_model, target_head.shape[0])]
 
 
+def refresh_target_owned_draft_weights(
+    target_model: nn.Module, draft_model: nn.Module | None
+) -> None:
+    """Refresh an embedding-free draft head after target synchronization."""
+    if draft_model is None or not isinstance(
+        getattr(draft_model, "draft_id_to_target_id", None), torch.Tensor
+    ):
+        return
+    target_head = target_head_weight(target_model)
+    draft_head = dict(draft_model.named_parameters()).get(LM_HEAD_WEIGHT_NAME)
+    if draft_head is None:
+        raise RuntimeError(f"Embedding-free EAGLE draft has no {LM_HEAD_WEIGHT_NAME}")
+    projected = project_target_head(draft_model, target_head)
+    if projected.shape != draft_head.shape:
+        raise RuntimeError("Projected target head does not match the EAGLE draft head")
+    with torch.no_grad():
+        draft_head.copy_(projected)
+
+
 @dataclass(frozen=True)
 class OnlineEagleCaptureConfig:
     step: int
@@ -150,6 +169,36 @@ class OnlineEagleCaptureConfig:
         )
 
 
+def resolve_online_eagle_capture_config(
+    config: Mapping[str, Any],
+    *,
+    speculative_method: str | None,
+    async_scheduling: bool,
+    pipeline_parallel_size: int,
+    worker_rank: int,
+    max_window_tokens: int,
+    aux_layer_ids: Callable[[], Sequence[int]],
+) -> OnlineEagleCaptureConfig:
+    """Add worker-owned fields and validate an online capture request."""
+    if speculative_method != "eagle3":
+        raise RuntimeError("Online EAGLE capture requires an EAGLE-3 drafter")
+    if async_scheduling:
+        raise RuntimeError("Online EAGLE capture requires synchronous scheduling")
+    if pipeline_parallel_size != 1:
+        raise RuntimeError("Online EAGLE capture requires pipeline_parallel_size=1")
+    resolved = dict(config)
+    reserved_fields = {"worker_rank", "aux_layer_ids"}.intersection(resolved)
+    if reserved_fields:
+        raise ValueError(
+            "Online EAGLE capture fields are worker-owned: "
+            + ", ".join(sorted(reserved_fields))
+        )
+    resolved["worker_rank"] = worker_rank
+    resolved.setdefault("max_window_tokens", max_window_tokens)
+    resolved["aux_layer_ids"] = list(aux_layer_ids())
+    return OnlineEagleCaptureConfig.from_mapping(resolved)
+
+
 @dataclass
 class _PendingCopy:
     rows: list[tuple[str, int]]
@@ -190,6 +239,28 @@ class OnlineEagleCapture:
         self.dropped_requests = 0
         self.dropped_windows = 0
         self.captured_rows = 0
+
+    def _copy_tensors_to_host(
+        self, tensors: Sequence[torch.Tensor]
+    ) -> tuple[tuple[torch.Tensor, ...], torch.cuda.Event | None]:
+        if not tensors[0].is_cuda:
+            return tuple(tensor.detach().cpu().clone() for tensor in tensors), None
+
+        if self._copy_stream is None:
+            self._copy_stream = torch.cuda.Stream(device=tensors[0].device)
+        default_stream = torch.cuda.current_stream(tensors[0].device)
+        with torch.cuda.stream(self._copy_stream):
+            self._copy_stream.wait_stream(default_stream)
+            host_tensors = tuple(
+                torch.empty_like(tensor, device="cpu", pin_memory=True)
+                for tensor in tensors
+            )
+            for host, source in zip(host_tensors, tensors, strict=True):
+                host.copy_(source, non_blocking=True)
+            _record_stream_for_async_copy(tensors, self._copy_stream)
+            event = torch.cuda.Event()
+            event.record(self._copy_stream)
+        return host_tensors, event
 
     def admit_request(
         self,
@@ -256,39 +327,17 @@ class OnlineEagleCapture:
         ):
             raise ValueError("sampled token metadata lengths do not match")
 
-        if not sampled_token_ids.is_cuda:
-            pending = _PendingSamples(
+        host_tensors, event = self._copy_tensors_to_host(
+            (sampled_token_ids, num_sampled_tokens)
+        )
+        self._pending.append(
+            _PendingSamples(
                 request_ids=tuple(request_ids),
-                token_ids=sampled_token_ids.detach().cpu().clone(),
-                num_sampled_tokens=num_sampled_tokens.detach().cpu().clone(),
-                event=None,
-            )
-        else:
-            if self._copy_stream is None:
-                self._copy_stream = torch.cuda.Stream(device=sampled_token_ids.device)
-            default_stream = torch.cuda.current_stream(sampled_token_ids.device)
-            with torch.cuda.stream(self._copy_stream):
-                self._copy_stream.wait_stream(default_stream)
-                host_tokens = torch.empty_like(
-                    sampled_token_ids, device="cpu", pin_memory=True
-                )
-                host_counts = torch.empty_like(
-                    num_sampled_tokens, device="cpu", pin_memory=True
-                )
-                host_tokens.copy_(sampled_token_ids, non_blocking=True)
-                host_counts.copy_(num_sampled_tokens, non_blocking=True)
-                _record_stream_for_async_copy(
-                    (sampled_token_ids, num_sampled_tokens), self._copy_stream
-                )
-                event = torch.cuda.Event()
-                event.record(self._copy_stream)
-            pending = _PendingSamples(
-                request_ids=tuple(request_ids),
-                token_ids=host_tokens,
-                num_sampled_tokens=host_counts,
+                token_ids=host_tensors[0],
+                num_sampled_tokens=host_tensors[1],
                 event=event,
             )
-        self._pending.append(pending)
+        )
         self._drain_pending(wait=False)
 
     def _selected_forward_rows(
@@ -342,41 +391,14 @@ class OnlineEagleCapture:
             0, indices
         )
         selected_head_inputs = head_input_hidden_states.index_select(0, indices)
-        if not selected_tokens.is_cuda:
-            return _PendingCopy(
-                rows=rows,
-                token_ids=selected_tokens.detach().cpu().clone(),
-                aux_hidden_states=selected_aux.detach().cpu().clone(),
-                head_input_hidden_states=selected_head_inputs.detach().cpu().clone(),
-                event=None,
-            )
-
-        if self._copy_stream is None:
-            self._copy_stream = torch.cuda.Stream(device=selected_tokens.device)
-        default_stream = torch.cuda.current_stream(selected_tokens.device)
-        with torch.cuda.stream(self._copy_stream):
-            self._copy_stream.wait_stream(default_stream)
-            host_tokens = torch.empty_like(
-                selected_tokens, device="cpu", pin_memory=True
-            )
-            host_aux = torch.empty_like(selected_aux, device="cpu", pin_memory=True)
-            host_head_inputs = torch.empty_like(
-                selected_head_inputs, device="cpu", pin_memory=True
-            )
-            host_tokens.copy_(selected_tokens, non_blocking=True)
-            host_aux.copy_(selected_aux, non_blocking=True)
-            host_head_inputs.copy_(selected_head_inputs, non_blocking=True)
-            _record_stream_for_async_copy(
-                (selected_tokens, selected_aux, selected_head_inputs),
-                self._copy_stream,
-            )
-            event = torch.cuda.Event()
-            event.record(self._copy_stream)
+        host_tensors, event = self._copy_tensors_to_host(
+            (selected_tokens, selected_aux, selected_head_inputs)
+        )
         return _PendingCopy(
             rows=rows,
-            token_ids=host_tokens,
-            aux_hidden_states=host_aux,
-            head_input_hidden_states=host_head_inputs,
+            token_ids=host_tensors[0],
+            aux_hidden_states=host_tensors[1],
+            head_input_hidden_states=host_tensors[2],
             event=event,
         )
 
@@ -421,6 +443,41 @@ class OnlineEagleCapture:
         self.captured_rows += len(rows)
         self._drain_pending(wait=False)
 
+    def _store_pending_samples(self, pending: _PendingSamples) -> None:
+        for index, request_id in enumerate(pending.request_ids):
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            count = int(pending.num_sampled_tokens[index].item())
+            if count < 0 or count > pending.token_ids.shape[1]:
+                raise ValueError("sampled token count is out of bounds")
+            sampled = tuple(
+                int(token) for token in pending.token_ids[index, :count].tolist()
+            )
+            request.output_token_ids = (request.output_token_ids or ()) + sampled
+            if request.final_output_length is not None:
+                request.output_token_ids = request.output_token_ids[
+                    : request.final_output_length
+                ]
+
+    def _store_pending_rows(self, pending: _PendingCopy) -> None:
+        for index, (request_id, position) in enumerate(pending.rows):
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            token_id = int(pending.token_ids[index].item())
+            stale = [
+                key
+                for key in request.provisional
+                if key[0] == position or key[0] < request.retention_floor
+            ]
+            for key in stale:
+                del request.provisional[key]
+            request.provisional[(position, token_id)] = (
+                pending.aux_hidden_states[index].clone(),
+                pending.head_input_hidden_states[index].clone(),
+            )
+
     def _drain_pending(self, *, wait: bool) -> None:
         remaining: list[_PendingCopy | _PendingSamples] = []
         for pending in self._pending:
@@ -430,40 +487,9 @@ class OnlineEagleCapture:
                     continue
                 pending.event.synchronize()
             if isinstance(pending, _PendingSamples):
-                for index, request_id in enumerate(pending.request_ids):
-                    request = self.requests.get(request_id)
-                    if request is None:
-                        continue
-                    count = int(pending.num_sampled_tokens[index].item())
-                    if count < 0 or count > pending.token_ids.shape[1]:
-                        raise ValueError("sampled token count is out of bounds")
-                    sampled = tuple(
-                        int(token)
-                        for token in pending.token_ids[index, :count].tolist()
-                    )
-                    existing = request.output_token_ids or ()
-                    request.output_token_ids = existing + sampled
-                    if request.final_output_length is not None:
-                        request.output_token_ids = request.output_token_ids[
-                            : request.final_output_length
-                        ]
-                continue
-            for index, (request_id, position) in enumerate(pending.rows):
-                request = self.requests.get(request_id)
-                if request is None:
-                    continue
-                token_id = int(pending.token_ids[index].item())
-                stale = [
-                    key
-                    for key in request.provisional
-                    if key[0] == position or key[0] < request.retention_floor
-                ]
-                for key in stale:
-                    del request.provisional[key]
-                request.provisional[(position, token_id)] = (
-                    pending.aux_hidden_states[index].clone(),
-                    pending.head_input_hidden_states[index].clone(),
-                )
+                self._store_pending_samples(pending)
+            else:
+                self._store_pending_rows(pending)
         self._pending = remaining
 
     @staticmethod
@@ -642,6 +668,8 @@ __all__ = [
     "TARGET_EMBEDDING_NAME",
     "draft_vocab_target_ids",
     "project_target_head",
+    "refresh_target_owned_draft_weights",
+    "resolve_online_eagle_capture_config",
     "target_embedding_weight",
     "target_head_weight",
 ]

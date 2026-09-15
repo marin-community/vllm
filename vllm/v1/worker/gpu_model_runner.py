@@ -205,11 +205,9 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_scheduler_for_invalid_drafts,
 )
 from vllm.v1.spec_decode.online_eagle import (
-    LM_HEAD_WEIGHT_NAME,
     OnlineEagleCapture,
-    OnlineEagleCaptureConfig,
-    project_target_head,
-    target_head_weight,
+    refresh_target_owned_draft_weights,
+    resolve_online_eagle_capture_config,
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -3360,26 +3358,19 @@ class GPUModelRunner(
 
     def begin_online_eagle_capture(self, config: dict[str, Any]) -> dict[str, Any]:
         """Begin one bounded capture interval before admitting rollout requests."""
-        if (
-            self.speculative_config is None
-            or self.speculative_config.method != "eagle3"
-        ):
-            raise RuntimeError("Online EAGLE capture requires an EAGLE-3 drafter")
-        if self.use_async_scheduling:
-            raise RuntimeError("Online EAGLE capture requires synchronous scheduling")
-        if get_pp_group().world_size != 1:
-            raise RuntimeError("Online EAGLE capture requires pipeline_parallel_size=1")
-        resolved = dict(config)
-        reserved_fields = {"worker_rank", "aux_layer_ids"}.intersection(resolved)
-        if reserved_fields:
-            raise ValueError(
-                "Online EAGLE capture fields are worker-owned: "
-                + ", ".join(sorted(reserved_fields))
-            )
-        resolved["worker_rank"] = self.parallel_config.data_parallel_rank
-        resolved.setdefault("max_window_tokens", self.effective_drafter_max_model_len)
-        resolved["aux_layer_ids"] = list(self._resolve_eagle3_aux_layers())
-        capture_config = OnlineEagleCaptureConfig.from_mapping(resolved)
+        capture_config = resolve_online_eagle_capture_config(
+            config,
+            speculative_method=(
+                self.speculative_config.method
+                if self.speculative_config is not None
+                else None
+            ),
+            async_scheduling=self.use_async_scheduling,
+            pipeline_parallel_size=get_pp_group().world_size,
+            worker_rank=self.parallel_config.data_parallel_rank,
+            max_window_tokens=self.effective_drafter_max_model_len,
+            aux_layer_ids=self._resolve_eagle3_aux_layers,
+        )
         self.online_eagle_capture = OnlineEagleCapture(capture_config)
         return {
             "active": True,
@@ -3408,27 +3399,7 @@ class GPUModelRunner(
 
     def refresh_online_eagle_target_owned_weights(self) -> None:
         """Refresh the draft-vocabulary head after target policy synchronization."""
-        draft_model = self.get_draft_model()
-        if draft_model is None:
-            return
-        if not isinstance(
-            getattr(draft_model, "draft_id_to_target_id", None), torch.Tensor
-        ):
-            return
-        target_head = target_head_weight(self.get_model())
-        draft_parameters = dict(draft_model.named_parameters())
-        draft_head = draft_parameters.get(LM_HEAD_WEIGHT_NAME)
-        if draft_head is None:
-            raise RuntimeError(
-                f"Embedding-free EAGLE draft has no {LM_HEAD_WEIGHT_NAME}"
-            )
-        projected = project_target_head(draft_model, target_head)
-        if projected.shape != draft_head.shape:
-            raise RuntimeError(
-                "Projected target head does not match the EAGLE draft head"
-            )
-        with torch.no_grad():
-            draft_head.copy_(projected)
+        refresh_target_owned_draft_weights(self.get_model(), self.get_draft_model())
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()

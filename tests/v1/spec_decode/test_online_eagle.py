@@ -64,13 +64,22 @@ def _capture_config(**overrides) -> OnlineEagleCaptureConfig:
     return OnlineEagleCaptureConfig.from_mapping(values)
 
 
-def _runner_with_shared_embedding() -> tuple[_TargetModel, _DraftModel, GPUModelRunner]:
-    target = _TargetModel()
-    draft = _DraftModel(target.model.embed_tokens)
+def _legacy_runner(target: _TargetModel, draft: _DraftModel) -> GPUModelRunner:
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.model = target
     runner.drafter = SimpleNamespace(model=draft)
-    return target, draft, runner
+    return runner
+
+
+def _v2_runner(
+    target: _TargetModel, draft: _DraftModel
+) -> gpu_model_runner_v2.GPUModelRunner:
+    runner = gpu_model_runner_v2.GPUModelRunner.__new__(
+        gpu_model_runner_v2.GPUModelRunner
+    )
+    runner.model = target
+    runner.get_draft_model = lambda: draft
+    return runner
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA side streams")
@@ -275,6 +284,8 @@ def test_begin_capture_rejects_worker_owned_fields(monkeypatch) -> None:
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.speculative_config = SimpleNamespace(method="eagle3")
     runner.use_async_scheduling = False
+    runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
+    runner.effective_drafter_max_model_len = 8
     monkeypatch.setattr(
         gpu_model_runner,
         "get_pp_group",
@@ -285,24 +296,12 @@ def test_begin_capture_rejects_worker_owned_fields(monkeypatch) -> None:
         runner.begin_online_eagle_capture({"worker_rank": 3})
 
 
-def test_target_sync_refreshes_draft_vocabulary_head() -> None:
-    target, draft, runner = _runner_with_shared_embedding()
-    target.lm_head.weight.data.copy_(torch.arange(128).reshape(64, 2))
-
-    runner.refresh_online_eagle_target_owned_weights()
-
-    assert torch.equal(draft.lm_head.weight, target.lm_head.weight[[1, 3, 5, 7]])
-
-
-def test_v2_target_sync_refreshes_draft_vocabulary_head() -> None:
+@pytest.mark.parametrize("runner_factory", [_legacy_runner, _v2_runner])
+def test_target_sync_refreshes_draft_vocabulary_head(runner_factory) -> None:
     target = _TargetModel()
     draft = _DraftModel(target.model.embed_tokens)
+    runner = runner_factory(target, draft)
     target.lm_head.weight.data.copy_(torch.arange(128).reshape(64, 2))
-    runner = gpu_model_runner_v2.GPUModelRunner.__new__(
-        gpu_model_runner_v2.GPUModelRunner
-    )
-    runner.model = target
-    runner.get_draft_model = lambda: draft
 
     runner.refresh_online_eagle_target_owned_weights()
 
