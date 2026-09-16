@@ -22,6 +22,10 @@ class PromptLogprobsWorker:
         self.in_progress_prompt_logprobs: dict[str, list[LogprobsTensors]] = {}
 
     def add_request(self, req_id: str, req_idx: int, sampling_params: SamplingParams):
+        if sampling_params.prompt_logprob_token_ids is not None:
+            raise NotImplementedError(
+                "prompt_logprob_token_ids requires the V1 GPU model runner"
+            )
         uses_prompt_logprobs = sampling_params.prompt_logprobs is not None
         self.uses_prompt_logprobs[req_idx] = uses_prompt_logprobs
         self.num_prompt_logprobs[req_idx] = sampling_params.prompt_logprobs or 0

@@ -356,6 +356,33 @@ class Sampler(nn.Module):
         return LogprobsTensors(indices, logprobs, token_ranks)
 
     @staticmethod
+    def gather_prompt_logprobs_for_token_ids(
+        logprobs: torch.Tensor,
+        prompt_token_ids: torch.Tensor,
+        candidate_token_ids: torch.Tensor,
+    ) -> LogprobsTensors:
+        """Gather exact per-position prompt candidates without a top-k sort."""
+        if (
+            prompt_token_ids.dtype != torch.int64
+            or candidate_token_ids.dtype != torch.int64
+            or candidate_token_ids.ndim != 2
+            or candidate_token_ids.shape[0] != prompt_token_ids.numel()
+            or candidate_token_ids.shape[1] == 0
+        ):
+            raise ValueError("prompt candidates must be a nonempty int64 matrix aligned with prompt tokens")
+        chosen_ids = prompt_token_ids.unsqueeze(-1)
+        chosen_scores = logprobs.gather(-1, chosen_ids)
+        candidate_scores = logprobs.gather(-1, candidate_token_ids)
+        torch._dynamo.decorators.mark_unbacked(logprobs, 0)
+        torch._dynamo.decorators.mark_unbacked(chosen_scores, 0)
+        ranks = batched_count_greater_than(logprobs, chosen_scores)
+        return LogprobsTensors(
+            torch.cat((chosen_ids, candidate_token_ids), dim=-1).to(torch.int32),
+            torch.cat((chosen_scores, candidate_scores), dim=-1),
+            ranks,
+        )
+
+    @staticmethod
     def _combine_outputs_with_spec_tokens(
         output_token_ids: list[list[int]],
         spec_token_ids: list[list[int]] | None = None,

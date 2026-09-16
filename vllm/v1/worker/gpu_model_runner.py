@@ -5421,6 +5421,15 @@ class GPUModelRunner(
                 continue
 
             num_prompt_tokens = len(request.prompt_token_ids)
+            requested_ids = (
+                request.sampling_params.prompt_logprob_token_ids
+                if request.sampling_params is not None
+                else None
+            )
+            if requested_ids is not None and len(requested_ids) != num_prompt_tokens:
+                raise ValueError(
+                    "prompt_logprob_token_ids must have one row per prompt token"
+                )
             prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
                 self.device, non_blocking=True
             )
@@ -5472,9 +5481,21 @@ class GPUModelRunner(
 
             # Compute prompt logprobs.
             logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
+            if requested_ids is None:
+                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                    logprobs, num_prompt_logprobs, tgt_token_ids
+                )
+            else:
+                candidate_ids = torch.tensor(
+                    requested_ids[start_tok : start_tok + num_logits],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                token_ids, logprobs, ranks, _ = (
+                    self.sampler.gather_prompt_logprobs_for_token_ids(
+                        logprobs, tgt_token_ids, candidate_ids
+                    )
+                )
 
             # Transfer GPU->CPU async.
             chunk_slice = slice(start_idx, start_idx + num_logits)

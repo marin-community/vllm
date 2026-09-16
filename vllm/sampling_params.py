@@ -275,6 +275,10 @@ class SamplingParams(
     prompt_logprobs: int | None = None
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
+    prompt_logprob_token_ids: list[list[int]] | None = None
+    """Exact token IDs to score at each prompt position, in addition to the
+    actual prompt token. Requires `prompt_logprobs` equal to each row's width.
+    The outer list has one row per prompt token, including the first token."""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -373,6 +377,7 @@ class SamplingParams(
         min_tokens: int = 0,
         logprobs: int | None = None,
         prompt_logprobs: int | None = None,
+        prompt_logprob_token_ids: list[list[int]] | None = None,
         detokenize: bool = True,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
@@ -414,6 +419,7 @@ class SamplingParams(
             min_tokens=min_tokens,
             logprobs=logprobs,
             prompt_logprobs=prompt_logprobs,
+            prompt_logprob_token_ids=prompt_logprob_token_ids,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
@@ -575,6 +581,25 @@ class SamplingParams(
                 parameter="prompt_logprobs",
                 value=self.prompt_logprobs,
             )
+        if self.prompt_logprob_token_ids is not None:
+            width = self.prompt_logprobs
+            if width is None or width <= 0:
+                raise VLLMValidationError(
+                    "prompt_logprob_token_ids requires positive prompt_logprobs",
+                    parameter="prompt_logprob_token_ids",
+                    value=width,
+                )
+            if not isinstance(self.prompt_logprob_token_ids, list) or any(
+                not isinstance(row, list)
+                or len(row) != width
+                or any(type(token_id) is not int or token_id < 0 for token_id in row)
+                for row in self.prompt_logprob_token_ids
+            ):
+                raise VLLMValidationError(
+                    "prompt_logprob_token_ids must contain one non-negative integer row per prompt token",
+                    parameter="prompt_logprob_token_ids",
+                    value=self.prompt_logprob_token_ids,
+                )
         assert isinstance(self.stop_token_ids, list)
         if not all(isinstance(st_id, int) for st_id in self.stop_token_ids):
             raise ValueError(
@@ -770,6 +795,19 @@ class SamplingParams(
                     f"logprobs={self.logprobs}, len(logprob_token_ids)={n}.",
                     parameter="logprob_token_ids",
                     value=n,
+                )
+
+        if self.prompt_logprob_token_ids is not None:
+            vocab_size = model_config.get_vocab_size()
+            if any(
+                token_id >= vocab_size
+                for row in self.prompt_logprob_token_ids
+                for token_id in row
+            ):
+                raise VLLMValidationError(
+                    "prompt_logprob_token_ids contains an out-of-vocabulary token ID",
+                    parameter="prompt_logprob_token_ids",
+                    value=vocab_size,
                 )
 
         # Validate prompt logprobs.
