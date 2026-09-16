@@ -179,6 +179,7 @@ def append_logprobs_for_next_position(
     decoded_tokens: Iterable[str | None],
     rank: int,
     num_logprobs: int,
+    candidates_are_topk: bool = True,
 ) -> None:
     """Appends logprobs for the next position"""
     if num_logprobs == -1:
@@ -186,8 +187,12 @@ def append_logprobs_for_next_position(
     # We do not need a special case for the sampled token
     # being in the topk, since inserting duplicated data
     # into a dictionary twice is the same as doing it once.
-    topk_ranks = range(1, num_logprobs + 1)
-    ranks = itertools.chain((rank,), topk_ranks)
+    candidate_ranks = (
+        range(1, num_logprobs + 1)
+        if candidates_are_topk
+        else (rank if token_id == token_ids[0] else None for token_id in token_ids[1:])
+    )
+    ranks = itertools.chain((rank,), candidate_ranks)
 
     if isinstance(request_logprobs, FlatLogprobs):
         request_logprobs.append_fast(token_ids, logprobs, ranks, decoded_tokens)

@@ -7,6 +7,7 @@ import torch
 
 from vllm import SamplingParams
 from vllm.exceptions import VLLMValidationError
+from vllm.logprobs import FlatLogprobs, append_logprobs_for_next_position
 from vllm.v1.sample.sampler import Sampler
 
 
@@ -20,7 +21,10 @@ def test_selected_prompt_scores_match_independent_full_vocabulary_reference():
     )
     expected_ids = torch.tensor([[2, 0, 3], [3, 1, 2]], dtype=torch.int32)
     expected_scores = torch.stack(
-        [logits[row].log_softmax(dim=-1)[ids.long()] for row, ids in enumerate(expected_ids)]
+        [
+            logits[row].log_softmax(dim=-1)[ids.long()]
+            for row, ids in enumerate(expected_ids)
+        ]
     )
 
     assert torch.equal(result.logprob_token_ids, expected_ids)
@@ -30,7 +34,31 @@ def test_selected_prompt_scores_match_independent_full_vocabulary_reference():
 
 def test_selected_prompt_ids_reject_out_of_vocabulary_request():
     params = SamplingParams(prompt_logprobs=2, prompt_logprob_token_ids=[[1, 10]])
-    model = SimpleNamespace(max_logprobs=20, logits_processors=None, get_vocab_size=lambda: 10)
+    model = SimpleNamespace(
+        max_logprobs=20, logits_processors=None, get_vocab_size=lambda: 10
+    )
 
     with pytest.raises(VLLMValidationError, match="out-of-vocabulary"):
-        params.verify(model, speculative_config=None, structured_outputs_config=None, tokenizer=None)
+        params.verify(
+            model,
+            speculative_config=None,
+            structured_outputs_config=None,
+            tokenizer=None,
+        )
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_selected_prompt_candidates_do_not_claim_topk_ranks(flat: bool):
+    output = FlatLogprobs() if flat else []
+    append_logprobs_for_next_position(
+        output,
+        token_ids=[2, 0, 2],
+        logprobs=[-0.4, -2.0, -0.4],
+        decoded_tokens=[None, None, None],
+        rank=3,
+        num_logprobs=2,
+        candidates_are_topk=False,
+    )
+
+    assert output[0][0].rank is None
+    assert output[0][2].rank == 3

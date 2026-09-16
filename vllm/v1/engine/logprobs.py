@@ -38,6 +38,7 @@ class LogprobsProcessor:
     cumulative_logprob: float | None
     num_logprobs: int | None
     num_prompt_logprobs: int | None
+    prompt_candidates_are_topk: bool = True
 
     @classmethod
     def from_new_request(
@@ -64,6 +65,9 @@ class LogprobsProcessor:
             ),
             num_prompt_logprobs=num_prompt_logprobs,
             num_logprobs=num_logprobs,
+            prompt_candidates_are_topk=(
+                sampling_params.prompt_logprob_token_ids is None
+            ),
         )
 
     def _update_sample_logprobs(self, logprobs_lists: LogprobsLists) -> None:
@@ -184,6 +188,7 @@ class LogprobsProcessor:
                 decoded_tokens_for_pos,
                 prompt_token_ranks[pos],
                 self.num_prompt_logprobs,
+                candidates_are_topk=self.prompt_candidates_are_topk,
             )
 
     def pop_prompt_logprobs(self) -> PromptLogprobs | None:

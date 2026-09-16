@@ -16,7 +16,9 @@ def main() -> None:
         gpu_memory_utilization=0.5,
         enforce_eager=True,
     )
-    prompt_ids = model.get_tokenizer().encode("Answer briefly: 2 + 2 =", add_special_tokens=False)
+    prompt_ids = model.get_tokenizer().encode(
+        "Answer briefly: 2 + 2 =", add_special_tokens=False
+    )
     prompt = TokensPrompt(prompt_token_ids=prompt_ids)
     candidate_ids = [17, 29]
     selected = model.generate(
@@ -35,14 +37,28 @@ def main() -> None:
     assert selected is not None and reference is not None
     assert len(selected) == len(reference) == len(prompt_ids)
     differences = []
-    for selected_row, reference_row in zip(selected[1:], reference[1:], strict=True):
+    for position, (selected_row, reference_row) in enumerate(
+        zip(selected[1:], reference[1:], strict=True), start=1
+    ):
         assert selected_row is not None and reference_row is not None
         for token_id in candidate_ids:
             assert token_id in selected_row and token_id in reference_row
-            differences.append(abs(selected_row[token_id].logprob - reference_row[token_id].logprob))
+            if token_id != prompt_ids[position]:
+                assert selected_row[token_id].rank is None
+            differences.append(
+                abs(selected_row[token_id].logprob - reference_row[token_id].logprob)
+            )
     max_difference = max(differences)
     assert math.isfinite(max_difference) and max_difference <= 1e-5
-    print(json.dumps({"positions": len(prompt_ids) - 1, "candidates": len(candidate_ids), "max_abs_diff": max_difference}))
+    print(
+        json.dumps(
+            {
+                "positions": len(prompt_ids) - 1,
+                "candidates": len(candidate_ids),
+                "max_abs_diff": max_difference,
+            }
+        )
+    )
 
 
 if __name__ == "__main__":
