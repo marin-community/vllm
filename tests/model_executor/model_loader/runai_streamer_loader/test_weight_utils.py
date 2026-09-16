@@ -3,11 +3,19 @@
 
 import glob
 import tempfile
+from types import SimpleNamespace
 
 import huggingface_hub.constants
+import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm.config.weight_transfer import WeightTransferConfig
+from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+from vllm.distributed.weight_transfer import runai_streamer_engine
+from vllm.distributed.weight_transfer.runai_streamer_engine import (
+    RunaiStreamerWeightTransferUpdateInfo,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     runai_safetensors_weights_iterator,
@@ -34,6 +42,49 @@ def test_runai_safetensors_weights_iterator_clones_reused_buffers(
     assert actual_tensors["first"].data_ptr() != actual_tensors["second"].data_ptr()
     for name, expected_tensor in expected_tensors.items():
         assert torch.equal(actual_tensors[name], expected_tensor)
+
+
+class _LoadableLinear(torch.nn.Linear):
+    def load_weights(self, weights) -> None:
+        parameters = dict(self.named_parameters())
+        for name, tensor in weights:
+            parameters[name].data.copy_(tensor)
+
+
+def test_runai_streamer_receiver_loads_exact_safetensors_object(
+    tmp_path, monkeypatch
+):
+    weights_path = tmp_path / "model.safetensors"
+    expected = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    save_file({"weight": expected}, weights_path)
+    model = _LoadableLinear(3, 2, bias=False)
+    storage_pointer = model.weight.data_ptr()
+    monkeypatch.setattr(
+        runai_streamer_engine,
+        "runai_safetensors_weights_iterator",
+        safetensors_weights_iterator,
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(), model_config=SimpleNamespace()
+    )
+    engine = WeightTransferEngineFactory.create_engine(
+        WeightTransferConfig(backend="runai_streamer"),
+        vllm_config,
+        torch.device("cpu"),
+        model,
+    )
+
+    engine.receive_weights(
+        RunaiStreamerWeightTransferUpdateInfo(weights_path=str(weights_path))
+    )
+
+    assert torch.equal(model.weight, expected)
+    assert model.weight.data_ptr() == storage_pointer
+
+
+def test_runai_streamer_receiver_requires_exact_object_uri():
+    with pytest.raises(ValueError, match="exact object URI"):
+        RunaiStreamerWeightTransferUpdateInfo()
 
 
 def test_runai_model_loader():

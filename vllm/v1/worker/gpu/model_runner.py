@@ -78,6 +78,11 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.spec_decode.online_eagle import (
+    OnlineEagleCapture,
+    refresh_target_owned_draft_weights,
+    resolve_online_eagle_capture_config,
+)
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.worker.block_table import get_block_table_width
@@ -156,6 +161,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     resolve_adaptive_cudagraph_mode,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+    resolve_eagle3_aux_hidden_state_layers,
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
 )
@@ -309,6 +315,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing = StepTimingCollector()
 
         # General request states.
+        self.online_eagle_capture: OnlineEagleCapture | None = None
         self.req_states = RequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -528,6 +535,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not isinstance(speculator, DraftModelSpeculator):
             return None
         return speculator.model
+
+    def _resolve_online_eagle_aux_layers(self) -> tuple[int, ...]:
+        assert self.speculative_config is not None
+        return resolve_eagle3_aux_hidden_state_layers(
+            self.get_model(), self.speculative_config
+        )[1]
+
+    def begin_online_eagle_capture(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Begin one bounded capture interval before admitting rollout requests."""
+        capture_config = resolve_online_eagle_capture_config(
+            config,
+            speculative_method=(
+                self.speculative_config.method
+                if self.speculative_config is not None
+                else None
+            ),
+            async_scheduling=bool(self.scheduler_config.async_scheduling),
+            pipeline_parallel_size=get_pp_group().world_size,
+            worker_rank=self.dp_rank,
+            max_window_tokens=self.max_model_len,
+            aux_layer_ids=self._resolve_online_eagle_aux_layers,
+        )
+        self.online_eagle_capture = OnlineEagleCapture(capture_config)
+        return {
+            "active": True,
+            "worker_rank": capture_config.worker_rank,
+            "step": capture_config.step,
+        }
+
+    def seal_online_eagle_capture(self, output_dir: str) -> dict[str, Any]:
+        """Seal the active interval before target weights can be synchronized."""
+        capture = self.online_eagle_capture
+        if capture is None:
+            raise RuntimeError("No online EAGLE capture interval is active")
+        draft_model = self.get_draft_model()
+        if draft_model is None:
+            raise RuntimeError("Online EAGLE capture requires a resident draft model")
+        try:
+            return capture.seal(
+                output_dir,
+                target_model=self.get_model(),
+                draft_model=draft_model,
+                target_config=self.model_config.hf_config.to_dict(),
+            )
+        finally:
+            self.online_eagle_capture = None
+
+    def refresh_online_eagle_target_owned_weights(self) -> None:
+        """Refresh the draft-vocabulary head after target policy synchronization."""
+        refresh_target_owned_draft_weights(self.get_model(), self.get_draft_model())
 
     def reload_weights(self, *args, **kwargs) -> None:
         # TODO(Wentao): Use full version instead of import when fully migrated to v2
@@ -1053,6 +1110,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
+        capture = self.online_eagle_capture
+        if capture is not None:
+            for (
+                req_id,
+                output_length,
+            ) in scheduler_output.finished_req_output_lengths.items():
+                capture.finalize_request_length(req_id, output_length)
         if self.pooling_runner is not None:
             # Preempted docs keep their query-use reservation until rescheduled.
             self.pooling_runner.on_requests_finished(finished_req_ids)
@@ -1099,6 +1163,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
+            capture = self.online_eagle_capture
+            if capture is not None and sampling_params is not None:
+                capture.admit_request(
+                    req_id,
+                    new_req_data.prompt_token_ids,
+                    sampling_params.max_tokens,
+                )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
@@ -1904,6 +1975,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        capture = self.online_eagle_capture
+        if not dummy_run and capture is not None:
+            if aux_hidden_states is None or hidden_states is None:
+                raise RuntimeError(
+                    "Online EAGLE capture requires target auxiliary and final "
+                    "hidden states on a single pipeline stage"
+                )
+            capture.record_forward(
+                request_ids=input_batch.req_ids,
+                num_scheduled_tokens=input_batch.num_scheduled_tokens,
+                num_computed_tokens=input_batch.num_computed_tokens_np,
+                input_ids=input_batch.input_ids[: input_batch.num_tokens],
+                aux_hidden_states=aux_hidden_states,
+                head_input_hidden_states=hidden_states,
+            )
+
         routed_experts = None
         if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
             assert slot_mappings is not None
@@ -1988,6 +2075,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        capture = self.online_eagle_capture
+        if capture is not None:
+            capture.record_sampled(
+                request_ids=input_batch.req_ids,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                num_sampled_tokens=num_sampled,
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).

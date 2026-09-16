@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 from collections import Counter
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
@@ -155,6 +155,11 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+    # Worker-discovered metadata used to keep a drafter's attention layers in
+    # one cache group. It is not part of cache compatibility or memory layout.
+    is_draft_attention: bool = field(
+        default=False, compare=False, repr=False, kw_only=True
+    )
 
     @property
     def prefix_cacheable(self) -> bool:
