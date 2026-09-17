@@ -290,7 +290,7 @@ def test_grug_model_returns_requested_eagle3_auxiliary_states():
     model._set_aux_hidden_state_layers((0, 2))
     input_ids = torch.tensor([1, 3])
 
-    final_hidden_state, auxiliary_states = model(input_ids, torch.arange(2))
+    final_hidden_state, auxiliary_states = model.forward(input_ids, torch.arange(2))
 
     embedded = model.embed_tokens(input_ids)
     assert torch.equal(final_hidden_state, embedded + 7)
