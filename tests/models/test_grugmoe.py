@@ -1277,6 +1277,66 @@ def test_grug_moe_3d_expert_weights_load_into_fused_moe_layout():
     torch.testing.assert_close(routed_experts.w2_weight, down_weight)
 
 
+def test_grug_moe_split_expert_weights_load_into_fused_moe_layout():
+    cfg = _tiny_config()
+    mlp = GrugMoeMLP(cfg, params_dtype=torch.float32)
+    params_dict = dict(mlp.named_parameters())
+    gate_weight = torch.arange(
+        cfg.num_experts * cfg.intermediate_dim * cfg.hidden_dim,
+        dtype=torch.float32,
+    ).view(cfg.num_experts, cfg.intermediate_dim, cfg.hidden_dim)
+    up_weight = gate_weight + 1000
+    down_weight = torch.arange(
+        cfg.num_experts * cfg.hidden_dim * cfg.intermediate_dim,
+        dtype=torch.float32,
+    ).view(cfg.num_experts, cfg.hidden_dim, cfg.intermediate_dim)
+
+    for expert_id in reversed(range(cfg.num_experts)):
+        assert (
+            _try_load_grug_expert_weight(
+                f"experts.{expert_id}.gate_proj.weight",
+                gate_weight[expert_id],
+                params_dict,
+            )
+            == "experts.routed_experts.w13_weight"
+        )
+        assert (
+            _try_load_grug_expert_weight(
+                f"experts.{expert_id}.up_proj.weight",
+                up_weight[expert_id],
+                params_dict,
+            )
+            == "experts.routed_experts.w13_weight"
+        )
+        assert (
+            _try_load_grug_expert_weight(
+                f"experts.{expert_id}.down_proj.weight",
+                down_weight[expert_id],
+                params_dict,
+            )
+            == "experts.routed_experts.w2_weight"
+        )
+
+    routed_experts = mlp.experts.routed_experts
+    torch.testing.assert_close(
+        routed_experts.w13_weight[:, : cfg.intermediate_dim, :],
+        gate_weight,
+    )
+    torch.testing.assert_close(
+        routed_experts.w13_weight[:, cfg.intermediate_dim :, :],
+        up_weight,
+    )
+    torch.testing.assert_close(routed_experts.w2_weight, down_weight)
+    assert (
+        _try_load_grug_expert_weight(
+            "shared_experts.0.gate_proj.weight",
+            gate_weight[0],
+            params_dict,
+        )
+        is None
+    )
+
+
 def test_grug_moe_tiny_decoder_layer_matches_reference_math():
     cfg = GrugMoeRuntimeConfig(
         vocab_size=32,
