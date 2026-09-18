@@ -13,8 +13,6 @@ import os
 import re
 import sys
 import zipfile
-from dataclasses import asdict, dataclass
-from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -77,23 +75,6 @@ REQUIRED_RUNTIME_GATES = (
     SPARSE_NCCL_GATE,
     SERVE_GATE,
 )
-
-
-class CandidatePublicationAction(StrEnum):
-    """The next safe transition for a candidate release."""
-
-    CREATE = "create"
-    RESUME = "resume"
-    PUBLISH = "publish"
-    VERIFIED = "verified"
-
-
-@dataclass(frozen=True)
-class CandidatePublicationPlan:
-    """The next transition and assets needed to complete it."""
-
-    action: CandidatePublicationAction
-    missing_assets: tuple[str, ...]
 
 
 def _expand_wheel_tag(tag: str) -> set[str]:
@@ -353,116 +334,6 @@ def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None
         raise ReleaseError("candidate tag does not match its fork commit")
     if manifest["validation"] != {"status": "pending", "targets": []}:
         raise ReleaseError("candidate validation state is not pending")
-
-
-def _candidate_asset_digests(
-    manifest: dict[str, Any], directory: Path, config: dict[str, Any]
-) -> dict[str, str]:
-    validate_candidate(manifest, config)
-    manifest_path = directory / MANIFEST_NAME
-    if load_json(manifest_path) != manifest:
-        raise ReleaseError("candidate manifest file disagrees with the release input")
-    verify_manifest_assets(manifest, directory)
-    filenames = [
-        MANIFEST_NAME,
-        *(platform["wheel"]["filename"] for platform in manifest["platforms"]),
-    ]
-    return {filename: sha256_file(directory / filename) for filename in filenames}
-
-
-def _validate_candidate_release_identity(
-    manifest: dict[str, Any], release: dict[str, Any]
-) -> None:
-    if release.get("tag_name") != manifest["release"]["tag"]:
-        raise ReleaseError("candidate release tag disagrees with its manifest")
-    if release.get("target_commitish") != manifest["source"]["fork_commit"]:
-        raise ReleaseError("candidate release targets a different commit")
-    if release.get("prerelease") is not True:
-        raise ReleaseError("candidate release is not a prerelease")
-    if not isinstance(release.get("draft"), bool):
-        raise ReleaseError("candidate release draft state is missing")
-
-
-def _validate_existing_candidate_assets(
-    release: dict[str, Any],
-    existing_directory: Path,
-    expected: dict[str, str],
-) -> set[str]:
-    release_assets = release.get("assets")
-    if not isinstance(release_assets, list):
-        raise ReleaseError("candidate release asset metadata is missing")
-    by_name = {asset.get("name"): asset for asset in release_assets}
-    if None in by_name or len(by_name) != len(release_assets):
-        raise ReleaseError("candidate release contains unnamed or duplicate assets")
-    asset_names = set(by_name)
-    unexpected = asset_names - set(expected)
-    if unexpected:
-        raise ReleaseError(
-            f"candidate release contains unexpected assets: {sorted(unexpected)}"
-        )
-
-    existing_paths = list(existing_directory.iterdir())
-    if any(not path.is_file() for path in existing_paths):
-        raise ReleaseError("downloaded candidate assets contain a non-file entry")
-    downloaded_names = {path.name for path in existing_paths}
-    if downloaded_names != asset_names:
-        raise ReleaseError(
-            "downloaded candidate assets disagree with release metadata: "
-            f"expected {sorted(asset_names)}, got {sorted(downloaded_names)}"
-        )
-
-    for name, asset in by_name.items():
-        if asset.get("state") != "uploaded":
-            raise ReleaseError(f"candidate asset has not finished uploading: {name}")
-        actual_digest = sha256_file(existing_directory / name)
-        recorded_digest = asset.get("digest")
-        if recorded_digest and recorded_digest != f"sha256:{actual_digest}":
-            raise ReleaseError(f"candidate asset digest metadata changed: {name}")
-        if actual_digest != expected[name]:
-            raise ReleaseError(f"existing candidate asset differs: {name}")
-    return asset_names
-
-
-def plan_candidate_publication(
-    manifest: dict[str, Any],
-    *,
-    candidate_directory: Path,
-    config: dict[str, Any],
-    release: dict[str, Any] | None,
-    existing_directory: Path,
-) -> CandidatePublicationPlan:
-    """Validate candidate state and return its next safe release transition."""
-    expected = _candidate_asset_digests(manifest, candidate_directory, config)
-    if release is None:
-        if any(existing_directory.iterdir()):
-            raise ReleaseError(
-                "candidate release is absent but downloaded assets exist"
-            )
-        return CandidatePublicationPlan(
-            action=CandidatePublicationAction.CREATE,
-            missing_assets=tuple(sorted(expected)),
-        )
-
-    _validate_candidate_release_identity(manifest, release)
-    asset_names = _validate_existing_candidate_assets(
-        release, existing_directory, expected
-    )
-    missing = tuple(sorted(set(expected) - asset_names))
-    if release["draft"]:
-        action = (
-            CandidatePublicationAction.RESUME
-            if missing
-            else CandidatePublicationAction.PUBLISH
-        )
-        return CandidatePublicationPlan(action=action, missing_assets=missing)
-    if missing:
-        raise ReleaseError(
-            f"published candidate is incomplete; missing assets: {list(missing)}"
-        )
-    return CandidatePublicationPlan(
-        action=CandidatePublicationAction.VERIFIED,
-        missing_assets=(),
-    )
 
 
 def _validate_manifest_common(
@@ -881,16 +752,6 @@ def parse_args() -> argparse.Namespace:
     candidate_parser.add_argument("--manifest", type=Path, required=True)
     candidate_parser.add_argument("--config", type=Path, required=True)
 
-    publication_parser = subparsers.add_parser("candidate-publication-plan")
-    publication_parser.add_argument("--manifest", type=Path, required=True)
-    publication_parser.add_argument("--directory", type=Path, required=True)
-    publication_parser.add_argument("--config", type=Path, required=True)
-    publication_parser.add_argument("--release", type=Path)
-    publication_parser.add_argument(
-        "--existing-directory", type=Path, required=True
-    )
-    publication_parser.add_argument("--output", type=Path, required=True)
-
     release_parser = subparsers.add_parser("verify-release")
     release_parser.add_argument("--manifest", type=Path, required=True)
     release_parser.add_argument("--directory", type=Path, required=True)
@@ -974,16 +835,6 @@ def main() -> int:
             return 0
         if args.command == "validate-candidate":
             validate_candidate(load_json(args.manifest), load_json(args.config))
-            return 0
-        if args.command == "candidate-publication-plan":
-            plan = plan_candidate_publication(
-                load_json(args.manifest),
-                candidate_directory=args.directory,
-                config=load_json(args.config),
-                release=load_json(args.release) if args.release else None,
-                existing_directory=args.existing_directory,
-            )
-            write_json(args.output, asdict(plan))
             return 0
         if args.command == "verify-release":
             verify_release_assets(
