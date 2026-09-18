@@ -76,8 +76,12 @@ The candidate manifest records:
 - wheel filename, tags, size, and SHA-256;
 - packaged `_C`, cuMem allocator, and Grug model state.
 
-Candidate tags and assets are immutable. A rerun verifies an existing
-candidate instead of replacing it.
+Candidate uploads start in a draft release. The publisher checks every existing
+asset against the assembled manifest, uploads only missing assets, downloads and
+verifies the complete set, and then makes the prerelease visible. If a run stops
+during upload, rerunning its failed publish job resumes the draft without
+overwriting an existing asset. A published candidate is immutable; reruns only
+verify its exact assets and hashes.
 
 ## GPU validation and release
 

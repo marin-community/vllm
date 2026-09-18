@@ -5,6 +5,7 @@ import base64
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -16,18 +17,26 @@ import yaml
 from infra.nightly.gpu_serve_smoke import server_command
 from infra.release.gpu_release import (
     GRUG_ARCHITECTURE,
+    MANIFEST_NAME,
     SPARSE_NCCL_GATE,
     STABLE_LIBTORCH_GATE,
+    CandidatePublicationAction,
     assemble_candidate,
     build_matrix,
     extract_validation,
     finalize_release,
     inspect_wheel,
+    plan_candidate_publication,
     validate_wheel_fragment,
     validation_matrix,
     verify_release_assets,
 )
-from infra.release.release_common import ReleaseError, load_json, sha256_file
+from infra.release.release_common import (
+    ReleaseError,
+    load_json,
+    sha256_file,
+    write_json,
+)
 
 REPOSITORY_ROOT = Path(__file__).parents[3]
 CONFIG_PATH = Path(__file__).parents[1] / "config.json"
@@ -202,6 +211,174 @@ def candidate(tmp_path: Path) -> dict:
         candidate_tag=CANDIDATE_TAG,
         created_at=BUILT_AT,
     )
+
+
+def candidate_release_snapshot(
+    manifest: dict, directory: Path, *, draft: bool
+) -> dict:
+    return {
+        "tag_name": manifest["release"]["tag"],
+        "target_commitish": manifest["source"]["fork_commit"],
+        "draft": draft,
+        "prerelease": True,
+        "assets": [
+            {
+                "name": path.name,
+                "state": "uploaded",
+                "digest": f"sha256:{sha256_file(path)}",
+            }
+            for path in sorted(directory.iterdir())
+        ],
+    }
+
+
+def candidate_publication_fixture(tmp_path: Path) -> tuple[dict, Path, Path]:
+    candidate_directory = tmp_path / "candidate"
+    candidate_directory.mkdir()
+    manifest = candidate(candidate_directory)
+    write_json(candidate_directory / MANIFEST_NAME, manifest)
+    existing_directory = tmp_path / "existing"
+    existing_directory.mkdir()
+    return manifest, candidate_directory, existing_directory
+
+
+def copy_candidate_assets(
+    manifest: dict, source: Path, destination: Path
+) -> None:
+    filenames = [
+        MANIFEST_NAME,
+        *(platform["wheel"]["filename"] for platform in manifest["platforms"]),
+    ]
+    for filename in filenames:
+        shutil.copy2(source / filename, destination / filename)
+
+
+def test_candidate_publication_creates_draft_before_uploading_assets(tmp_path):
+    manifest, candidate_directory, existing_directory = (
+        candidate_publication_fixture(tmp_path)
+    )
+
+    plan = plan_candidate_publication(
+        manifest,
+        candidate_directory=candidate_directory,
+        config=load_json(CONFIG_PATH),
+        release=None,
+        existing_directory=existing_directory,
+    )
+
+    assert plan.action is CandidatePublicationAction.CREATE
+    assert set(plan.missing_assets) == {
+        MANIFEST_NAME,
+        *(platform["wheel"]["filename"] for platform in manifest["platforms"]),
+    }
+
+
+def test_candidate_publication_verifies_complete_published_candidate(tmp_path):
+    manifest, candidate_directory, existing_directory = (
+        candidate_publication_fixture(tmp_path)
+    )
+    copy_candidate_assets(manifest, candidate_directory, existing_directory)
+    release = candidate_release_snapshot(
+        manifest, existing_directory, draft=False
+    )
+
+    plan = plan_candidate_publication(
+        manifest,
+        candidate_directory=candidate_directory,
+        config=load_json(CONFIG_PATH),
+        release=release,
+        existing_directory=existing_directory,
+    )
+
+    assert plan.action is CandidatePublicationAction.VERIFIED
+    assert plan.missing_assets == ()
+
+
+def test_candidate_publication_resumes_manifest_only_draft(tmp_path):
+    manifest, candidate_directory, existing_directory = (
+        candidate_publication_fixture(tmp_path)
+    )
+    shutil.copy2(
+        candidate_directory / MANIFEST_NAME,
+        existing_directory / MANIFEST_NAME,
+    )
+    release = candidate_release_snapshot(manifest, existing_directory, draft=True)
+
+    plan = plan_candidate_publication(
+        manifest,
+        candidate_directory=candidate_directory,
+        config=load_json(CONFIG_PATH),
+        release=release,
+        existing_directory=existing_directory,
+    )
+
+    assert plan.action is CandidatePublicationAction.RESUME
+    assert set(plan.missing_assets) == {
+        platform["wheel"]["filename"] for platform in manifest["platforms"]
+    }
+
+    for filename in plan.missing_assets:
+        shutil.copy2(candidate_directory / filename, existing_directory / filename)
+    resumed_release = candidate_release_snapshot(
+        manifest, existing_directory, draft=True
+    )
+    completed = plan_candidate_publication(
+        manifest,
+        candidate_directory=candidate_directory,
+        config=load_json(CONFIG_PATH),
+        release=resumed_release,
+        existing_directory=existing_directory,
+    )
+
+    assert completed.action is CandidatePublicationAction.PUBLISH
+    assert completed.missing_assets == ()
+
+
+@pytest.mark.parametrize("asset", [MANIFEST_NAME, "wheel"])
+def test_candidate_publication_rejects_changed_draft_assets(tmp_path, asset):
+    manifest, candidate_directory, existing_directory = (
+        candidate_publication_fixture(tmp_path)
+    )
+    copy_candidate_assets(manifest, candidate_directory, existing_directory)
+    if asset == "wheel":
+        asset = manifest["platforms"][0]["wheel"]["filename"]
+    changed_path = existing_directory / asset
+    changed_path.write_bytes(changed_path.read_bytes() + b"changed")
+    changed_bytes = changed_path.read_bytes()
+    release = candidate_release_snapshot(manifest, existing_directory, draft=True)
+
+    with pytest.raises(ReleaseError, match="existing candidate asset differs"):
+        plan_candidate_publication(
+            manifest,
+            candidate_directory=candidate_directory,
+            config=load_json(CONFIG_PATH),
+            release=release,
+            existing_directory=existing_directory,
+        )
+
+    assert changed_path.read_bytes() == changed_bytes
+
+
+def test_candidate_publication_rejects_incomplete_published_candidate(tmp_path):
+    manifest, candidate_directory, existing_directory = (
+        candidate_publication_fixture(tmp_path)
+    )
+    shutil.copy2(
+        candidate_directory / MANIFEST_NAME,
+        existing_directory / MANIFEST_NAME,
+    )
+    release = candidate_release_snapshot(
+        manifest, existing_directory, draft=False
+    )
+
+    with pytest.raises(ReleaseError, match="published candidate is incomplete"):
+        plan_candidate_publication(
+            manifest,
+            candidate_directory=candidate_directory,
+            config=load_json(CONFIG_PATH),
+            release=release,
+            existing_directory=existing_directory,
+        )
 
 
 def validation(candidate_manifest: dict, architecture: str) -> dict:
