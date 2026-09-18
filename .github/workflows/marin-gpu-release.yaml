@@ -89,7 +89,11 @@ jobs:
           CANDIDATE_TAG="$REQUESTED_CANDIDATE_TAG"
           if [[ -z "$CANDIDATE_TAG" ]]; then
             CANDIDATE_TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              --jq '[.[] | select(.prerelease and (.tag_name | startswith("marin-vllm-gpu-candidate-")))][0].tag_name // empty')
+              --jq '[.[] | select(.prerelease and (.draft | not) and (.tag_name | startswith("marin-vllm-gpu-candidate-")))][0].tag_name // empty')
+          else
+            CANDIDATE_TAG=$(gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$CANDIDATE_TAG" \
+              --jq 'select(.prerelease and (.draft | not)).tag_name // empty')
           fi
           if [[ -z "$CANDIDATE_TAG" ]]; then
             echo "No Marin vLLM GPU candidate release exists." >&2
