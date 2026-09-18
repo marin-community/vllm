@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,13 @@ FORK_COMMIT = "a" * 40
 UPSTREAM_BASE = "b" * 40
 BUILT_AT = "2026-08-03T12:00:00Z"
 CANDIDATE_TAG = f"marin-vllm-gpu-candidate-{FORK_COMMIT[:12]}"
+
+
+@dataclass(frozen=True)
+class CandidatePublicationFixture:
+    manifest: dict
+    candidate_directory: Path
+    existing_directory: Path
 
 
 def test_publish_uses_current_release_automation_for_an_older_candidate():
@@ -232,14 +240,18 @@ def candidate_release_snapshot(
     }
 
 
-def candidate_publication_fixture(tmp_path: Path) -> tuple[dict, Path, Path]:
+def candidate_publication_fixture(tmp_path: Path) -> CandidatePublicationFixture:
     candidate_directory = tmp_path / "candidate"
     candidate_directory.mkdir()
     manifest = candidate(candidate_directory)
     write_json(candidate_directory / MANIFEST_NAME, manifest)
     existing_directory = tmp_path / "existing"
     existing_directory.mkdir()
-    return manifest, candidate_directory, existing_directory
+    return CandidatePublicationFixture(
+        manifest=manifest,
+        candidate_directory=candidate_directory,
+        existing_directory=existing_directory,
+    )
 
 
 def copy_candidate_assets(
@@ -254,40 +266,43 @@ def copy_candidate_assets(
 
 
 def test_candidate_publication_creates_draft_before_uploading_assets(tmp_path):
-    manifest, candidate_directory, existing_directory = (
-        candidate_publication_fixture(tmp_path)
-    )
+    fixture = candidate_publication_fixture(tmp_path)
 
     plan = plan_candidate_publication(
-        manifest,
-        candidate_directory=candidate_directory,
+        fixture.manifest,
+        candidate_directory=fixture.candidate_directory,
         config=load_json(CONFIG_PATH),
         release=None,
-        existing_directory=existing_directory,
+        existing_directory=fixture.existing_directory,
     )
 
     assert plan.action is CandidatePublicationAction.CREATE
     assert set(plan.missing_assets) == {
         MANIFEST_NAME,
-        *(platform["wheel"]["filename"] for platform in manifest["platforms"]),
+        *(
+            platform["wheel"]["filename"]
+            for platform in fixture.manifest["platforms"]
+        ),
     }
 
 
 def test_candidate_publication_verifies_complete_published_candidate(tmp_path):
-    manifest, candidate_directory, existing_directory = (
-        candidate_publication_fixture(tmp_path)
+    fixture = candidate_publication_fixture(tmp_path)
+    copy_candidate_assets(
+        fixture.manifest,
+        fixture.candidate_directory,
+        fixture.existing_directory,
     )
-    copy_candidate_assets(manifest, candidate_directory, existing_directory)
     release = candidate_release_snapshot(
-        manifest, existing_directory, draft=False
+        fixture.manifest, fixture.existing_directory, draft=False
     )
 
     plan = plan_candidate_publication(
-        manifest,
-        candidate_directory=candidate_directory,
+        fixture.manifest,
+        candidate_directory=fixture.candidate_directory,
         config=load_json(CONFIG_PATH),
         release=release,
-        existing_directory=existing_directory,
+        existing_directory=fixture.existing_directory,
     )
 
     assert plan.action is CandidatePublicationAction.VERIFIED
@@ -295,39 +310,43 @@ def test_candidate_publication_verifies_complete_published_candidate(tmp_path):
 
 
 def test_candidate_publication_resumes_manifest_only_draft(tmp_path):
-    manifest, candidate_directory, existing_directory = (
-        candidate_publication_fixture(tmp_path)
-    )
+    fixture = candidate_publication_fixture(tmp_path)
     shutil.copy2(
-        candidate_directory / MANIFEST_NAME,
-        existing_directory / MANIFEST_NAME,
+        fixture.candidate_directory / MANIFEST_NAME,
+        fixture.existing_directory / MANIFEST_NAME,
     )
-    release = candidate_release_snapshot(manifest, existing_directory, draft=True)
+    release = candidate_release_snapshot(
+        fixture.manifest, fixture.existing_directory, draft=True
+    )
 
     plan = plan_candidate_publication(
-        manifest,
-        candidate_directory=candidate_directory,
+        fixture.manifest,
+        candidate_directory=fixture.candidate_directory,
         config=load_json(CONFIG_PATH),
         release=release,
-        existing_directory=existing_directory,
+        existing_directory=fixture.existing_directory,
     )
 
     assert plan.action is CandidatePublicationAction.RESUME
     assert set(plan.missing_assets) == {
-        platform["wheel"]["filename"] for platform in manifest["platforms"]
+        platform["wheel"]["filename"]
+        for platform in fixture.manifest["platforms"]
     }
 
     for filename in plan.missing_assets:
-        shutil.copy2(candidate_directory / filename, existing_directory / filename)
+        shutil.copy2(
+            fixture.candidate_directory / filename,
+            fixture.existing_directory / filename,
+        )
     resumed_release = candidate_release_snapshot(
-        manifest, existing_directory, draft=True
+        fixture.manifest, fixture.existing_directory, draft=True
     )
     completed = plan_candidate_publication(
-        manifest,
-        candidate_directory=candidate_directory,
+        fixture.manifest,
+        candidate_directory=fixture.candidate_directory,
         config=load_json(CONFIG_PATH),
         release=resumed_release,
-        existing_directory=existing_directory,
+        existing_directory=fixture.existing_directory,
     )
 
     assert completed.action is CandidatePublicationAction.PUBLISH
@@ -336,48 +355,50 @@ def test_candidate_publication_resumes_manifest_only_draft(tmp_path):
 
 @pytest.mark.parametrize("asset", [MANIFEST_NAME, "wheel"])
 def test_candidate_publication_rejects_changed_draft_assets(tmp_path, asset):
-    manifest, candidate_directory, existing_directory = (
-        candidate_publication_fixture(tmp_path)
+    fixture = candidate_publication_fixture(tmp_path)
+    copy_candidate_assets(
+        fixture.manifest,
+        fixture.candidate_directory,
+        fixture.existing_directory,
     )
-    copy_candidate_assets(manifest, candidate_directory, existing_directory)
     if asset == "wheel":
-        asset = manifest["platforms"][0]["wheel"]["filename"]
-    changed_path = existing_directory / asset
+        asset = fixture.manifest["platforms"][0]["wheel"]["filename"]
+    changed_path = fixture.existing_directory / asset
     changed_path.write_bytes(changed_path.read_bytes() + b"changed")
     changed_bytes = changed_path.read_bytes()
-    release = candidate_release_snapshot(manifest, existing_directory, draft=True)
+    release = candidate_release_snapshot(
+        fixture.manifest, fixture.existing_directory, draft=True
+    )
 
     with pytest.raises(ReleaseError, match="existing candidate asset differs"):
         plan_candidate_publication(
-            manifest,
-            candidate_directory=candidate_directory,
+            fixture.manifest,
+            candidate_directory=fixture.candidate_directory,
             config=load_json(CONFIG_PATH),
             release=release,
-            existing_directory=existing_directory,
+            existing_directory=fixture.existing_directory,
         )
 
     assert changed_path.read_bytes() == changed_bytes
 
 
 def test_candidate_publication_rejects_incomplete_published_candidate(tmp_path):
-    manifest, candidate_directory, existing_directory = (
-        candidate_publication_fixture(tmp_path)
-    )
+    fixture = candidate_publication_fixture(tmp_path)
     shutil.copy2(
-        candidate_directory / MANIFEST_NAME,
-        existing_directory / MANIFEST_NAME,
+        fixture.candidate_directory / MANIFEST_NAME,
+        fixture.existing_directory / MANIFEST_NAME,
     )
     release = candidate_release_snapshot(
-        manifest, existing_directory, draft=False
+        fixture.manifest, fixture.existing_directory, draft=False
     )
 
     with pytest.raises(ReleaseError, match="published candidate is incomplete"):
         plan_candidate_publication(
-            manifest,
-            candidate_directory=candidate_directory,
+            fixture.manifest,
+            candidate_directory=fixture.candidate_directory,
             config=load_json(CONFIG_PATH),
             release=release,
-            existing_directory=existing_directory,
+            existing_directory=fixture.existing_directory,
         )
 
 

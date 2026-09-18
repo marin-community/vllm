@@ -87,7 +87,8 @@ verify its exact assets and hashes.
 
 [`marin-gpu-release.yaml`](../../.github/workflows/marin-gpu-release.yaml) runs
 on a schedule and through `workflow_dispatch`. The optional `candidate_tag`
-input selects an exact candidate; an empty input selects the newest candidate.
+input selects an exact published candidate; an empty input selects the newest
+published candidate. Drafts are never eligible for qualification.
 
 The workflow qualifies both wheels on their configured hardware:
 

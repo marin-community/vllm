@@ -314,22 +314,43 @@ jobs:
             --manifest candidate/marin-vllm-gpu-manifest.json \
             --output candidate-notes.md
 
-      - name: Plan candidate publication
-        id: plan
+      - name: Publish or resume the verified candidate
         run: |
-          mkdir existing
-          gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/releases?per_page=100" | \
-            jq --arg tag "$CANDIDATE_TAG" \
-              '[.[][] | select(.tag_name == $tag)] |
-               if length == 0 then empty
-               elif length == 1 then .[0]
-               else error("duplicate candidate release") end' \
-              > existing-release.json
+          release_snapshot() {
+            local output=$1
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" | \
+              jq --arg tag "$CANDIDATE_TAG" \
+                '[.[][] | select(.tag_name == $tag)] |
+                 if length == 0 then empty
+                 elif length == 1 then .[0]
+                 else error("duplicate candidate release") end' \
+                > "$output"
+          }
 
-          RELEASE_ARGS=()
+          candidate_plan() {
+            local release=$1
+            local assets=$2
+            local output=$3
+            local release_args=()
+            if [[ -n "$release" ]]; then
+              release_args+=(--release "$release")
+            fi
+            .venv/bin/python infra/release/gpu_release.py \
+              candidate-publication-plan \
+              --manifest candidate/marin-vllm-gpu-manifest.json \
+              --directory candidate \
+              --config "$RELEASE_CONFIG" \
+              "${release_args[@]}" \
+              --existing-directory "$assets" \
+              --output "$output"
+          }
+
+          mkdir existing
+          release_snapshot existing-release.json
+          EXISTING_RELEASE=
           if [[ -s existing-release.json ]]; then
-            RELEASE_ARGS+=(--release existing-release.json)
+            EXISTING_RELEASE=existing-release.json
             ASSET_COUNT=$(jq '.assets | length' existing-release.json)
             if [[ "$ASSET_COUNT" -gt 0 ]]; then
               gh release download "$CANDIDATE_TAG" \
@@ -337,67 +358,44 @@ jobs:
                 --dir existing
             fi
           fi
-          .venv/bin/python infra/release/gpu_release.py candidate-publication-plan \
-            --manifest candidate/marin-vllm-gpu-manifest.json \
-            --directory candidate \
-            --config "$RELEASE_CONFIG" \
-            "${RELEASE_ARGS[@]}" \
-            --existing-directory existing \
-            --output publication-plan.json
-          echo "action=$(jq -r '.action' publication-plan.json)" >> "$GITHUB_OUTPUT"
+          candidate_plan \
+            "$EXISTING_RELEASE" existing publication-plan.json
 
-      - name: Create the candidate draft
-        if: steps.plan.outputs.action == 'create'
-        run: |
-          gh release create "$CANDIDATE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Marin vLLM GPU candidate $(git rev-parse --short=12 "$GITHUB_SHA")" \
-            --notes-file candidate-notes.md \
-            --draft \
-            --prerelease
-
-      - name: Upload missing candidate assets
-        if: steps.plan.outputs.action != 'verified'
-        run: |
+          ACTION=$(jq -r '.action' publication-plan.json)
+          if [[ "$ACTION" == verified ]]; then
+            exit 0
+          fi
+          if [[ "$ACTION" == create ]]; then
+            gh release create "$CANDIDATE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Marin vLLM GPU candidate $(git rev-parse --short=12 "$GITHUB_SHA")" \
+              --notes-file candidate-notes.md \
+              --draft \
+              --prerelease
+          fi
           while IFS= read -r asset; do
             gh release upload "$CANDIDATE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               "candidate/$asset"
           done < <(jq -r '.missing_assets[]' publication-plan.json)
 
-      - name: Verify the complete candidate draft
-        id: complete
-        if: steps.plan.outputs.action != 'verified'
-        run: |
-          gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/releases?per_page=100" | \
-            jq --arg tag "$CANDIDATE_TAG" \
-              '[.[][] | select(.tag_name == $tag)] |
-               if length == 1 then .[0]
-               else error("candidate draft is missing or duplicated") end' \
-              > staged-release.json
+          release_snapshot staged-release.json
+          if [[ ! -s staged-release.json ]]; then
+            echo "Candidate draft is missing after upload." >&2
+            exit 1
+          fi
           mkdir staged
           gh release download "$CANDIDATE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --dir staged
-          .venv/bin/python infra/release/gpu_release.py candidate-publication-plan \
-            --manifest candidate/marin-vllm-gpu-manifest.json \
-            --directory candidate \
-            --config "$RELEASE_CONFIG" \
-            --release staged-release.json \
-            --existing-directory staged \
-            --output completed-plan.json
+          candidate_plan staged-release.json staged completed-plan.json
           ACTION=$(jq -r '.action' completed-plan.json)
           if [[ "$ACTION" != publish ]]; then
             echo "Expected a verified draft, got candidate action: $ACTION" >&2
             exit 1
           fi
-          echo "action=${ACTION}" >> "$GITHUB_OUTPUT"
 
-      - name: Publish the verified candidate
-        if: steps.complete.outputs.action == 'publish'
-        run: |
           gh release edit "$CANDIDATE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false \

@@ -370,38 +370,24 @@ def _candidate_asset_digests(
     return {filename: sha256_file(directory / filename) for filename in filenames}
 
 
-def plan_candidate_publication(
-    manifest: dict[str, Any],
-    *,
-    candidate_directory: Path,
-    config: dict[str, Any],
-    release: dict[str, Any] | None,
-    existing_directory: Path,
-) -> CandidatePublicationPlan:
-    """Validate candidate state and return its next safe release transition."""
-    expected = _candidate_asset_digests(manifest, candidate_directory, config)
-    existing_paths = list(existing_directory.iterdir())
-    if release is None:
-        if existing_paths:
-            raise ReleaseError(
-                "candidate release is absent but downloaded assets exist"
-            )
-        return CandidatePublicationPlan(
-            action=CandidatePublicationAction.CREATE,
-            missing_assets=tuple(sorted(expected)),
-        )
-
-    expected_tag = manifest["release"]["tag"]
-    expected_commit = manifest["source"]["fork_commit"]
-    if release.get("tag_name") != expected_tag:
+def _validate_candidate_release_identity(
+    manifest: dict[str, Any], release: dict[str, Any]
+) -> None:
+    if release.get("tag_name") != manifest["release"]["tag"]:
         raise ReleaseError("candidate release tag disagrees with its manifest")
-    if release.get("target_commitish") != expected_commit:
+    if release.get("target_commitish") != manifest["source"]["fork_commit"]:
         raise ReleaseError("candidate release targets a different commit")
     if release.get("prerelease") is not True:
         raise ReleaseError("candidate release is not a prerelease")
     if not isinstance(release.get("draft"), bool):
         raise ReleaseError("candidate release draft state is missing")
 
+
+def _validate_existing_candidate_assets(
+    release: dict[str, Any],
+    existing_directory: Path,
+    expected: dict[str, str],
+) -> set[str]:
     release_assets = release.get("assets")
     if not isinstance(release_assets, list):
         raise ReleaseError("candidate release asset metadata is missing")
@@ -415,6 +401,7 @@ def plan_candidate_publication(
             f"candidate release contains unexpected assets: {sorted(unexpected)}"
         )
 
+    existing_paths = list(existing_directory.iterdir())
     if any(not path.is_file() for path in existing_paths):
         raise ReleaseError("downloaded candidate assets contain a non-file entry")
     downloaded_names = {path.name for path in existing_paths}
@@ -433,7 +420,33 @@ def plan_candidate_publication(
             raise ReleaseError(f"candidate asset digest metadata changed: {name}")
         if actual_digest != expected[name]:
             raise ReleaseError(f"existing candidate asset differs: {name}")
+    return asset_names
 
+
+def plan_candidate_publication(
+    manifest: dict[str, Any],
+    *,
+    candidate_directory: Path,
+    config: dict[str, Any],
+    release: dict[str, Any] | None,
+    existing_directory: Path,
+) -> CandidatePublicationPlan:
+    """Validate candidate state and return its next safe release transition."""
+    expected = _candidate_asset_digests(manifest, candidate_directory, config)
+    if release is None:
+        if any(existing_directory.iterdir()):
+            raise ReleaseError(
+                "candidate release is absent but downloaded assets exist"
+            )
+        return CandidatePublicationPlan(
+            action=CandidatePublicationAction.CREATE,
+            missing_assets=tuple(sorted(expected)),
+        )
+
+    _validate_candidate_release_identity(manifest, release)
+    asset_names = _validate_existing_candidate_assets(
+        release, existing_directory, expected
+    )
     missing = tuple(sorted(set(expected) - asset_names))
     if release["draft"]:
         action = (
