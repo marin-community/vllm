@@ -50,16 +50,31 @@ def test_publish_uses_current_release_automation_for_an_older_candidate():
     assert "ref" not in checkout.get("with", {})
 
 
-def test_release_publishers_use_builtin_token_with_write_permission():
-    workflow_paths = (
-        GPU_CANDIDATE_WORKFLOW_PATH,
-        GPU_RELEASE_WORKFLOW_PATH,
+def test_candidate_publisher_uses_builtin_write_token():
+    publish = yaml.safe_load(GPU_CANDIDATE_WORKFLOW_PATH.read_text())["jobs"][
+        "publish"
+    ]
+
+    assert publish["permissions"]["contents"] == "write"
+    assert publish["env"]["GH_TOKEN"] == "${{ github.token }}"
+
+
+def test_gpu_release_publisher_scopes_workflow_write_token_to_creation():
+    publish = yaml.safe_load(GPU_RELEASE_WORKFLOW_PATH.read_text())["jobs"]["publish"]
+    creation_step = next(
+        step
+        for step in publish["steps"]
+        if step.get("name") == "Publish release assets once"
     )
 
-    for workflow_path in workflow_paths:
-        publish = yaml.safe_load(workflow_path.read_text())["jobs"]["publish"]
-        assert publish["permissions"]["contents"] == "write"
-        assert publish["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert publish["permissions"]["contents"] == "read"
+    assert publish["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert creation_step["env"]["GH_TOKEN"] == "${{ secrets.MARIN_GPU_RELEASE_TOKEN }}"
+    assert all(
+        "GH_TOKEN" not in step.get("env", {})
+        for step in publish["steps"]
+        if step is not creation_step
+    )
 
 
 def test_candidate_build_ignores_release_only_changes():
