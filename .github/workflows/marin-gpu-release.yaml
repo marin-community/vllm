@@ -345,9 +345,7 @@ jobs:
     permissions:
       contents: read
     env:
-      # Publishing an older source commit whose workflows differ from main requires
-      # Contents and Workflows write permissions, which GITHUB_TOKEN cannot hold.
-      GH_TOKEN: ${{ secrets.MARIN_GPU_RELEASE_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
       CANDIDATE_TAG: ${{ needs.resolve.outputs.candidate_tag }}
       RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
       SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
@@ -406,6 +404,10 @@ jobs:
             --config "$RELEASE_CONFIG"
 
       - name: Publish release assets once
+        env:
+          # Publishing an older source commit whose workflows differ from main
+          # requires Contents and Workflows write, which GITHUB_TOKEN cannot hold.
+          GH_TOKEN: ${{ secrets.MARIN_GPU_RELEASE_TOKEN }}
         run: |
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Refusing to overwrite existing release $RELEASE_TAG" >&2
