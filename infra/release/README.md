@@ -114,6 +114,13 @@ unchanged candidate wheels, their validation records, and a final manifest that
 binds every result to a wheel digest. The workflow never overwrites an existing
 release tag or asset.
 
+The repository secret `MARIN_GPU_RELEASE_TOKEN` must have Contents and Workflows
+write permission for this repository. [GitHub checks the target source commit](https://docs.github.com/en/rest/releases/releases#create-a-release)
+against current `main` when creating a release. If their workflow files differ,
+the Actions `GITHUB_TOKEN` cannot create the release, even with `contents: write`.
+The resolver stops before GPU validation when publication is needed and this
+secret is absent. Verifying an existing final release does not need the secret.
+
 Dispatch a specific candidate with:
 
 ```bash

@@ -85,6 +85,7 @@ jobs:
         id: candidate
         env:
           REQUESTED_CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          RELEASE_TOKEN_CONFIGURED: ${{ secrets.MARIN_GPU_RELEASE_TOKEN != '' }}
         run: |
           CANDIDATE_TAG="$REQUESTED_CANDIDATE_TAG"
           if [[ -z "$CANDIDATE_TAG" ]]; then
@@ -129,6 +130,10 @@ jobs:
               --directory existing \
               --config "$RELEASE_CONFIG"
             PUBLISH=false
+          fi
+          if [[ "$PUBLISH" == true && "$RELEASE_TOKEN_CONFIGURED" != true ]]; then
+            echo "MARIN_GPU_RELEASE_TOKEN is required to publish a GPU release." >&2
+            exit 1
           fi
           {
             echo "publish=${PUBLISH}"
@@ -340,7 +345,9 @@ jobs:
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
+      # Publishing an older source commit whose workflows differ from main requires
+      # Contents and Workflows write permissions, which GITHUB_TOKEN cannot hold.
+      GH_TOKEN: ${{ secrets.MARIN_GPU_RELEASE_TOKEN }}
       CANDIDATE_TAG: ${{ needs.resolve.outputs.candidate_tag }}
       RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
       SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
