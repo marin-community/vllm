@@ -343,7 +343,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
-      contents: write
+      contents: read
     env:
       # Publishing an older source commit whose workflows differ from main requires
       # Contents and Workflows write permissions, which GITHUB_TOKEN cannot hold.
