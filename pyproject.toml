@@ -209,5 +209,7 @@ include = [
     "vllm/model_executor/models/grugmoe.py",
     "vllm/transformers_utils/configs/grugmoe.py",
     "tests/models/test_grugmoe.py",
+    "vllm/model_executor/model_loader/reload/layerwise.py",
+    "tests/model_executor/model_loader/test_reload.py",
     "infra/**",
 ]

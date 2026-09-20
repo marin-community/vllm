@@ -24,7 +24,9 @@ Everything Marin adds on top of upstream is small and deliberate:
   `vllm/transformers_utils/configs/__init__.py`.
 - **Surgical edits** — a scheduler held-request skip (`vllm/v1/core/sched/scheduler.py`),
   TPU head-padding validation (`vllm/config/model.py`), TPU/macOS build tweaks
-  (`setup.py`), a logger tweak (`vllm/logger.py`), and requirements pins.
+  (`setup.py`), a logger tweak (`vllm/logger.py`), layerwise reload memory
+  handling (`vllm/model_executor/model_loader/reload/layerwise.py` and
+  `tests/model_executor/model_loader/test_reload.py`), and requirements pins.
 
 The TPU head-padding validation is paired with tpu-inference's arbitrary-GQA
 padding and should leave this delta when the generic support lands upstream.
