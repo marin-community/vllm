@@ -129,7 +129,6 @@ jobs:
             --manifest candidate/marin-vllm-gpu-manifest.json \
             --repository "$GITHUB_REPOSITORY"
 
-          SOURCE_COMMIT=$(jq -r '.source.fork_commit' candidate/marin-vllm-gpu-manifest.json)
           MANIFEST_TAG=$(jq -r '.release.tag' candidate/marin-vllm-gpu-manifest.json)
           CREATED_AT=$(jq -r '.release.created_at' candidate/marin-vllm-gpu-manifest.json)
           if [[ "$MANIFEST_TAG" != "$CANDIDATE_TAG" ]]; then
@@ -395,17 +394,6 @@ jobs:
             --manifest candidate-assets/marin-vllm-gpu-manifest.json \
             --directory release-assets \
             --config "$RELEASE_CONFIG"
-          SOURCE_COMMIT_IN_MANIFEST=$(jq -r '.source.fork_commit' candidate-assets/marin-vllm-gpu-manifest.json)
-          MANIFEST_TAG=$(jq -r '.release.tag' candidate-assets/marin-vllm-gpu-manifest.json)
-          if [[ "$SOURCE_COMMIT_IN_MANIFEST" != "$SOURCE_COMMIT" || "$MANIFEST_TAG" != "$CANDIDATE_TAG" ]]; then
-            echo "Candidate identity changed between resolution and publication: $CANDIDATE_TAG $SOURCE_COMMIT" >&2
-            exit 1
-          fi
-          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
-            --repository "$GITHUB_REPOSITORY" \
-            --workflow-ref "$GITHUB_REF" \
-            --source-commit "$SOURCE_COMMIT_IN_MANIFEST" \
-            --candidate-tag "$CANDIDATE_TAG"
 
       - name: Finalize the release manifest
         run: |

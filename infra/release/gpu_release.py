@@ -326,7 +326,7 @@ def verify_manifest_assets(manifest: dict[str, Any], directory: Path) -> None:
 
 
 def verify_published_candidate(manifest: dict[str, Any], repository: str) -> None:
-    """Check GitHub's immutable asset digests before a validation short circuit."""
+    """Check a published candidate's release identity and asset metadata."""
     tag = manifest["release"]["tag"]
     source = manifest["source"]["fork_commit"]
     try:
@@ -355,14 +355,16 @@ def verify_published_candidate(manifest: dict[str, Any], repository: str) -> Non
     }
     if len(by_name) != len(assets) or set(by_name) != expected_names:
         raise ReleaseError(f"candidate {tag} source={source} asset set changed")
-    if by_name[MANIFEST_NAME]["state"] != "uploaded":
-        raise ReleaseError(f"candidate {tag} source={source} manifest asset is invalid")
+    for asset in assets:
+        if asset["state"] != "uploaded":
+            raise ReleaseError(
+                f"candidate {tag} source={source} asset is invalid: {asset['name']}"
+            )
     for platform in manifest["platforms"]:
         wheel = platform["wheel"]
         asset = by_name[wheel["filename"]]
         if (
-            asset["state"] != "uploaded"
-            or asset["size"] != wheel["size_bytes"]
+            asset["size"] != wheel["size_bytes"]
             or asset["digest"] != f"sha256:{wheel['sha256']}"
         ):
             raise ReleaseError(

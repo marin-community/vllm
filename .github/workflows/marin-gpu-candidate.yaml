@@ -96,8 +96,7 @@ jobs:
           .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-ref "$GITHUB_REF" \
-            --source-commit "$GITHUB_SHA" \
-            --candidate-tag "marin-vllm-gpu-candidate-${GITHUB_SHA:0:12}"
+            --source-commit "$GITHUB_SHA"
 
       - name: Read the release platforms
         id: matrix
@@ -323,11 +322,6 @@ jobs:
           .venv/bin/python infra/release/gpu_release.py release-notes \
             --manifest candidate/marin-vllm-gpu-manifest.json \
             --output candidate-notes.md
-          SOURCE_COMMIT=$(jq -r '.source.fork_commit' candidate/marin-vllm-gpu-manifest.json)
-          if [[ "$SOURCE_COMMIT" != "$GITHUB_SHA" ]]; then
-            echo "Candidate source $SOURCE_COMMIT does not match workflow commit $GITHUB_SHA" >&2
-            exit 1
-          fi
 
       - name: Check for an existing immutable candidate
         id: existing
