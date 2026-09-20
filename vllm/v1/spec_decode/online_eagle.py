@@ -22,6 +22,7 @@ from torch import nn
 _FORMAT_VERSION = 1
 _CANDIDATE_FORMAT = "marinskyrl-online-eagle-candidate"
 _SKYRL_REQUEST_PREFIX = "skyrl-group-"
+_SKYRL_REPLAY_REQUEST_PREFIX = "skyrl-eagle-replay-"
 _MIN_TRAINING_WINDOW_TOKENS = 2
 
 
@@ -90,12 +91,29 @@ def load_candidate(
 
 def request_group_from_id(request_id: str) -> str:
     """Return a SkyRL group digest, or the full ID for an ungrouped request."""
+    if request_id.startswith(_SKYRL_REPLAY_REQUEST_PREFIX):
+        remainder = request_id[len(_SKYRL_REPLAY_REQUEST_PREFIX) :]
+        group, separator, _loss_start_and_attempt = remainder.partition("-")
+        if separator and group:
+            return group
     if request_id.startswith(_SKYRL_REQUEST_PREFIX):
         remainder = request_id[len(_SKYRL_REQUEST_PREFIX) :]
         group, separator, _attempt = remainder.partition("-")
         if separator and group:
             return group
     return request_id
+
+
+def replay_loss_start_from_id(request_id: str) -> int | None:
+    """Return the supervised-response boundary carried by a replay request."""
+    if not request_id.startswith(_SKYRL_REPLAY_REQUEST_PREFIX):
+        return None
+    remainder = request_id[len(_SKYRL_REPLAY_REQUEST_PREFIX) :]
+    _group, separator, loss_start_and_attempt = remainder.partition("-")
+    loss_start, second_separator, _attempt = loss_start_and_attempt.partition("-")
+    if not separator or not second_separator or not loss_start.isdecimal():
+        raise ValueError(f"Malformed EAGLE replay request ID: {request_id!r}")
+    return int(loss_start)
 
 
 @dataclass(frozen=True)
@@ -193,6 +211,7 @@ class _PendingCopy:
 class _RequestCapture:
     group_id: str
     prompt_token_ids: tuple[int, ...]
+    replay_loss_start: int | None = None
     retention_floor: int = 0
     output_token_ids: tuple[int, ...] | None = None
     provisional: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = field(
@@ -232,6 +251,12 @@ class OnlineEagleCapture:
             self.dropped_requests += 1
             return False
         group_id = request_group_from_id(request_id)
+        replay_loss_start = replay_loss_start_from_id(request_id)
+        if replay_loss_start is not None and not 0 < replay_loss_start < len(
+            prompt_token_ids
+        ):
+            self.dropped_requests += 1
+            return False
         if (
             self._group_counts.get(group_id, 0)
             >= self.config.max_sequences_per_prompt_group
@@ -253,6 +278,7 @@ class OnlineEagleCapture:
         self.requests[request_id] = _RequestCapture(
             group_id=group_id,
             prompt_token_ids=tuple(int(token) for token in prompt_token_ids),
+            replay_loss_start=replay_loss_start,
         )
         return True
 
@@ -450,10 +476,13 @@ class OnlineEagleCapture:
             return None
         prompt_length = len(request.prompt_token_ids)
         trajectory = request.prompt_token_ids + request.output_token_ids
+        training_end = (
+            prompt_length if request.replay_loss_start is not None else len(trajectory)
+        )
         matching = {
             position: request.provisional[(position, token)]
             for position, token in enumerate(trajectory)
-            if (position, token) in request.provisional
+            if position < training_end and (position, token) in request.provisional
         }
         segments: list[list[int]] = []
         for position in sorted(matching):
@@ -465,7 +494,12 @@ class OnlineEagleCapture:
             segment
             for segment in segments
             if len(segment) >= _MIN_TRAINING_WINDOW_TOKENS
-            and segment[-1] >= prompt_length
+            and segment[-1]
+            >= (
+                request.replay_loss_start
+                if request.replay_loss_start is not None
+                else prompt_length
+            )
         ]
         if not eligible:
             self.dropped_windows += 1
@@ -479,7 +513,16 @@ class OnlineEagleCapture:
             [trajectory[position] for position in positions], dtype=torch.long
         )
         loss_mask = torch.tensor(
-            [position >= prompt_length for position in positions], dtype=torch.bool
+            [
+                position
+                >= (
+                    request.replay_loss_start
+                    if request.replay_loss_start is not None
+                    else prompt_length
+                )
+                for position in positions
+            ],
+            dtype=torch.bool,
         )
         if not loss_mask[1:].any():
             self.dropped_windows += 1
@@ -537,7 +580,9 @@ class OnlineEagleCapture:
                 save_file(target_tensors, str(target_path), metadata={"format": "pt"})
                 config_path = staging / "target-config.json"
                 config_path.write_text(
-                    json.dumps(dict(target_config), sort_keys=True, separators=(",", ":"))
+                    json.dumps(
+                        dict(target_config), sort_keys=True, separators=(",", ":")
+                    )
                 )
                 target = {
                     "weights_path": target_path.name,
@@ -579,6 +624,7 @@ __all__ = [
     "OnlineEagleCapture",
     "OnlineEagleCaptureConfig",
     "file_sha256",
+    "replay_loss_start_from_id",
     "load_candidate",
     "request_group_from_id",
 ]

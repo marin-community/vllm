@@ -13,6 +13,7 @@ from torch import nn
 from vllm.v1.spec_decode.online_eagle import (
     OnlineEagleCapture,
     OnlineEagleCaptureConfig,
+    replay_loss_start_from_id,
     request_group_from_id,
 )
 from vllm.v1.worker import gpu_model_runner
@@ -187,6 +188,63 @@ def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
         64,
         2,
     ]
+
+
+def test_teacher_forced_replay_supervises_prefilled_response_only(tmp_path) -> None:
+    capture = OnlineEagleCapture(
+        OnlineEagleCaptureConfig.from_mapping(
+            {
+                "step": 1,
+                "max_tokens": 32,
+                "max_window_tokens": 16,
+                "max_sequences_per_prompt_group": 1,
+                "trainer_rank": 0,
+                "worker_rank": 0,
+                "target_revision": "target-0",
+                "draft_revision": "draft-0",
+                "aux_layer_ids": [2, 13, 23],
+            }
+        )
+    )
+    request_id = "skyrl-eagle-replay-deadbeef-3-attempt0"
+    assert request_group_from_id(request_id) == "deadbeef"
+    assert replay_loss_start_from_id(request_id) == 3
+    sequence = [10, 11, 12, 20, 21, 22]
+    assert capture.admit_request(request_id, sequence, 1)
+    aux, head = _states(sequence)
+    capture.record_forward(
+        request_ids=[request_id],
+        num_scheduled_tokens=[len(sequence)],
+        num_computed_tokens=[0],
+        input_ids=torch.tensor(sequence),
+        aux_hidden_states=aux,
+        head_input_hidden_states=head,
+    )
+
+    # Replay uses one decode token only to make vLLM complete the request. It is
+    # not part of the teacher-forced sequence or the draft loss.
+    aux, head = _states([99])
+    capture.record_forward(
+        request_ids=[request_id],
+        num_scheduled_tokens=[1],
+        num_computed_tokens=[len(sequence)],
+        input_ids=torch.tensor([99]),
+        aux_hidden_states=aux,
+        head_input_hidden_states=head,
+    )
+    capture.finalize_request(request_id, [99])
+
+    destination = tmp_path / "capture"
+    manifest = capture.seal(
+        destination,
+        target_model=_TargetModel(),
+        target_config={"hidden_size": 2, "vocab_size": 64},
+    )
+
+    window = load_file(str(destination / manifest["windows"][0]["path"]))
+    assert window["input_ids"].tolist() == sequence
+    assert window["loss_mask"].tolist() == [False, False, False, True, True, True]
+    assert 99 not in window["input_ids"].tolist()
 
 
 def test_capture_can_omit_redundant_target_snapshot(tmp_path) -> None:
