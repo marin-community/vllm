@@ -23,6 +23,7 @@ from infra.release.gpu_release import (
     extract_validation,
     finalize_release,
     inspect_wheel,
+    newest_published_candidate,
     validate_candidate,
     validate_wheel_fragment,
     validation_matrix,
@@ -212,6 +213,27 @@ def candidate(tmp_path: Path) -> dict:
         candidate_tag=CANDIDATE_TAG,
         created_at=BUILT_AT,
     )
+
+
+def test_newest_candidate_uses_publication_time_without_provenance_fallback():
+    off_main = {
+        "tag_name": "marin-vllm-gpu-candidate-e09cfd55a7a9",
+        "prerelease": True,
+        "draft": False,
+        "published_at": "2026-09-20T00:47:34Z",
+        "id": 1,
+    }
+    main = {
+        "tag_name": "marin-vllm-gpu-candidate-744111c4f161",
+        "prerelease": True,
+        "draft": False,
+        "published_at": "2026-09-20T16:33:38Z",
+        "id": 2,
+    }
+
+    assert newest_published_candidate([off_main, main]) == main["tag_name"]
+    off_main["published_at"] = "2026-09-21T00:00:00Z"
+    assert newest_published_candidate([main, off_main]) == off_main["tag_name"]
 
 
 def test_published_candidate_rejects_changed_assets_and_target(tmp_path, monkeypatch):

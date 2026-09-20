@@ -364,8 +364,8 @@ def verify_published_candidate(manifest: dict[str, Any], repository: str) -> Non
         wheel = platform["wheel"]
         asset = by_name[wheel["filename"]]
         if (
-            asset["size"] != wheel["size_bytes"]
-            or asset["digest"] != f"sha256:{wheel['sha256']}"
+            asset.get("size") != wheel["size_bytes"]
+            or asset.get("digest") != f"sha256:{wheel['sha256']}"
         ):
             raise ReleaseError(
                 f"candidate {tag} source={source} wheel asset changed: "
@@ -384,6 +384,28 @@ def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None
         raise ReleaseError("candidate tag does not match its fork commit")
     if manifest["validation"] != {"status": "pending", "targets": []}:
         raise ReleaseError("candidate validation state is not pending")
+
+
+def newest_published_candidate(releases: list[dict[str, Any]]) -> str:
+    """Select the GPU candidate with the latest publication timestamp."""
+    candidates = [
+        release
+        for release in releases
+        if release["prerelease"]
+        and not release["draft"]
+        and release["tag_name"].startswith(CANDIDATE_TAG_PREFIX)
+    ]
+    if not candidates:
+        raise ReleaseError("No Marin vLLM GPU candidate release exists")
+    for release in candidates:
+        if not release["published_at"]:
+            raise ReleaseError(
+                f"GPU candidate {release['tag_name']} has no publication time"
+            )
+    newest = max(
+        candidates, key=lambda release: (release["published_at"], release["id"])
+    )
+    return newest["tag_name"]
 
 
 def verify_main_lineage(
@@ -843,6 +865,8 @@ def parse_args() -> argparse.Namespace:
     lineage_source.add_argument("--ref-only", action="store_true")
     lineage_parser.add_argument("--candidate-tag")
 
+    subparsers.add_parser("select-newest-candidate")
+
     inspect_parser = subparsers.add_parser("inspect-wheel")
     inspect_parser.add_argument("--config", type=Path, required=True)
     inspect_parser.add_argument("--wheel", type=Path, required=True)
@@ -932,6 +956,9 @@ def main() -> int:
                 args.source_commit,
                 args.candidate_tag,
             )
+            return 0
+        if args.command == "select-newest-candidate":
+            print(newest_published_candidate([json.loads(line) for line in sys.stdin]))
             return 0
         if args.command == "inspect-wheel":
             fragment = inspect_wheel(

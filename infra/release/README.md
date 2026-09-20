@@ -98,7 +98,8 @@ gh workflow run marin-gpu-candidate.yaml \
 [`marin-gpu-release.yaml`](../../.github/workflows/marin-gpu-release.yaml) runs
 on a schedule and through `workflow_dispatch`. The optional `candidate_tag`
 input selects an exact published candidate; an empty input selects the newest
-published candidate. Drafts are never eligible for qualification. The newest
+published candidate by GitHub's `published_at` timestamp, across release-list
+pages. Drafts are never eligible for qualification. The newest
 candidate is checked as selected. Off-main provenance, an incompatible ABI, or
 invalid assets fail the run instead of silently choosing an older candidate.
 

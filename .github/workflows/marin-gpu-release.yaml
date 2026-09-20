@@ -98,8 +98,10 @@ jobs:
         run: |
           CANDIDATE_TAG="$REQUESTED_CANDIDATE_TAG"
           if [[ -z "$CANDIDATE_TAG" ]]; then
-            CANDIDATE_TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              --jq '[.[] | select(.prerelease and (.draft | not) and (.tag_name | startswith("marin-vllm-gpu-candidate-")))][0].tag_name // empty')
+            set -o pipefail
+            CANDIDATE_TAG=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq '.[] | {tag_name,prerelease,draft,published_at,id}' | \
+              .venv/bin/python infra/release/gpu_release.py select-newest-candidate)
           else
             CANDIDATE_TAG=$(gh api \
               "repos/$GITHUB_REPOSITORY/releases/tags/$CANDIDATE_TAG" \
