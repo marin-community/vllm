@@ -501,7 +501,11 @@ class OnlineEagleCapture:
     ) -> dict[str, Any]:
         """Write an immutable atomic capture directory and return its manifest."""
         if not self.active:
-            return {"active": False, "worker_rank": self.config.worker_rank}
+            return {
+                "active": False,
+                "worker_rank": self.config.worker_rank,
+                "target": None,
+            }
         self._drain_pending(wait=True)
         destination = Path(output_dir)
         destination.parent.mkdir(parents=True, exist_ok=True)
