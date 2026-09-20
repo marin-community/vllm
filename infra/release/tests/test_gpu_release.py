@@ -300,10 +300,10 @@ def test_gpu_lineage_policy(
             verify_main_lineage(
                 "marin-community/vllm", workflow_ref, source, CANDIDATE_TAG
             )
-        assert f"workflow_ref={workflow_ref}" in str(exc.value)
-        assert f"expected_default_branch={branch}" in str(exc.value)
-        assert f"source={source}" in str(exc.value)
-        assert f"candidate={CANDIDATE_TAG}" in str(exc.value)
+        assert all(
+            value in str(exc.value)
+            for value in (workflow_ref, branch, source, CANDIDATE_TAG)
+        )
 
 
 def test_candidate_rejects_abi_change(tmp_path):

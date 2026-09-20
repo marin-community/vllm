@@ -338,7 +338,7 @@ def _github_api(path: str, context: str) -> dict[str, Any]:
 
 
 def verify_published_candidate(manifest: dict[str, Any], repository: str) -> None:
-    """Check the candidate release before an existing final release can skip it."""
+    """Match a published candidate's identity and wheel digests to its manifest."""
     tag = manifest["release"]["tag"]
     source = manifest["source"]["fork_commit"]
     context = f"candidate={tag} source={source}"
