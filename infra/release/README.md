@@ -79,12 +79,26 @@ The candidate manifest records:
 Candidate tags and assets are immutable. A rerun verifies an existing
 candidate instead of replacing it.
 
+GPU publication runs must use the repository's default branch, which this fork
+expects to be `main`. A candidate from a prior `main` commit remains valid after
+`main` advances. To build immediately after a merge, dispatch from `main`:
+
+```bash
+gh workflow run marin-gpu-candidate.yaml \
+  --repo marin-community/vllm \
+  --ref main \
+  -f lane=gpu \
+  -f gpu_mode=publish
+```
+
 ## GPU validation and release
 
 [`marin-gpu-release.yaml`](../../.github/workflows/marin-gpu-release.yaml) runs
 on a schedule and through `workflow_dispatch`. The optional `candidate_tag`
 input selects an exact published candidate; an empty input selects the newest
-published candidate. Drafts are never eligible for qualification.
+published candidate by GitHub's `published_at` timestamp across release-list
+pages. Drafts are ineligible. Invalid provenance, ABI, or assets fail the run;
+it does not try an older candidate.
 
 The workflow qualifies both wheels on their configured hardware:
 
@@ -119,8 +133,15 @@ Dispatch a specific candidate with:
 ```bash
 gh workflow run marin-gpu-release.yaml \
   --repo marin-community/vllm \
+  --ref main \
+  -f lane=gpu \
   -f candidate_tag=marin-vllm-gpu-candidate-0123456789ab
 ```
+
+Check the published tag and final assets independently. [GitHub runs](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows)
+the workflow file on the selected ref, so an older branch can still run its old
+publication logic. Enforcing this against repository writers requires a publisher
+outside branch-controlled workflow code.
 
 ## TPU wheel pairs
 
