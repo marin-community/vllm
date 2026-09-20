@@ -109,6 +109,7 @@ class OnlineEagleCaptureConfig:
     target_revision: str
     draft_revision: str
     aux_layer_ids: tuple[int, ...]
+    capture_target_snapshot: bool = True
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> OnlineEagleCaptureConfig:
@@ -122,6 +123,7 @@ class OnlineEagleCaptureConfig:
             "target_revision",
             "draft_revision",
             "aux_layer_ids",
+            "capture_target_snapshot",
         }
         unknown = set(value) - allowed
         if unknown:
@@ -159,6 +161,9 @@ class OnlineEagleCaptureConfig:
             raise ValueError("target_revision must be a nonempty string")
         if not isinstance(draft_revision, str) or not draft_revision:
             raise ValueError("draft_revision must be a nonempty string")
+        capture_target_snapshot = value.get("capture_target_snapshot", True)
+        if not isinstance(capture_target_snapshot, bool):
+            raise ValueError("capture_target_snapshot must be a boolean")
         return cls(
             step=step,
             max_tokens=positive_int("max_tokens"),
@@ -171,6 +176,7 @@ class OnlineEagleCaptureConfig:
             target_revision=target_revision,
             draft_revision=draft_revision,
             aux_layer_ids=aux_layers,
+            capture_target_snapshot=capture_target_snapshot,
         )
 
 
@@ -520,13 +526,22 @@ class OnlineEagleCapture:
                     }
                 )
 
-            target_tensors, target_inventory = self._target_snapshot(target_model)
-            target_path = staging / "target.safetensors"
-            save_file(target_tensors, str(target_path), metadata={"format": "pt"})
-            config_path = staging / "target-config.json"
-            config_path.write_text(
-                json.dumps(dict(target_config), sort_keys=True, separators=(",", ":"))
-            )
+            target = None
+            if self.config.capture_target_snapshot:
+                target_tensors, target_inventory = self._target_snapshot(target_model)
+                target_path = staging / "target.safetensors"
+                save_file(target_tensors, str(target_path), metadata={"format": "pt"})
+                config_path = staging / "target-config.json"
+                config_path.write_text(
+                    json.dumps(dict(target_config), sort_keys=True, separators=(",", ":"))
+                )
+                target = {
+                    "weights_path": target_path.name,
+                    "weights_sha256": file_sha256(target_path),
+                    "config_path": config_path.name,
+                    "config_sha256": file_sha256(config_path),
+                    "inventory": target_inventory,
+                }
             manifest = {
                 "format": "vllm-online-eagle-capture",
                 "format_version": _FORMAT_VERSION,
@@ -541,13 +556,7 @@ class OnlineEagleCapture:
                 "captured_rows": self.captured_rows,
                 "dropped_requests": self.dropped_requests,
                 "dropped_windows": self.dropped_windows,
-                "target": {
-                    "weights_path": target_path.name,
-                    "weights_sha256": file_sha256(target_path),
-                    "config_path": config_path.name,
-                    "config_sha256": file_sha256(config_path),
-                    "inventory": target_inventory,
-                },
+                "target": target,
             }
             manifest_path = staging / "manifest.json"
             manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))

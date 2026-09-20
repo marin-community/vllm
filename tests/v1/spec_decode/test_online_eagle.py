@@ -189,6 +189,35 @@ def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
     ]
 
 
+def test_capture_can_omit_redundant_target_snapshot(tmp_path) -> None:
+    config = OnlineEagleCaptureConfig.from_mapping(
+        {
+            "step": 7,
+            "max_tokens": 32,
+            "max_window_tokens": 8,
+            "max_sequences_per_prompt_group": 1,
+            "trainer_rank": 0,
+            "worker_rank": 1,
+            "target_revision": "target-6",
+            "draft_revision": "draft-6",
+            "aux_layer_ids": [2, 13, 23],
+            "capture_target_snapshot": False,
+        }
+    )
+    capture = OnlineEagleCapture(config)
+    destination = tmp_path / "capture"
+
+    manifest = capture.seal(
+        destination,
+        target_model=_TargetModel(),
+        target_config={"hidden_size": 2, "vocab_size": 64},
+    )
+
+    assert manifest["target"] is None
+    assert not (destination / "target.safetensors").exists()
+    assert not (destination / "target-config.json").exists()
+
+
 def test_capture_crops_a_long_prefill_before_copying() -> None:
     config = OnlineEagleCaptureConfig.from_mapping(
         {
