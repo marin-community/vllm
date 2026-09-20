@@ -23,8 +23,11 @@ from infra.release.gpu_release import (
     extract_validation,
     finalize_release,
     inspect_wheel,
+    validate_candidate,
     validate_wheel_fragment,
     validation_matrix,
+    verify_main_lineage,
+    verify_published_candidate,
     verify_release_assets,
 )
 from infra.release.release_common import ReleaseError, load_json, sha256_file
@@ -209,6 +212,101 @@ def candidate(tmp_path: Path) -> dict:
         candidate_tag=CANDIDATE_TAG,
         created_at=BUILT_AT,
     )
+
+
+def test_published_candidate_rejects_changed_assets_and_target(tmp_path, monkeypatch):
+    manifest = candidate(tmp_path)
+    release = {
+        "tag_name": CANDIDATE_TAG,
+        "target_commitish": FORK_COMMIT,
+        "draft": False,
+        "prerelease": True,
+        "assets": [{"name": "marin-vllm-gpu-manifest.json", "state": "uploaded"}],
+    }
+    for platform in manifest["platforms"]:
+        wheel = platform["wheel"]
+        release["assets"].append(
+            {
+                "name": wheel["filename"],
+                "state": "uploaded",
+                "size": wheel["size_bytes"],
+                "digest": f"sha256:{wheel['sha256']}",
+            }
+        )
+
+    def gh_api(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps(release), stderr=""
+        )
+
+    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
+
+    verify_published_candidate(manifest, "marin-community/vllm")
+    release["assets"][1]["digest"] = "sha256:" + "0" * 64
+    with pytest.raises(ReleaseError, match="wheel asset changed"):
+        verify_published_candidate(manifest, "marin-community/vllm")
+    release["assets"][1]["digest"] = (
+        f"sha256:{manifest['platforms'][0]['wheel']['sha256']}"
+    )
+    release["target_commitish"] = "b" * 40
+    with pytest.raises(ReleaseError, match="release identity changed"):
+        verify_published_candidate(manifest, "marin-community/vllm")
+
+
+@pytest.mark.parametrize("compare_status", ["identical", "ahead"])
+def test_gpu_lineage_accepts_main_source_when_main_advances(
+    monkeypatch, compare_status: str
+):
+    def gh_api(args, **kwargs):
+        value = "main" if args[2] == "repos/marin-community/vllm" else compare_status
+        return subprocess.CompletedProcess(args, 0, stdout=value, stderr="")
+
+    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
+
+    # The same source can be current main or an ancestor after a long build.
+    assert (
+        verify_main_lineage(
+            "marin-community/vllm", "refs/heads/main", FORK_COMMIT, CANDIDATE_TAG
+        )
+        is None
+    )
+
+
+def test_gpu_lineage_rejects_off_main_dispatch(monkeypatch):
+    def gh_api(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout="main", stderr="")
+
+    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
+
+    with pytest.raises(ReleaseError, match="workflow must run from refs/heads/main"):
+        verify_main_lineage(
+            "marin-community/vllm", "refs/heads/feature", FORK_COMMIT, CANDIDATE_TAG
+        )
+
+
+def test_gpu_lineage_rejects_diverged_candidate_with_context(monkeypatch):
+    def gh_api(args, **kwargs):
+        value = "main" if args[2] == "repos/marin-community/vllm" else "diverged"
+        return subprocess.CompletedProcess(args, 0, stdout=value, stderr="")
+
+    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
+
+    with pytest.raises(ReleaseError, match="source is not an ancestor of main") as exc:
+        verify_main_lineage(
+            "marin-community/vllm", "refs/heads/main", FORK_COMMIT, CANDIDATE_TAG
+        )
+    assert CANDIDATE_TAG in str(exc.value)
+    assert FORK_COMMIT in str(exc.value)
+    assert "workflow_ref=refs/heads/main" in str(exc.value)
+    assert "expected_default_branch=main" in str(exc.value)
+
+
+def test_candidate_rejects_abi_change(tmp_path):
+    manifest = candidate(tmp_path)
+    manifest["abi"]["torch_version"] = "0.0.0"
+
+    with pytest.raises(ReleaseError, match="release ABI changed"):
+        validate_candidate(manifest, load_json(CONFIG_PATH))
 
 
 def validation(candidate_manifest: dict, architecture: str) -> dict:

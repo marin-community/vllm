@@ -74,6 +74,16 @@ jobs:
       - name: Create the metadata environment
         run: uv venv --python 3.12
 
+      - name: Require the main workflow ref
+        env:
+          REQUESTED_CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$GITHUB_REF" \
+            --ref-only \
+            --candidate-tag "$REQUESTED_CANDIDATE_TAG"
+
       - name: Read the validation platforms
         id: matrix
         run: |
@@ -99,15 +109,25 @@ jobs:
             echo "No Marin vLLM GPU candidate release exists." >&2
             exit 1
           fi
+          echo "Selected GPU candidate: $CANDIDATE_TAG"
 
           mkdir candidate
           gh release download "$CANDIDATE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern marin-vllm-gpu-manifest.json \
             --dir candidate
+          SOURCE_COMMIT=$(jq -r '.source.fork_commit' candidate/marin-vllm-gpu-manifest.json)
+          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$GITHUB_REF" \
+            --source-commit "$SOURCE_COMMIT" \
+            --candidate-tag "$CANDIDATE_TAG"
           .venv/bin/python infra/release/gpu_release.py validate-candidate \
             --manifest candidate/marin-vllm-gpu-manifest.json \
             --config "$RELEASE_CONFIG"
+          .venv/bin/python infra/release/gpu_release.py verify-published-candidate \
+            --manifest candidate/marin-vllm-gpu-manifest.json \
+            --repository "$GITHUB_REPOSITORY"
 
           SOURCE_COMMIT=$(jq -r '.source.fork_commit' candidate/marin-vllm-gpu-manifest.json)
           MANIFEST_TAG=$(jq -r '.release.tag' candidate/marin-vllm-gpu-manifest.json)
@@ -375,6 +395,17 @@ jobs:
             --manifest candidate-assets/marin-vllm-gpu-manifest.json \
             --directory release-assets \
             --config "$RELEASE_CONFIG"
+          SOURCE_COMMIT_IN_MANIFEST=$(jq -r '.source.fork_commit' candidate-assets/marin-vllm-gpu-manifest.json)
+          MANIFEST_TAG=$(jq -r '.release.tag' candidate-assets/marin-vllm-gpu-manifest.json)
+          if [[ "$SOURCE_COMMIT_IN_MANIFEST" != "$SOURCE_COMMIT" || "$MANIFEST_TAG" != "$CANDIDATE_TAG" ]]; then
+            echo "Candidate identity changed between resolution and publication: $CANDIDATE_TAG $SOURCE_COMMIT" >&2
+            exit 1
+          fi
+          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$GITHUB_REF" \
+            --source-commit "$SOURCE_COMMIT_IN_MANIFEST" \
+            --candidate-tag "$CANDIDATE_TAG"
 
       - name: Finalize the release manifest
         run: |
@@ -400,6 +431,17 @@ jobs:
 
       - name: Publish release assets once
         run: |
+          PUBLISHED_SOURCE=$(jq -r '.source.fork_commit' release-assets/marin-vllm-gpu-manifest.json)
+          PUBLISHED_CANDIDATE=$(jq -r '.release.candidate_tag' release-assets/marin-vllm-gpu-manifest.json)
+          if [[ "$PUBLISHED_SOURCE" != "$SOURCE_COMMIT" || "$PUBLISHED_CANDIDATE" != "$CANDIDATE_TAG" ]]; then
+            echo "Final release identity changed before publication: $CANDIDATE_TAG $SOURCE_COMMIT" >&2
+            exit 1
+          fi
+          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$GITHUB_REF" \
+            --source-commit "$PUBLISHED_SOURCE" \
+            --candidate-tag "$CANDIDATE_TAG"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Refusing to overwrite existing release $RELEASE_TAG" >&2
             exit 1

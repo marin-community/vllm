@@ -79,12 +79,28 @@ The candidate manifest records:
 Candidate tags and assets are immutable. A rerun verifies an existing
 candidate instead of replacing it.
 
+GPU publication runs must use the repository's default-branch ref, which this
+fork expects to be `main`. The candidate source SHA must be an ancestor of the
+current `main`; a candidate remains valid if `main` advances while its wheels
+build. To publish immediately after merging reviewed code, dispatch the candidate
+workflow from `main` with `lane=gpu` and `gpu_mode=publish`.
+
+```bash
+gh workflow run marin-gpu-candidate.yaml \
+  --repo marin-community/vllm \
+  --ref main \
+  -f lane=gpu \
+  -f gpu_mode=publish
+```
+
 ## GPU validation and release
 
 [`marin-gpu-release.yaml`](../../.github/workflows/marin-gpu-release.yaml) runs
 on a schedule and through `workflow_dispatch`. The optional `candidate_tag`
 input selects an exact published candidate; an empty input selects the newest
-published candidate. Drafts are never eligible for qualification.
+published candidate. Drafts are never eligible for qualification. The newest
+candidate is checked as selected. Off-main provenance, an incompatible ABI, or
+invalid assets fail the run instead of silently choosing an older candidate.
 
 The workflow qualifies both wheels on their configured hardware:
 
@@ -119,8 +135,19 @@ Dispatch a specific candidate with:
 ```bash
 gh workflow run marin-gpu-release.yaml \
   --repo marin-community/vllm \
+  --ref main \
+  -f lane=gpu \
   -f candidate_tag=marin-vllm-gpu-candidate-0123456789ab
 ```
+
+Check the published candidate tag and final release assets independently after
+the manual run. [GitHub runs](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows)
+the workflow file on the selected ref. Older branches with older files can still run
+their old publication logic; these checks govern the supported workflows once
+merged to `main`. A publisher restricted outside branch-controlled workflow
+code would be needed to enforce this against a repository writer. A GitHub
+Environment on the publisher jobs could add a useful review gate, but an older
+workflow can omit it, so it is not a complete boundary.
 
 ## TPU wheel pairs
 

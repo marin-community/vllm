@@ -75,6 +75,8 @@ jobs:
     if: github.event_name == 'push' || inputs.lane == 'gpu'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       candidate_tag: ${{ steps.source.outputs.candidate_tag }}
@@ -88,6 +90,14 @@ jobs:
 
       - name: Create the metadata environment
         run: uv venv --python 3.12
+
+      - name: Require a main-line GPU source
+        run: |
+          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$GITHUB_REF" \
+            --source-commit "$GITHUB_SHA" \
+            --candidate-tag "marin-vllm-gpu-candidate-${GITHUB_SHA:0:12}"
 
       - name: Read the release platforms
         id: matrix
@@ -313,6 +323,11 @@ jobs:
           .venv/bin/python infra/release/gpu_release.py release-notes \
             --manifest candidate/marin-vllm-gpu-manifest.json \
             --output candidate-notes.md
+          SOURCE_COMMIT=$(jq -r '.source.fork_commit' candidate/marin-vllm-gpu-manifest.json)
+          if [[ "$SOURCE_COMMIT" != "$GITHUB_SHA" ]]; then
+            echo "Candidate source $SOURCE_COMMIT does not match workflow commit $GITHUB_SHA" >&2
+            exit 1
+          fi
 
       - name: Check for an existing immutable candidate
         id: existing
@@ -334,6 +349,16 @@ jobs:
       - name: Publish candidate assets once
         if: steps.existing.outputs.exists != 'true'
         run: |
+          SOURCE_COMMIT=$(jq -r '.source.fork_commit' candidate/marin-vllm-gpu-manifest.json)
+          if [[ "$SOURCE_COMMIT" != "$GITHUB_SHA" ]]; then
+            echo "Candidate source $SOURCE_COMMIT does not match workflow commit $GITHUB_SHA" >&2
+            exit 1
+          fi
+          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$GITHUB_REF" \
+            --source-commit "$SOURCE_COMMIT" \
+            --candidate-tag "$CANDIDATE_TAG"
           gh release create "$CANDIDATE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \

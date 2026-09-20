@@ -11,6 +11,7 @@ import copy
 import json
 import os
 import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -50,6 +51,7 @@ REQUIRED_EXTENSIONS = (STABLE_LIBTORCH_GATE, "vllm.cumem_allocator")
 GRUG_ARCHITECTURE = "GrugMoeForCausalLM"
 CANDIDATE_TAG_PREFIX = "marin-vllm-gpu-candidate-"
 RELEASE_TAG_PREFIX = "marin-vllm-gpu-"
+MAINTAINED_BRANCH = "main"
 BUILD_ABI_KEYS = (
     "python_version",
     "torch_version",
@@ -323,6 +325,52 @@ def verify_manifest_assets(manifest: dict[str, Any], directory: Path) -> None:
             )
 
 
+def verify_published_candidate(manifest: dict[str, Any], repository: str) -> None:
+    """Check GitHub's immutable asset digests before a validation short circuit."""
+    tag = manifest["release"]["tag"]
+    source = manifest["source"]["fork_commit"]
+    try:
+        response = subprocess.run(
+            ["gh", "api", f"repos/{repository}/releases/tags/{tag}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise ReleaseError(
+            f"cannot inspect candidate {tag} source={source}: {exc.stderr.strip()}"
+        ) from exc
+    release = json.loads(response.stdout)
+    if (
+        release["tag_name"] != tag
+        or release["target_commitish"] != source
+        or release["draft"]
+        or not release["prerelease"]
+    ):
+        raise ReleaseError(f"candidate {tag} source={source} release identity changed")
+    assets = release["assets"]
+    by_name = {asset["name"]: asset for asset in assets}
+    expected_names = {MANIFEST_NAME} | {
+        platform["wheel"]["filename"] for platform in manifest["platforms"]
+    }
+    if len(by_name) != len(assets) or set(by_name) != expected_names:
+        raise ReleaseError(f"candidate {tag} source={source} asset set changed")
+    if by_name[MANIFEST_NAME]["state"] != "uploaded":
+        raise ReleaseError(f"candidate {tag} source={source} manifest asset is invalid")
+    for platform in manifest["platforms"]:
+        wheel = platform["wheel"]
+        asset = by_name[wheel["filename"]]
+        if (
+            asset["state"] != "uploaded"
+            or asset["size"] != wheel["size_bytes"]
+            or asset["digest"] != f"sha256:{wheel['sha256']}"
+        ):
+            raise ReleaseError(
+                f"candidate {tag} source={source} wheel asset changed: "
+                f"{wheel['filename']}"
+            )
+
+
 def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None:
     if manifest["release"]["status"] != "candidate":
         raise ReleaseError("manifest is not a candidate")
@@ -334,6 +382,69 @@ def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None
         raise ReleaseError("candidate tag does not match its fork commit")
     if manifest["validation"] != {"status": "pending", "targets": []}:
         raise ReleaseError("candidate validation state is not pending")
+
+
+def verify_main_lineage(
+    repository: str,
+    workflow_ref: str,
+    source_commit: str | None = None,
+    candidate_tag: str | None = None,
+) -> None:
+    """Require the running ref and exact GPU source to belong to main."""
+    context = (
+        f"candidate={candidate_tag or 'unknown'} source={source_commit or 'unknown'} "
+        f"workflow_ref={workflow_ref}"
+    )
+    try:
+        response = subprocess.run(
+            ["gh", "api", f"repos/{repository}", "--jq", ".default_branch"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise ReleaseError(
+            f"cannot read default branch for {context}: {exc.stderr.strip()}"
+        ) from exc
+    default_branch = response.stdout.strip()
+    expected_ref = f"refs/heads/{default_branch}"
+    branch_context = f"{context} expected_default_branch={default_branch}"
+    if default_branch != MAINTAINED_BRANCH or workflow_ref != expected_ref:
+        raise ReleaseError(
+            f"GPU lineage rejected: {branch_context}; "
+            f"workflow must run from {expected_ref} on maintained {MAINTAINED_BRANCH}"
+        )
+    if source_commit is None:
+        return
+    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+        raise ReleaseError(
+            f"GPU lineage rejected: {branch_context}; "
+            "source is not a full Git SHA"
+        )
+    try:
+        response = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repository}/compare/{source_commit}...{default_branch}",
+                "--jq",
+                ".status",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise ReleaseError(
+            f"cannot compare GPU lineage for {context} "
+            f"expected_default_branch={default_branch}: {exc.stderr.strip()}"
+        ) from exc
+    status = response.stdout.strip()
+    if status not in {"identical", "ahead"}:
+        raise ReleaseError(
+            f"GPU lineage rejected: {branch_context}; "
+            f"source is not an ancestor of {default_branch} (compare status={status})"
+        )
 
 
 def _validate_manifest_common(
@@ -722,6 +833,14 @@ def parse_args() -> argparse.Namespace:
     validation_matrix_parser = subparsers.add_parser("validation-matrix")
     validation_matrix_parser.add_argument("--config", type=Path, required=True)
 
+    lineage_parser = subparsers.add_parser("verify-main-lineage")
+    lineage_parser.add_argument("--repository", required=True)
+    lineage_parser.add_argument("--workflow-ref", required=True)
+    lineage_source = lineage_parser.add_mutually_exclusive_group(required=True)
+    lineage_source.add_argument("--source-commit")
+    lineage_source.add_argument("--ref-only", action="store_true")
+    lineage_parser.add_argument("--candidate-tag")
+
     inspect_parser = subparsers.add_parser("inspect-wheel")
     inspect_parser.add_argument("--config", type=Path, required=True)
     inspect_parser.add_argument("--wheel", type=Path, required=True)
@@ -751,6 +870,10 @@ def parse_args() -> argparse.Namespace:
     candidate_parser = subparsers.add_parser("validate-candidate")
     candidate_parser.add_argument("--manifest", type=Path, required=True)
     candidate_parser.add_argument("--config", type=Path, required=True)
+
+    published_candidate_parser = subparsers.add_parser("verify-published-candidate")
+    published_candidate_parser.add_argument("--manifest", type=Path, required=True)
+    published_candidate_parser.add_argument("--repository", required=True)
 
     release_parser = subparsers.add_parser("verify-release")
     release_parser.add_argument("--manifest", type=Path, required=True)
@@ -800,6 +923,14 @@ def main() -> int:
                 )
             )
             return 0
+        if args.command == "verify-main-lineage":
+            verify_main_lineage(
+                args.repository,
+                args.workflow_ref,
+                args.source_commit,
+                args.candidate_tag,
+            )
+            return 0
         if args.command == "inspect-wheel":
             fragment = inspect_wheel(
                 args.wheel,
@@ -835,6 +966,9 @@ def main() -> int:
             return 0
         if args.command == "validate-candidate":
             validate_candidate(load_json(args.manifest), load_json(args.config))
+            return 0
+        if args.command == "verify-published-candidate":
+            verify_published_candidate(load_json(args.manifest), args.repository)
             return 0
         if args.command == "verify-release":
             verify_release_assets(
