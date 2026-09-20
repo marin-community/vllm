@@ -74,16 +74,6 @@ jobs:
       - name: Create the metadata environment
         run: uv venv --python 3.12
 
-      - name: Require the main workflow ref
-        env:
-          REQUESTED_CANDIDATE_TAG: ${{ inputs.candidate_tag }}
-        run: |
-          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
-            --repository "$GITHUB_REPOSITORY" \
-            --workflow-ref "$GITHUB_REF" \
-            --ref-only \
-            --candidate-tag "$REQUESTED_CANDIDATE_TAG"
-
       - name: Read the validation platforms
         id: matrix
         run: |

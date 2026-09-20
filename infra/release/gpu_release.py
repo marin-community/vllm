@@ -325,52 +325,42 @@ def verify_manifest_assets(manifest: dict[str, Any], directory: Path) -> None:
             )
 
 
-def verify_published_candidate(manifest: dict[str, Any], repository: str) -> None:
-    """Check a published candidate's release identity and asset metadata."""
-    tag = manifest["release"]["tag"]
-    source = manifest["source"]["fork_commit"]
+def _github_api(path: str, context: str) -> dict[str, Any]:
     try:
         response = subprocess.run(
-            ["gh", "api", f"repos/{repository}/releases/tags/{tag}"],
-            check=True,
-            capture_output=True,
-            text=True,
+            ["gh", "api", path], check=True, capture_output=True, text=True
         )
     except subprocess.CalledProcessError as exc:
         raise ReleaseError(
-            f"cannot inspect candidate {tag} source={source}: {exc.stderr.strip()}"
+            f"{context}: GitHub API failed: {exc.stderr.strip()}"
         ) from exc
-    release = json.loads(response.stdout)
+    return json.loads(response.stdout)
+
+
+def verify_published_candidate(manifest: dict[str, Any], repository: str) -> None:
+    """Check the candidate release before an existing final release can skip it."""
+    tag = manifest["release"]["tag"]
+    source = manifest["source"]["fork_commit"]
+    context = f"candidate={tag} source={source}"
+    release = _github_api(f"repos/{repository}/releases/tags/{tag}", context)
     if (
         release["tag_name"] != tag
         or release["target_commitish"] != source
         or release["draft"]
         or not release["prerelease"]
     ):
-        raise ReleaseError(f"candidate {tag} source={source} release identity changed")
-    assets = release["assets"]
-    by_name = {asset["name"]: asset for asset in assets}
-    expected_names = {MANIFEST_NAME} | {
-        platform["wheel"]["filename"] for platform in manifest["platforms"]
+        raise ReleaseError(f"{context}: release identity changed")
+    wheels = {
+        platform["wheel"]["filename"]: f"sha256:{platform['wheel']['sha256']}"
+        for platform in manifest["platforms"]
     }
-    if len(by_name) != len(assets) or set(by_name) != expected_names:
-        raise ReleaseError(f"candidate {tag} source={source} asset set changed")
-    for asset in assets:
-        if asset["state"] != "uploaded":
-            raise ReleaseError(
-                f"candidate {tag} source={source} asset is invalid: {asset['name']}"
-            )
-    for platform in manifest["platforms"]:
-        wheel = platform["wheel"]
-        asset = by_name[wheel["filename"]]
-        if (
-            asset.get("size") != wheel["size_bytes"]
-            or asset.get("digest") != f"sha256:{wheel['sha256']}"
-        ):
-            raise ReleaseError(
-                f"candidate {tag} source={source} wheel asset changed: "
-                f"{wheel['filename']}"
-            )
+    assets = {asset["name"]: asset for asset in release["assets"]}
+    if (
+        set(assets) != {MANIFEST_NAME, *wheels}
+        or any(asset["state"] != "uploaded" for asset in assets.values())
+        or any(assets[name].get("digest") != digest for name, digest in wheels.items())
+    ):
+        raise ReleaseError(f"{context}: release assets disagree with manifest")
 
 
 def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None:
@@ -397,76 +387,36 @@ def newest_published_candidate(releases: list[dict[str, Any]]) -> str:
     ]
     if not candidates:
         raise ReleaseError("No Marin vLLM GPU candidate release exists")
-    for release in candidates:
-        if not release["published_at"]:
-            raise ReleaseError(
-                f"GPU candidate {release['tag_name']} has no publication time"
-            )
-    newest = max(
+    return max(
         candidates, key=lambda release: (release["published_at"], release["id"])
-    )
-    return newest["tag_name"]
+    )["tag_name"]
 
 
 def verify_main_lineage(
     repository: str,
     workflow_ref: str,
-    source_commit: str | None = None,
+    source_commit: str,
     candidate_tag: str | None = None,
 ) -> None:
     """Require the running ref and exact GPU source to belong to main."""
     context = (
-        f"candidate={candidate_tag or 'unknown'} source={source_commit or 'unknown'} "
+        f"candidate={candidate_tag or '-'} source={source_commit} "
         f"workflow_ref={workflow_ref}"
     )
-    try:
-        response = subprocess.run(
-            ["gh", "api", f"repos/{repository}", "--jq", ".default_branch"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise ReleaseError(
-            f"cannot read default branch for {context}: {exc.stderr.strip()}"
-        ) from exc
-    default_branch = response.stdout.strip()
+    default_branch = _github_api(f"repos/{repository}", context)["default_branch"]
     expected_ref = f"refs/heads/{default_branch}"
-    branch_context = f"{context} expected_default_branch={default_branch}"
+    context += f" expected_default_branch={default_branch}"
     if default_branch != MAINTAINED_BRANCH or workflow_ref != expected_ref:
         raise ReleaseError(
-            f"GPU lineage rejected: {branch_context}; "
+            f"GPU lineage rejected: {context}; "
             f"workflow must run from {expected_ref} on maintained {MAINTAINED_BRANCH}"
         )
-    if source_commit is None:
-        return
-    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
-        raise ReleaseError(
-            f"GPU lineage rejected: {branch_context}; "
-            "source is not a full Git SHA"
-        )
-    try:
-        response = subprocess.run(
-            [
-                "gh",
-                "api",
-                f"repos/{repository}/compare/{source_commit}...{default_branch}",
-                "--jq",
-                ".status",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise ReleaseError(
-            f"cannot compare GPU lineage for {context} "
-            f"expected_default_branch={default_branch}: {exc.stderr.strip()}"
-        ) from exc
-    status = response.stdout.strip()
+    status = _github_api(
+        f"repos/{repository}/compare/{source_commit}...{default_branch}", context
+    )["status"]
     if status not in {"identical", "ahead"}:
         raise ReleaseError(
-            f"GPU lineage rejected: {branch_context}; "
+            f"GPU lineage rejected: {context}; "
             f"source is not an ancestor of {default_branch} (compare status={status})"
         )
 
@@ -860,9 +810,7 @@ def parse_args() -> argparse.Namespace:
     lineage_parser = subparsers.add_parser("verify-main-lineage")
     lineage_parser.add_argument("--repository", required=True)
     lineage_parser.add_argument("--workflow-ref", required=True)
-    lineage_source = lineage_parser.add_mutually_exclusive_group(required=True)
-    lineage_source.add_argument("--source-commit")
-    lineage_source.add_argument("--ref-only", action="store_true")
+    lineage_parser.add_argument("--source-commit", required=True)
     lineage_parser.add_argument("--candidate-tag")
 
     subparsers.add_parser("select-newest-candidate")

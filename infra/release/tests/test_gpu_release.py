@@ -216,111 +216,94 @@ def candidate(tmp_path: Path) -> dict:
 
 
 def test_newest_candidate_uses_publication_time_without_provenance_fallback():
-    off_main = {
-        "tag_name": "marin-vllm-gpu-candidate-e09cfd55a7a9",
-        "prerelease": True,
-        "draft": False,
-        "published_at": "2026-09-20T00:47:34Z",
-        "id": 1,
+    releases = [
+        dict(
+            tag_name=f"marin-vllm-gpu-candidate-{tag}",
+            prerelease=True,
+            draft=False,
+            published_at=published_at,
+            id=index,
+        )
+        for index, (tag, published_at) in enumerate(
+            [
+                ("e09cfd55a7a9", "2026-09-20T00:47:34Z"),
+                ("744111c4f161", "2026-09-20T16:33:38Z"),
+            ]
+        )
+    ]
+    assert newest_published_candidate(releases) == releases[1]["tag_name"]
+    releases[0]["published_at"] = "2026-09-21T00:00:00Z"
+    assert newest_published_candidate(releases) == releases[0]["tag_name"]
+
+
+def test_published_candidate_rejects_changed_assets_and_target(monkeypatch):
+    manifest = {
+        "release": {"tag": CANDIDATE_TAG},
+        "source": {"fork_commit": FORK_COMMIT},
+        "platforms": [{"wheel": {"filename": "wheel.whl", "sha256": "a" * 64}}],
     }
-    main = {
-        "tag_name": "marin-vllm-gpu-candidate-744111c4f161",
-        "prerelease": True,
-        "draft": False,
-        "published_at": "2026-09-20T16:33:38Z",
-        "id": 2,
-    }
-
-    assert newest_published_candidate([off_main, main]) == main["tag_name"]
-    off_main["published_at"] = "2026-09-21T00:00:00Z"
-    assert newest_published_candidate([main, off_main]) == off_main["tag_name"]
-
-
-def test_published_candidate_rejects_changed_assets_and_target(tmp_path, monkeypatch):
-    manifest = candidate(tmp_path)
     release = {
         "tag_name": CANDIDATE_TAG,
         "target_commitish": FORK_COMMIT,
         "draft": False,
         "prerelease": True,
-        "assets": [{"name": "marin-vllm-gpu-manifest.json", "state": "uploaded"}],
+        "assets": [
+            {"name": "marin-vllm-gpu-manifest.json", "state": "uploaded"},
+            {"name": "wheel.whl", "state": "uploaded", "digest": "sha256:" + "a" * 64},
+        ],
     }
-    for platform in manifest["platforms"]:
-        wheel = platform["wheel"]
-        release["assets"].append(
-            {
-                "name": wheel["filename"],
-                "state": "uploaded",
-                "size": wheel["size_bytes"],
-                "digest": f"sha256:{wheel['sha256']}",
-            }
-        )
 
-    def gh_api(args, **kwargs):
-        return subprocess.CompletedProcess(
+    monkeypatch.setattr(
+        "infra.release.gpu_release.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
             args, 0, stdout=json.dumps(release), stderr=""
-        )
-
-    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
+        ),
+    )
 
     verify_published_candidate(manifest, "marin-community/vllm")
+    digest = release["assets"][1]["digest"]
     release["assets"][1]["digest"] = "sha256:" + "0" * 64
-    with pytest.raises(ReleaseError, match="wheel asset changed"):
+    with pytest.raises(ReleaseError, match="assets disagree with manifest"):
         verify_published_candidate(manifest, "marin-community/vllm")
-    release["assets"][1]["digest"] = (
-        f"sha256:{manifest['platforms'][0]['wheel']['sha256']}"
-    )
+    release["assets"][1]["digest"] = digest
     release["target_commitish"] = "b" * 40
     with pytest.raises(ReleaseError, match="release identity changed"):
         verify_published_candidate(manifest, "marin-community/vllm")
 
 
-@pytest.mark.parametrize("compare_status", ["identical", "ahead"])
-def test_gpu_lineage_accepts_main_source_when_main_advances(
-    monkeypatch, compare_status: str
+@pytest.mark.parametrize(
+    ("branch", "workflow_ref", "source", "status", "failure"),
+    [
+        ("main", "refs/heads/main", FORK_COMMIT, "identical", None),
+        ("main", "refs/heads/main", FORK_COMMIT, "ahead", None),
+        ("main", "refs/heads/feature", FORK_COMMIT, "ahead", "workflow must run"),
+        ("main", "refs/heads/main", FORK_COMMIT, "diverged", "not an ancestor"),
+        ("develop", "refs/heads/develop", FORK_COMMIT, "ahead", "maintained main"),
+    ],
+)
+def test_gpu_lineage_policy(
+    monkeypatch, branch, workflow_ref, source, status, failure
 ):
     def gh_api(args, **kwargs):
-        value = "main" if args[2] == "repos/marin-community/vllm" else compare_status
-        return subprocess.CompletedProcess(args, 0, stdout=value, stderr="")
+        body = (
+            {"default_branch": branch}
+            if args[2] == "repos/marin-community/vllm"
+            else {"status": status}
+        )
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(body), stderr="")
 
     monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
-
-    # The same source can be current main or an ancestor after a long build.
-    assert (
-        verify_main_lineage(
-            "marin-community/vllm", "refs/heads/main", FORK_COMMIT, CANDIDATE_TAG
-        )
-        is None
-    )
-
-
-def test_gpu_lineage_rejects_off_main_dispatch(monkeypatch):
-    def gh_api(args, **kwargs):
-        return subprocess.CompletedProcess(args, 0, stdout="main", stderr="")
-
-    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
-
-    with pytest.raises(ReleaseError, match="workflow must run from refs/heads/main"):
-        verify_main_lineage(
-            "marin-community/vllm", "refs/heads/feature", FORK_COMMIT, CANDIDATE_TAG
-        )
-
-
-def test_gpu_lineage_rejects_diverged_candidate_with_context(monkeypatch):
-    def gh_api(args, **kwargs):
-        value = "main" if args[2] == "repos/marin-community/vllm" else "diverged"
-        return subprocess.CompletedProcess(args, 0, stdout=value, stderr="")
-
-    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
-
-    with pytest.raises(ReleaseError, match="source is not an ancestor of main") as exc:
-        verify_main_lineage(
-            "marin-community/vllm", "refs/heads/main", FORK_COMMIT, CANDIDATE_TAG
-        )
-    assert CANDIDATE_TAG in str(exc.value)
-    assert FORK_COMMIT in str(exc.value)
-    assert "workflow_ref=refs/heads/main" in str(exc.value)
-    assert "expected_default_branch=main" in str(exc.value)
+    if failure is None:
+        assert verify_main_lineage("marin-community/vllm", workflow_ref, source) is None
+    else:
+        with pytest.raises(ReleaseError, match=failure) as exc:
+            verify_main_lineage(
+                "marin-community/vllm", workflow_ref, source, CANDIDATE_TAG
+            )
+        assert f"workflow_ref={workflow_ref}" in str(exc.value)
+        assert f"expected_default_branch={branch}" in str(exc.value)
+        assert f"source={source}" in str(exc.value)
+        assert f"candidate={CANDIDATE_TAG}" in str(exc.value)
 
 
 def test_candidate_rejects_abi_change(tmp_path):
