@@ -20,6 +20,7 @@ from torch import nn
 
 _FORMAT_VERSION = 1
 _MANIFEST_FILENAME = "manifest.json"
+_SKYRL_REPLAY_REQUEST_PREFIX = "skyrl-eagle-replay-"
 _MIN_TRAINING_WINDOW_TOKENS = 2
 LM_HEAD_WEIGHT_NAME = "lm_head.weight"
 TARGET_EMBEDDING_NAME = "model.embed_tokens.weight"
@@ -103,6 +104,18 @@ def refresh_target_owned_draft_weights(
         raise RuntimeError("Projected target head does not match the EAGLE draft head")
     with torch.no_grad():
         draft_head.copy_(projected)
+
+
+def replay_loss_start_from_id(request_id: str) -> int | None:
+    """Return the supervised-response boundary carried by a replay request."""
+    if not request_id.startswith(_SKYRL_REPLAY_REQUEST_PREFIX):
+        return None
+    remainder = request_id[len(_SKYRL_REPLAY_REQUEST_PREFIX) :]
+    _group, separator, loss_start_and_attempt = remainder.partition("-")
+    loss_start, second_separator, _attempt = loss_start_and_attempt.partition("-")
+    if not separator or not second_separator or not loss_start.isdecimal():
+        raise ValueError(f"Malformed EAGLE replay request ID: {request_id!r}")
+    return int(loss_start)
 
 
 @dataclass(frozen=True)
@@ -219,6 +232,7 @@ class _PendingSamples:
 @dataclass
 class _RequestCapture:
     prompt_token_ids: tuple[int, ...]
+    replay_loss_start: int | None = None
     retention_floor: int = 0
     output_token_ids: tuple[int, ...] | None = None
     final_output_length: int | None = None
@@ -276,6 +290,12 @@ class OnlineEagleCapture:
         ):
             self.dropped_requests += 1
             return False
+        replay_loss_start = replay_loss_start_from_id(request_id)
+        if replay_loss_start is not None and not 0 < replay_loss_start < len(
+            prompt_token_ids
+        ):
+            self.dropped_requests += 1
+            return False
         reserved = min(
             len(prompt_token_ids) + max_completion_tokens,
             self.config.max_window_tokens,
@@ -289,6 +309,7 @@ class OnlineEagleCapture:
         self._reserved_tokens += reserved
         self.requests[request_id] = _RequestCapture(
             prompt_token_ids=tuple(int(token) for token in prompt_token_ids),
+            replay_loss_start=replay_loss_start,
         )
         return True
 
@@ -517,7 +538,12 @@ class OnlineEagleCapture:
             self.dropped_windows += 1
             return None
         prompt_length = len(request.prompt_token_ids)
-        trajectory = request.prompt_token_ids + request.output_token_ids
+        loss_start = request.replay_loss_start or prompt_length
+        trajectory = (
+            request.prompt_token_ids
+            if request.replay_loss_start is not None
+            else request.prompt_token_ids + request.output_token_ids
+        )
         matching = {
             position: request.provisional[(position, token)]
             for position, token in enumerate(trajectory)
@@ -533,7 +559,7 @@ class OnlineEagleCapture:
             segment
             for segment in segments
             if len(segment) >= _MIN_TRAINING_WINDOW_TOKENS
-            and segment[-1] >= prompt_length
+            and segment[-1] >= loss_start
         ]
         if not eligible:
             self.dropped_windows += 1
@@ -547,7 +573,7 @@ class OnlineEagleCapture:
             [trajectory[position] for position in positions], dtype=torch.long
         )
         loss_mask = torch.tensor(
-            [position >= prompt_length for position in positions], dtype=torch.bool
+            [position >= loss_start for position in positions], dtype=torch.bool
         )
         if not loss_mask[1:].any():
             self.dropped_windows += 1
@@ -668,6 +694,7 @@ __all__ = [
     "TARGET_EMBEDDING_NAME",
     "draft_vocab_target_ids",
     "project_target_head",
+    "replay_loss_start_from_id",
     "refresh_target_owned_draft_weights",
     "resolve_online_eagle_capture_config",
     "target_embedding_weight",

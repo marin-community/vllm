@@ -15,6 +15,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.online_eagle import (
     OnlineEagleCapture,
     OnlineEagleCaptureConfig,
+    replay_loss_start_from_id,
 )
 from vllm.v1.worker import gpu_model_runner
 from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
@@ -184,6 +185,51 @@ def test_token_keyed_capture_discards_rejected_branch_and_keeps_replacement(
         4,
         2,
     ]
+
+
+def test_teacher_forced_replay_supervises_prefilled_response_only(tmp_path) -> None:
+    capture = OnlineEagleCapture(_capture_config(max_window_tokens=16))
+    request_id = "skyrl-eagle-replay-deadbeef-3-attempt0"
+    assert replay_loss_start_from_id(request_id) == 3
+    sequence = [10, 11, 12, 20, 21, 22]
+    assert capture.admit_request(request_id, sequence, 1)
+    aux, head = _states(sequence)
+    capture.record_forward(
+        request_ids=[request_id],
+        num_scheduled_tokens=[len(sequence)],
+        num_computed_tokens=[0],
+        input_ids=torch.tensor(sequence),
+        aux_hidden_states=aux,
+        head_input_hidden_states=head,
+    )
+
+    # Replay uses one decode token only to make vLLM complete the request. It is
+    # not part of the teacher-forced sequence or the draft loss.
+    aux, head = _states([99])
+    capture.record_forward(
+        request_ids=[request_id],
+        num_scheduled_tokens=[1],
+        num_computed_tokens=[len(sequence)],
+        input_ids=torch.tensor([99]),
+        aux_hidden_states=aux,
+        head_input_hidden_states=head,
+    )
+    capture.finalize_request(request_id, [99])
+
+    destination = tmp_path / "capture"
+    manifest = capture.seal(
+        destination,
+        target_model=_TargetModel(),
+        draft_model=SimpleNamespace(
+            draft_id_to_target_id=torch.tensor([1, 2, 3, 4])
+        ),
+        target_config={"hidden_size": 2, "vocab_size": 64},
+    )
+
+    window = load_file(str(destination / manifest["windows"][0]["path"]))
+    assert window["input_ids"].tolist() == sequence
+    assert window["loss_mask"].tolist() == [False, False, False, True, True, True]
+    assert 99 not in window["input_ids"].tolist()
 
 
 def test_sampled_capture_uses_scheduler_final_output_length(tmp_path) -> None:
