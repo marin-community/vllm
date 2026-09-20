@@ -599,7 +599,7 @@ class OnlineEagleCapture:
                     "path": window_path.name,
                     "request_id": request_id,
                     "tokens": int(tensors["input_ids"].shape[0]),
-                    "supervised_tokens": int(tensors["loss_mask"].sum().item()),
+                    "supervised_tokens": int(tensors["loss_mask"][1:].sum().item()),
                 }
             )
         return windows

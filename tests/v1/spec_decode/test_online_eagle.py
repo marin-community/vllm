@@ -232,6 +232,35 @@ def test_teacher_forced_replay_supervises_prefilled_response_only(tmp_path) -> N
     assert 99 not in window["input_ids"].tolist()
 
 
+def test_manifest_counts_only_shifted_supervised_tokens(tmp_path) -> None:
+    capture = OnlineEagleCapture(_capture_config(max_window_tokens=3))
+    request_id = "skyrl-eagle-replay-deadbeef-2-attempt0"
+    sequence = [10, 11, 20, 21, 22]
+    assert capture.admit_request(request_id, sequence, 1)
+    aux, head = _states(sequence)
+    capture.record_forward(
+        request_ids=[request_id],
+        num_scheduled_tokens=[len(sequence)],
+        num_computed_tokens=[0],
+        input_ids=torch.tensor(sequence),
+        aux_hidden_states=aux,
+        head_input_hidden_states=head,
+    )
+    capture.finalize_request(request_id, [99])
+
+    manifest = capture.seal(
+        tmp_path / "capture",
+        target_model=_TargetModel(),
+        draft_model=SimpleNamespace(
+            draft_id_to_target_id=torch.tensor([1, 2, 3, 4])
+        ),
+        target_config={"hidden_size": 2, "vocab_size": 64},
+    )
+
+    assert manifest["windows"][0]["tokens"] == 3
+    assert manifest["windows"][0]["supervised_tokens"] == 2
+
+
 def test_sampled_capture_uses_scheduler_final_output_length(tmp_path) -> None:
     capture = OnlineEagleCapture(_capture_config())
     request_id = "request"
