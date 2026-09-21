@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import re
+import zipfile
+from email.parser import Parser
 from pathlib import Path
 
 from infra.release.gpu_release import (
@@ -32,6 +34,33 @@ def verify(
         raise ReleaseError("an unqualified branch release cannot claim validation")
     _validate_manifest_common(manifest, config)
     verify_manifest_assets(manifest, directory)
+    required = {
+        "apache-tvm-ffi": "0.1.12",
+        "tilelang": "0.1.14",
+        "tokenspeed-mla": "0.1.9",
+    }
+    for platform in manifest["platforms"]:
+        wheel = directory / platform["wheel"]["filename"]
+        with zipfile.ZipFile(wheel) as archive:
+            metadata_path = next(
+                name
+                for name in archive.namelist()
+                if name.endswith(".dist-info/METADATA")
+            )
+            metadata = Parser().parsestr(archive.read(metadata_path).decode())
+        requirements = {
+            requirement.lower().replace(" ", "")
+            for requirement in metadata.get_all("Requires-Dist", [])
+        }
+        for name, pinned_version in required.items():
+            if not any(
+                requirement.startswith(f"{name}=={pinned_version}")
+                for requirement in requirements
+            ):
+                raise ReleaseError(
+                    f"{platform['architecture']} wheel does not pin "
+                    f"{name}=={pinned_version}"
+                )
 
 
 def main() -> None:
