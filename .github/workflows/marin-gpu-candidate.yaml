@@ -459,6 +459,7 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             mkdir existing
             gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir existing
+            cmp candidate/marin-vllm-gpu-manifest.json existing/marin-vllm-gpu-manifest.json
             .venv/bin/python -m infra.release.premerge_candidate \
               --config "$RELEASE_CONFIG" \
               --directory existing \
