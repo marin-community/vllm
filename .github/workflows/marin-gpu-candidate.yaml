@@ -455,7 +455,7 @@ jobs:
 
       - name: Publish and recheck immutable assets
         run: |
-          TAG="marin-vllm-gpu-premerge-${SOURCE_COMMIT:0:12}"
+          TAG="marin-vllm-gpu-premerge-${SOURCE_COMMIT:0:12}-immutable"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             mkdir existing
             gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir existing

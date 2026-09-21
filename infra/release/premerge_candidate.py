@@ -20,7 +20,7 @@ from infra.release.release_common import ReleaseError, load_json, write_json
 def verify(
     manifest: dict, *, config: dict, directory: Path, source_commit: str
 ) -> None:
-    expected_tag = f"marin-vllm-gpu-premerge-{source_commit[:12]}"
+    expected_tag = f"marin-vllm-gpu-premerge-{source_commit[:12]}-immutable"
     if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
         raise ReleaseError("source commit must be a full lowercase SHA")
     if manifest["source"]["fork_commit"] != source_commit:
@@ -84,7 +84,9 @@ def main() -> None:
             fragments,
             config=config,
             repository=args.repository,
-            candidate_tag=f"marin-vllm-gpu-premerge-{args.source_commit[:12]}",
+            candidate_tag=(
+                f"marin-vllm-gpu-premerge-{args.source_commit[:12]}-immutable"
+            ),
             created_at=args.created_at,
         )
         verify(
