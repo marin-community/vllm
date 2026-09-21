@@ -41,6 +41,22 @@ on:
           - publish
           - qualify-x86_64
           - qualify-aarch64
+          - publish-premerge
+      premerge_source_commit:
+        description: "Exact branch source commit for the premerge wheel pair"
+        required: false
+        default: 947b2b82fca046f51a35a1e0de64c2093b7f7d19
+        type: string
+      premerge_x86_run_id:
+        description: "Successful x86_64 branch qualification run"
+        required: false
+        default: "35545938724"
+        type: string
+      premerge_arm_run_id:
+        description: "Successful aarch64 branch qualification run"
+        required: false
+        default: "35545963872"
+        type: string
       vllm_commit:
         description: "Exact vLLM package source for the TPU lane"
         required: true
@@ -72,7 +88,7 @@ env:
 jobs:
   prepare:
     name: Resolve build matrix
-    if: github.event_name == 'push' || inputs.lane == 'gpu'
+    if: github.event_name == 'push' || (inputs.lane == 'gpu' && inputs.gpu_mode != 'publish-premerge')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -376,6 +392,96 @@ jobs:
             --manifest published/marin-vllm-gpu-manifest.json \
             --directory published \
             --config "$RELEASE_CONFIG"
+
+  publish-premerge:
+    name: Publish isolated premerge wheel pair
+    if: github.event_name == 'workflow_dispatch' && inputs.lane == 'gpu' && inputs.gpu_mode == 'publish-premerge'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_COMMIT: ${{ inputs.premerge_source_commit }}
+      X86_RUN_ID: ${{ inputs.premerge_x86_run_id }}
+      ARM_RUN_ID: ${{ inputs.premerge_arm_run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Check the source and completed build runs
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/ops/fa4-premerge-publisher-20260920 ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git merge-base --is-ancestor "$SOURCE_COMMIT" "$GITHUB_SHA"
+          for run_id in "$X86_RUN_ID" "$ARM_RUN_ID"; do
+            [[ "$run_id" =~ ^[0-9]+$ ]]
+            [[ "$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --json conclusion --jq .conclusion)" == success ]]
+            [[ "$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --json headSha --jq .headSha)" == "$SOURCE_COMMIT" ]]
+          done
+
+      - name: Create the metadata environment
+        run: uv venv --python 3.12
+
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.premerge_x86_run_id }}
+          name: marin-vllm-gpu-candidate-x86_64
+          github-token: ${{ github.token }}
+          path: candidate
+
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.premerge_arm_run_id }}
+          name: marin-vllm-gpu-candidate-aarch64
+          github-token: ${{ github.token }}
+          path: candidate
+
+      - name: Assemble and verify the premerge manifest
+        run: |
+          .venv/bin/python -m infra.release.premerge_candidate \
+            --config "$RELEASE_CONFIG" \
+            --directory candidate \
+            --source-commit "$SOURCE_COMMIT" \
+            --created-at "$(git show -s --format=%cI "$SOURCE_COMMIT")" \
+            --repository "$GITHUB_REPOSITORY" \
+            --assemble
+
+      - name: Publish and recheck immutable assets
+        run: |
+          TAG="marin-vllm-gpu-premerge-${SOURCE_COMMIT:0:12}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            mkdir existing
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir existing
+            .venv/bin/python -m infra.release.premerge_candidate \
+              --config "$RELEASE_CONFIG" \
+              --directory existing \
+              --source-commit "$SOURCE_COMMIT" \
+              --created-at "$(git show -s --format=%cI "$SOURCE_COMMIT")" \
+              --repository "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SOURCE_COMMIT" \
+              --title "Marin vLLM premerge candidate ${SOURCE_COMMIT:0:12}" \
+              --notes-file candidate/release-notes.md \
+              --prerelease \
+              candidate/*.whl candidate/marin-vllm-gpu-manifest.json
+            mkdir published
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir published
+            .venv/bin/python -m infra.release.premerge_candidate \
+              --config "$RELEASE_CONFIG" \
+              --directory published \
+              --source-commit "$SOURCE_COMMIT" \
+              --created-at "$(git show -s --format=%cI "$SOURCE_COMMIT")" \
+              --repository "$GITHUB_REPOSITORY"
+          fi
 
   publish-tpu:
     name: Build and publish exact TPU wheel pair
