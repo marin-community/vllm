@@ -91,6 +91,18 @@ gh workflow run marin-gpu-candidate.yaml \
   -f gpu_mode=publish
 ```
 
+A source refresh uses the separate `main-next` staging lane. `gpu_mode=stage`
+requires the workflow source to equal the current remote `main-next` tip and
+publishes under `marin-vllm-gpu-staged-candidate-<12-character-sha>`. Staged
+candidates never match scheduled candidate selection. The manifest binds the
+source and workflow commit, workflow ref and run, and both wheel digests.
+Arbitrary branches cannot publish either candidate kind.
+
+The `qualify-x86_64` and `qualify-aarch64` modes remain useful for branch-only
+dependency checks. They build one short-lived Actions artifact and publish no
+GitHub release. They do not replace the two-wheel staged candidate used by a
+source refresh.
+
 ## GPU validation and release
 
 [`marin-gpu-release.yaml`](../../.github/workflows/marin-gpu-release.yaml) runs
@@ -127,6 +139,37 @@ Both GPU results must pass before the workflow creates
 unchanged candidate wheels, their validation records, and a final manifest that
 binds every result to a wheel digest. The workflow never overwrites an existing
 release tag or asset.
+
+For a staged refresh, dispatch the release workflow from trusted `main` with
+`qualification_only=true`. It accepts only the exact current `main-next` source,
+runs the normal H100 and GB200 gates, and retains their artifacts without
+publishing a final release. After an administrator promotes that exact source to
+`main`, dispatch again with the successful qualification run ID. The promotion
+rechecks the candidate assets, source lineage, workflow run, validation records,
+and wheel digests, then publishes the same bytes without another GPU allocation.
+
+```bash
+gh workflow run marin-gpu-candidate.yaml \
+  --repo marin-community/vllm \
+  --ref main-next \
+  -f lane=gpu \
+  -f gpu_mode=stage
+
+gh workflow run marin-gpu-release.yaml \
+  --repo marin-community/vllm \
+  --ref main \
+  -f lane=gpu \
+  -f candidate_tag=marin-vllm-gpu-staged-candidate-0123456789ab \
+  -f qualification_only=true
+
+# After the lease-checked main-next -> main promotion:
+gh workflow run marin-gpu-release.yaml \
+  --repo marin-community/vllm \
+  --ref main \
+  -f lane=gpu \
+  -f candidate_tag=marin-vllm-gpu-staged-candidate-0123456789ab \
+  -f qualification_run_id=<successful-qualification-run-id>
+```
 
 Dispatch a specific candidate with:
 

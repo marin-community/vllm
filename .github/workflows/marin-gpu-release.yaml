@@ -26,9 +26,14 @@ on:
         required: false
         type: boolean
       qualification_run_id:
-        description: "Successful TPU qualification run to reuse during promotion"
+        description: "Successful GPU or TPU qualification run to reuse"
         required: false
         type: string
+      qualification_only:
+        description: "Qualify GPU candidate without publishing its final release"
+        default: false
+        required: false
+        type: boolean
       model:
         description: "HF model id for the GPU serving smoke"
         default: Qwen/Qwen3-0.6B
@@ -109,7 +114,8 @@ jobs:
             --pattern marin-vllm-gpu-manifest.json \
             --dir candidate
           SOURCE_COMMIT=$(jq -r '.source.fork_commit' candidate/marin-vllm-gpu-manifest.json)
-          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
+          .venv/bin/python infra/release/gpu_release.py \
+            verify-candidate-qualification-lineage \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-ref "$GITHUB_REF" \
             --source-commit "$SOURCE_COMMIT" \
@@ -159,7 +165,9 @@ jobs:
   validate:
     name: Validate ${{ matrix.hardware }} wheel
     needs: resolve
-    if: needs.resolve.outputs.publish == 'true'
+    if: >-
+      needs.resolve.outputs.publish == 'true' &&
+      inputs.qualification_run_id == ''
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.validation_matrix) }}
@@ -345,10 +353,15 @@ jobs:
   publish:
     name: Publish verified release
     needs: [resolve, validate]
-    if: needs.resolve.outputs.publish == 'true'
+    if: >-
+      always() &&
+      needs.resolve.outputs.publish == 'true' &&
+      inputs.qualification_only != true &&
+      (needs.validate.result == 'success' || inputs.qualification_run_id != '')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
+      actions: read
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
@@ -366,10 +379,28 @@ jobs:
         run: uv venv --python 3.12
 
       - uses: actions/download-artifact@v4
+        if: inputs.qualification_run_id == ''
         with:
           pattern: marin-vllm-validation-*
           path: validations
           merge-multiple: true
+
+      - name: Download the accepted GPU qualification
+        if: inputs.qualification_run_id != ''
+        env:
+          QUALIFICATION_RUN_ID: ${{ inputs.qualification_run_id }}
+        run: |
+          if [[ ! "$QUALIFICATION_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "qualification_run_id must be a positive GitHub Actions run ID." >&2
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QUALIFICATION_RUN_ID" \
+            > qualification-run.json
+          mkdir validations
+          gh run download "$QUALIFICATION_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'marin-vllm-validation-*' \
+            --dir validations
 
       - name: Download and verify candidate assets
         run: |
@@ -387,15 +418,38 @@ jobs:
             --directory release-assets \
             --config "$RELEASE_CONFIG"
 
+      - name: Verify the accepted GPU qualification
+        if: inputs.qualification_run_id != ''
+        env:
+          QUALIFICATION_RUN_ID: ${{ inputs.qualification_run_id }}
+        run: |
+          VALIDATION_ARGS=()
+          while IFS= read -r result; do
+            VALIDATION_ARGS+=(--validation "$result")
+          done < <(find validations -name 'marin-vllm-validation-*.json' -print | sort)
+          .venv/bin/python infra/release/gpu_release.py validate-qualification-run \
+            --run-metadata qualification-run.json \
+            "${VALIDATION_ARGS[@]}" \
+            --candidate candidate-assets/marin-vllm-gpu-manifest.json \
+            --config "$RELEASE_CONFIG" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$QUALIFICATION_RUN_ID" \
+            --output qualification-provenance.json
+
       - name: Finalize the release manifest
         run: |
           VALIDATION_ARGS=()
           while IFS= read -r result; do
             VALIDATION_ARGS+=(--validation "$result")
           done < <(find validations -name 'marin-vllm-validation-*.json' -print | sort)
+          QUALIFICATION_ARGS=()
+          if [[ -f qualification-provenance.json ]]; then
+            QUALIFICATION_ARGS+=(--qualification-provenance qualification-provenance.json)
+          fi
           .venv/bin/python infra/release/gpu_release.py finalize-release \
             --candidate candidate-assets/marin-vllm-gpu-manifest.json \
             "${VALIDATION_ARGS[@]}" \
+            "${QUALIFICATION_ARGS[@]}" \
             --config "$RELEASE_CONFIG" \
             --release-tag "$RELEASE_TAG" \
             --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
