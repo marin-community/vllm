@@ -14,6 +14,7 @@ import pydantic
 import pytest
 from huggingface_hub import ResolvedRevision
 from pydantic import ValidationError
+from torch.distributed import DistNetworkError
 
 import vllm.config.vllm as vllm_config_module
 import vllm.envs as envs
@@ -1070,6 +1071,27 @@ def test_async_scheduling_with_pipeline_parallelism_is_allowed():
 
 def test_data_parallel_rpc_port_has_fixed_default():
     assert ParallelConfig().data_parallel_rpc_port == 29550
+
+
+@pytest.mark.skip_global_cleanup
+def test_stateless_dp_group_does_not_retry(monkeypatch):
+    parallel_config = ParallelConfig(data_parallel_size=2)
+    attempts = 0
+
+    def init_process_group(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise DistNetworkError("EADDRINUSE")
+
+    monkeypatch.setattr(
+        "vllm.distributed.utils.stateless_init_torch_distributed_process_group",
+        init_process_group,
+    )
+
+    with pytest.raises(DistNetworkError, match="EADDRINUSE"):
+        parallel_config.stateless_init_dp_group()
+
+    assert attempts == 1
 
 
 def test_all2all_backend_has_portable_default():
