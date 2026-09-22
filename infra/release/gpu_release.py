@@ -449,21 +449,15 @@ def verify_main_lineage(
         f"candidate={candidate_tag or '-'} source={source_commit} "
         f"workflow_ref={workflow_ref}"
     )
-    default_branch = _github_api(f"repos/{repository}", context)["default_branch"]
-    expected_ref = f"refs/heads/{default_branch}"
-    context += f" expected_default_branch={default_branch}"
-    if default_branch != MAINTAINED_BRANCH or workflow_ref != expected_ref:
-        raise ReleaseError(
-            f"GPU lineage rejected: {context}; "
-            f"workflow must run from {expected_ref} on maintained {MAINTAINED_BRANCH}"
-        )
+    _require_workflow_branch(repository, workflow_ref, MAINTAINED_BRANCH, context)
     status = _github_api(
-        f"repos/{repository}/compare/{source_commit}...{default_branch}", context
+        f"repos/{repository}/compare/{source_commit}...{MAINTAINED_BRANCH}", context
     )["status"]
     if status not in {"identical", "ahead"}:
         raise ReleaseError(
             f"GPU lineage rejected: {context}; "
-            f"source is not an ancestor of {default_branch} (compare status={status})"
+            f"source is not an ancestor of {MAINTAINED_BRANCH} "
+            f"(compare status={status})"
         )
 
 
@@ -479,6 +473,19 @@ def _branch_head(repository: str, branch: str, context: str) -> str:
     return _github_api(f"repos/{repository}/git/ref/heads/{branch}", context)[
         "object"
     ]["sha"]
+
+
+def _require_workflow_branch(
+    repository: str, workflow_ref: str, branch: str, context: str
+) -> None:
+    default_branch = _github_api(f"repos/{repository}", context)["default_branch"]
+    expected_ref = f"refs/heads/{branch}"
+    if default_branch != MAINTAINED_BRANCH or workflow_ref != expected_ref:
+        raise ReleaseError(
+            f"GPU lineage rejected: {context} "
+            f"expected_default_branch={default_branch}; "
+            f"workflow must run from {expected_ref} on maintained {MAINTAINED_BRANCH}"
+        )
 
 
 def verify_candidate_build_lineage(
@@ -497,12 +504,7 @@ def verify_candidate_build_lineage(
         f"candidate={candidate_tag} source={source_commit} "
         f"workflow_ref={workflow_ref}"
     )
-    default_branch = _github_api(f"repos/{repository}", context)["default_branch"]
-    expected_ref = f"refs/heads/{STAGING_BRANCH}"
-    if default_branch != MAINTAINED_BRANCH or workflow_ref != expected_ref:
-        raise ReleaseError(
-            f"GPU staging rejected: {context}; workflow must run from {expected_ref}"
-        )
+    _require_workflow_branch(repository, workflow_ref, STAGING_BRANCH, context)
     staging_tip = _branch_head(repository, STAGING_BRANCH, context)
     if staging_tip != source_commit:
         raise ReleaseError(
@@ -521,13 +523,7 @@ def verify_candidate_qualification_lineage(
         f"candidate={candidate_tag} source={source_commit} "
         f"workflow_ref={workflow_ref}"
     )
-    default_branch = _github_api(f"repos/{repository}", context)["default_branch"]
-    expected_ref = f"refs/heads/{MAINTAINED_BRANCH}"
-    if default_branch != MAINTAINED_BRANCH or workflow_ref != expected_ref:
-        raise ReleaseError(
-            f"GPU qualification rejected: {context}; "
-            f"workflow must run from {expected_ref}"
-        )
+    _require_workflow_branch(repository, workflow_ref, MAINTAINED_BRANCH, context)
 
     status = _github_api(
         f"repos/{repository}/compare/{source_commit}...{MAINTAINED_BRANCH}", context

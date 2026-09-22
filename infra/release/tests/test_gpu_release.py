@@ -245,6 +245,23 @@ def staged_candidate(tmp_path: Path) -> dict:
     )
 
 
+def qualification_run_metadata(**overrides) -> dict:
+    metadata = {
+        "id": 456,
+        "event": "workflow_dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "head_branch": "main",
+        "head_sha": "c" * 40,
+        "path": ".github/workflows/marin-gpu-release.yaml",
+        "run_attempt": 1,
+        "html_url": "https://github.com/marin-community/vllm/actions/runs/456",
+        "repository": {"full_name": "marin-community/vllm"},
+    }
+    metadata.update(overrides)
+    return metadata
+
+
 def test_newest_candidate_uses_publication_time_without_provenance_fallback():
     releases = [
         dict(
@@ -732,18 +749,7 @@ def test_staged_release_reuses_exact_successful_qualification(tmp_path):
         validation(candidate_manifest, architecture)
         for architecture in config["platforms"]
     ]
-    run_metadata = {
-        "id": 456,
-        "event": "workflow_dispatch",
-        "status": "completed",
-        "conclusion": "success",
-        "head_branch": "main",
-        "head_sha": "c" * 40,
-        "path": ".github/workflows/marin-gpu-release.yaml",
-        "run_attempt": 1,
-        "html_url": "https://github.com/marin-community/vllm/actions/runs/456",
-        "repository": {"full_name": "marin-community/vllm"},
-    }
+    run_metadata = qualification_run_metadata()
     qualification = validate_qualification_run(
         run_metadata,
         validations,
@@ -828,19 +834,7 @@ def test_staged_release_rejects_stale_qualification_metadata(
         validation(candidate_manifest, architecture)
         for architecture in config["platforms"]
     ]
-    run_metadata = {
-        "id": 456,
-        "event": "workflow_dispatch",
-        "status": "completed",
-        "conclusion": "success",
-        "head_branch": "main",
-        "head_sha": "c" * 40,
-        "path": ".github/workflows/marin-gpu-release.yaml",
-        "run_attempt": 1,
-        "html_url": "https://github.com/marin-community/vllm/actions/runs/456",
-        "repository": {"full_name": "marin-community/vllm"},
-    }
-    run_metadata.update(mutation)
+    run_metadata = qualification_run_metadata(**mutation)
 
     with pytest.raises(ReleaseError, match=failure):
         validate_qualification_run(
@@ -863,18 +857,7 @@ def test_staged_release_rejects_qualification_for_other_candidate(tmp_path):
     validations[0]["candidate_tag"] = (
         f"{STAGED_CANDIDATE_TAG_PREFIX}{'c' * 12}"
     )
-    run_metadata = {
-        "id": 456,
-        "event": "workflow_dispatch",
-        "status": "completed",
-        "conclusion": "success",
-        "head_branch": "main",
-        "head_sha": "c" * 40,
-        "path": ".github/workflows/marin-gpu-release.yaml",
-        "run_attempt": 1,
-        "html_url": "https://github.com/marin-community/vllm/actions/runs/456",
-        "repository": {"full_name": "marin-community/vllm"},
-    }
+    run_metadata = qualification_run_metadata()
 
     with pytest.raises(ReleaseError, match="different candidate"):
         validate_qualification_run(
