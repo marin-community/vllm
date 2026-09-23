@@ -147,6 +147,8 @@ publishing a final release. After an administrator promotes that exact source to
 `main`, dispatch again with the successful qualification run ID. The promotion
 rechecks the candidate assets, source lineage, workflow run, validation records,
 and wheel digests, then publishes the same bytes without another GPU allocation.
+Complete promotion within the validation artifacts' 14-day retention window;
+after expiry, the exact qualification records cannot be reused.
 
 ```bash
 gh workflow run marin-gpu-candidate.yaml \

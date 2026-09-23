@@ -21,6 +21,7 @@ from infra.release.gpu_release import (
     STAGED_CANDIDATE_TAG_PREFIX,
     assemble_candidate,
     build_matrix,
+    copy_validation_assets,
     extract_validation,
     finalize_release,
     inspect_wheel,
@@ -776,6 +777,33 @@ def test_staged_release_reuses_exact_successful_qualification(tmp_path):
     )
 
 
+def test_reused_qualification_copies_nested_artifacts(tmp_path):
+    config = load_json(CONFIG_PATH)
+    candidate_manifest = staged_candidate(tmp_path)
+    validations = [
+        validation(candidate_manifest, architecture)
+        for architecture in config["platforms"]
+    ]
+    validation_paths = []
+    for result in validations:
+        hardware = result["hardware"]["requested"].lower()
+        artifact = tmp_path / f"artifact-{hardware}"
+        artifact.mkdir()
+        path = artifact / f"marin-vllm-validation-{hardware}.json"
+        path.write_text(json.dumps(result))
+        validation_paths.append(path)
+
+    output = tmp_path / "release-assets"
+    copy_validation_assets(validation_paths, output, config)
+
+    assert {
+        path.name: json.loads(path.read_text()) for path in output.iterdir()
+    } == {
+        f"marin-vllm-validation-{result['hardware']['requested'].lower()}.json": result
+        for result in validations
+    }
+
+
 def test_staged_release_rejects_changed_qualification_provenance(tmp_path):
     config = load_json(CONFIG_PATH)
     candidate_manifest = staged_candidate(tmp_path)
@@ -887,6 +915,41 @@ def test_staged_release_rejects_missing_qualification_provenance(tmp_path):
             published_at="2026-08-04T00:00:00Z",
             provenance={"run_id": "789"},
         )
+
+
+def test_staged_release_cli_requires_prior_qualification_provenance(tmp_path):
+    config = load_json(CONFIG_PATH)
+    candidate_manifest = staged_candidate(tmp_path)
+    validations = [
+        validation(candidate_manifest, architecture)
+        for architecture in config["platforms"]
+    ]
+    candidate_path = tmp_path / "candidate.json"
+    candidate_path.write_text(json.dumps(candidate_manifest))
+    command = [
+        sys.executable,
+        str(REPOSITORY_ROOT / "infra/release/gpu_release.py"),
+        "finalize-release",
+        "--candidate",
+        str(candidate_path),
+        "--config",
+        str(CONFIG_PATH),
+        "--release-tag",
+        f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
+        "--published-at",
+        "2026-08-04T00:00:00Z",
+        "--output",
+        str(tmp_path / "release.json"),
+    ]
+    for index, result in enumerate(validations):
+        result_path = tmp_path / f"validation-{index}.json"
+        result_path.write_text(json.dumps(result))
+        command.extend(("--validation", str(result_path)))
+
+    completed = subprocess.run(command, capture_output=True, text=True)
+
+    assert completed.returncode == 1
+    assert "staged release qualification provenance is missing" in completed.stderr
 
 
 def test_release_rejects_allocator_absence_from_gpu_result(tmp_path):
