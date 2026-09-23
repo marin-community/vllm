@@ -115,6 +115,10 @@ jobs:
         env:
           GPU_MODE: ${{ inputs.gpu_mode || 'publish' }}
         run: |
+          if [[ "$GPU_MODE" == stage && "$GITHUB_REF" != refs/heads/main-next ]]; then
+            echo "GPU staging must run from refs/heads/main-next." >&2
+            exit 1
+          fi
           SHORT_SHA=$(git rev-parse --short=12 "$GITHUB_SHA")
           CREATED_AT=$(git show -s --format=%cI "$GITHUB_SHA")
           CANDIDATE_PREFIX=marin-vllm-gpu-candidate
@@ -132,8 +136,7 @@ jobs:
           inputs.gpu_mode == 'publish' ||
           inputs.gpu_mode == 'stage'
         run: |
-          .venv/bin/python infra/release/gpu_release.py \
-            verify-candidate-build-lineage \
+          .venv/bin/python infra/release/gpu_release.py verify-candidate-lineage \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-ref "$GITHUB_REF" \
             --source-commit "$GITHUB_SHA" \
@@ -330,10 +333,6 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --candidate-tag "$CANDIDATE_TAG" \
             --created-at "${{ needs.prepare.outputs.created_at }}" \
-            --workflow-commit "$GITHUB_SHA" \
-            --workflow-ref "$GITHUB_REF" \
-            --workflow-run-id "$GITHUB_RUN_ID" \
-            --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --output candidate/marin-vllm-gpu-manifest.json
           .venv/bin/python infra/release/gpu_release.py verify-assets \
             --manifest candidate/marin-vllm-gpu-manifest.json \
@@ -371,8 +370,7 @@ jobs:
             echo "Candidate source $SOURCE_COMMIT does not match workflow commit $GITHUB_SHA" >&2
             exit 1
           fi
-          .venv/bin/python infra/release/gpu_release.py \
-            verify-candidate-build-lineage \
+          .venv/bin/python infra/release/gpu_release.py verify-candidate-lineage \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-ref "$GITHUB_REF" \
             --source-commit "$SOURCE_COMMIT" \

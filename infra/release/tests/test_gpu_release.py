@@ -21,18 +21,15 @@ from infra.release.gpu_release import (
     STAGED_CANDIDATE_TAG_PREFIX,
     assemble_candidate,
     build_matrix,
-    copy_validation_assets,
     extract_validation,
     finalize_release,
     inspect_wheel,
     newest_published_candidate,
     validate_candidate,
-    validate_qualification_run,
     validate_release,
     validate_wheel_fragment,
     validation_matrix,
-    verify_candidate_build_lineage,
-    verify_candidate_qualification_lineage,
+    verify_candidate_lineage,
     verify_main_lineage,
     verify_published_candidate,
     verify_release_assets,
@@ -206,11 +203,6 @@ def fragment(
         ),
         provenance={
             "system": "GitHub Actions",
-            "workflow_commit": FORK_COMMIT,
-            "workflow_ref": (
-                "marin-community/vllm/.github/workflows/"
-                "marin-gpu-candidate.yaml@refs/heads/main-next"
-            ),
             "run_id": "123",
             "runner_arch": architecture,
             "run_url": "https://github.com/marin-community/vllm/actions/runs/123",
@@ -237,30 +229,7 @@ def staged_candidate(tmp_path: Path) -> dict:
         repository="marin-community/vllm",
         candidate_tag=STAGED_CANDIDATE_TAG,
         created_at=BUILT_AT,
-        workflow={
-            "commit": FORK_COMMIT,
-            "ref": "refs/heads/main-next",
-            "run_id": "123",
-            "run_url": "https://github.com/marin-community/vllm/actions/runs/123",
-        },
     )
-
-
-def qualification_run_metadata(**overrides) -> dict:
-    metadata = {
-        "id": 456,
-        "event": "workflow_dispatch",
-        "status": "completed",
-        "conclusion": "success",
-        "head_branch": "main",
-        "head_sha": "c" * 40,
-        "path": ".github/workflows/marin-gpu-release.yaml",
-        "run_attempt": 1,
-        "html_url": "https://github.com/marin-community/vllm/actions/runs/456",
-        "repository": {"full_name": "marin-community/vllm"},
-    }
-    metadata.update(overrides)
-    return metadata
 
 
 def test_newest_candidate_uses_publication_time_without_provenance_fallback():
@@ -363,136 +332,66 @@ def test_gpu_lineage_policy(
         )
 
 
-@pytest.mark.parametrize(
-    ("workflow_ref", "candidate_tag", "main_status", "staging_tip", "failure"),
-    [
-        ("refs/heads/main", CANDIDATE_TAG, "ahead", FORK_COMMIT, None),
-        (
-            "refs/heads/main-next",
-            STAGED_CANDIDATE_TAG,
-            "diverged",
-            FORK_COMMIT,
-            None,
-        ),
-        (
-            "refs/heads/main-next",
-            STAGED_CANDIDATE_TAG,
-            "diverged",
-            "c" * 40,
-            "moved",
-        ),
-        (
-            "refs/heads/feature",
-            STAGED_CANDIDATE_TAG,
-            "diverged",
-            FORK_COMMIT,
-            "workflow must run",
-        ),
-    ],
-)
-def test_candidate_build_lineage_allows_only_main_or_exact_staging_tip(
-    monkeypatch, workflow_ref, candidate_tag, main_status, staging_tip, failure
-):
+def test_staged_candidate_lifecycle_fails_if_the_source_moves(monkeypatch, tmp_path):
+    state = {"main_status": "diverged", "staging_tip": FORK_COMMIT}
+
     def gh_api(args, **kwargs):
         path = args[2]
         if path == "repos/marin-community/vllm":
             body = {"default_branch": "main"}
         elif path.endswith("/git/ref/heads/main-next"):
-            body = {"object": {"sha": staging_tip}}
+            body = {"object": {"sha": state["staging_tip"]}}
         else:
-            body = {"status": main_status}
+            body = {"status": state["main_status"]}
         return subprocess.CompletedProcess(args, 0, stdout=json.dumps(body), stderr="")
 
     monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
-    if failure is None:
-        verify_candidate_build_lineage(
-            "marin-community/vllm", workflow_ref, FORK_COMMIT, candidate_tag
+    staged = staged_candidate(tmp_path)
+    validate_candidate(staged, load_json(CONFIG_PATH))
+    verify_candidate_lineage(
+        "marin-community/vllm",
+        "refs/heads/main-next",
+        FORK_COMMIT,
+        STAGED_CANDIDATE_TAG,
+    )
+    with pytest.raises(ReleaseError, match="requires a staged tag"):
+        verify_candidate_lineage(
+            "marin-community/vllm", "refs/heads/main-next", FORK_COMMIT, CANDIDATE_TAG
         )
-    else:
-        with pytest.raises(ReleaseError, match=failure):
-            verify_candidate_build_lineage(
-                "marin-community/vllm", workflow_ref, FORK_COMMIT, candidate_tag
-            )
-
-
-@pytest.mark.parametrize(
-    ("workflow_ref", "candidate_tag", "main_status", "staging_tip", "failure"),
-    [
-        ("refs/heads/main", CANDIDATE_TAG, "ahead", "c" * 40, None),
-        ("refs/heads/main", STAGED_CANDIDATE_TAG, "ahead", "c" * 40, None),
-        (
-            "refs/heads/main",
-            STAGED_CANDIDATE_TAG,
-            "diverged",
-            FORK_COMMIT,
-            None,
-        ),
-        (
-            "refs/heads/main",
-            STAGED_CANDIDATE_TAG,
-            "diverged",
-            "c" * 40,
-            "neither on main",
-        ),
-        (
-            "refs/heads/main-next",
-            STAGED_CANDIDATE_TAG,
-            "diverged",
-            FORK_COMMIT,
-            "workflow must run",
-        ),
-    ],
-)
-def test_candidate_qualification_uses_main_workflow_and_current_source(
-    monkeypatch, workflow_ref, candidate_tag, main_status, staging_tip, failure
-):
-    def gh_api(args, **kwargs):
-        path = args[2]
-        if path == "repos/marin-community/vllm":
-            body = {"default_branch": "main"}
-        elif path.endswith("/git/ref/heads/main-next"):
-            body = {"object": {"sha": staging_tip}}
-        else:
-            body = {"status": main_status}
-        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(body), stderr="")
-
-    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
-    if failure is None:
-        verify_candidate_qualification_lineage(
-            "marin-community/vllm", workflow_ref, FORK_COMMIT, candidate_tag
-        )
-    else:
-        with pytest.raises(ReleaseError, match=failure):
-            verify_candidate_qualification_lineage(
-                "marin-community/vllm", workflow_ref, FORK_COMMIT, candidate_tag
-            )
-
-
-def test_staged_candidate_binds_workflow_commit_and_ref(tmp_path):
-    manifest = staged_candidate(tmp_path)
-
-    validate_candidate(manifest, load_json(CONFIG_PATH))
-    manifest["workflow"]["commit"] = "c" * 40
-    with pytest.raises(ReleaseError, match="workflow commit"):
-        validate_candidate(manifest, load_json(CONFIG_PATH))
-
-
-def test_staged_candidate_binds_workflow_run_url_to_id(tmp_path):
-    manifest = staged_candidate(tmp_path)
-    manifest["workflow"]["run_url"] = (
-        "https://github.com/marin-community/vllm/actions/runs/456"
+    verify_candidate_lineage(
+        "marin-community/vllm", "refs/heads/main", FORK_COMMIT, STAGED_CANDIDATE_TAG
     )
 
-    with pytest.raises(ReleaseError, match="run URL does not match"):
-        validate_candidate(manifest, load_json(CONFIG_PATH))
+    state["staging_tip"] = "c" * 40
+    with pytest.raises(
+        ReleaseError, match="neither on main nor the exact main-next tip"
+    ):
+        verify_candidate_lineage(
+            "marin-community/vllm", "refs/heads/main", FORK_COMMIT, STAGED_CANDIDATE_TAG
+        )
+    with pytest.raises(ReleaseError, match="unsupported ref"):
+        verify_candidate_lineage(
+            "marin-community/vllm",
+            "refs/heads/feature",
+            FORK_COMMIT,
+            STAGED_CANDIDATE_TAG,
+        )
 
-
-def test_staged_candidate_rejects_cross_run_wheel_provenance(tmp_path):
-    manifest = staged_candidate(tmp_path)
-    manifest["platforms"][0]["build"]["provenance"]["run_id"] = "456"
-
-    with pytest.raises(ReleaseError, match="build provenance disagrees"):
-        validate_candidate(manifest, load_json(CONFIG_PATH))
+    state["main_status"] = "ahead"
+    verify_main_lineage("marin-community/vllm", "refs/heads/main", FORK_COMMIT)
+    config = load_json(CONFIG_PATH)
+    validations = [
+        validation(staged, architecture) for architecture in config["platforms"]
+    ]
+    release = finalize_release(
+        staged,
+        validations,
+        config=config,
+        release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
+        published_at="2026-08-04T00:00:00Z",
+        provenance={"run_id": "789"},
+    )
+    validate_release(release, config)
 
 
 def test_candidate_rejects_abi_change(tmp_path):
@@ -741,215 +640,6 @@ def test_release_binds_passed_gpu_results_to_candidate_wheel_digests(tmp_path):
     }
     for platform in manifest["platforms"]:
         assert f"/{manifest['release']['tag']}/" in platform["wheel"]["url"]
-
-
-def test_staged_release_reuses_exact_successful_qualification(tmp_path):
-    config = load_json(CONFIG_PATH)
-    candidate_manifest = staged_candidate(tmp_path)
-    validations = [
-        validation(candidate_manifest, architecture)
-        for architecture in config["platforms"]
-    ]
-    run_metadata = qualification_run_metadata()
-    qualification = validate_qualification_run(
-        run_metadata,
-        validations,
-        candidate_manifest,
-        config,
-        repository="marin-community/vllm",
-        run_id="456",
-    )
-
-    manifest = finalize_release(
-        candidate_manifest,
-        validations,
-        config=config,
-        release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
-        published_at="2026-08-04T00:00:00Z",
-        provenance={"run_id": "789"},
-        qualification_provenance=qualification,
-    )
-
-    validate_release(manifest, config)
-    assert manifest["validation"]["provenance"]["run_id"] == "456"
-    assert manifest["validation"]["targets"] == sorted(
-        validations, key=lambda result: result["architecture"]
-    )
-
-
-def test_reused_qualification_copies_nested_artifacts(tmp_path):
-    config = load_json(CONFIG_PATH)
-    candidate_manifest = staged_candidate(tmp_path)
-    validations = [
-        validation(candidate_manifest, architecture)
-        for architecture in config["platforms"]
-    ]
-    validation_paths = []
-    for result in validations:
-        hardware = result["hardware"]["requested"].lower()
-        artifact = tmp_path / f"artifact-{hardware}"
-        artifact.mkdir()
-        path = artifact / f"marin-vllm-validation-{hardware}.json"
-        path.write_text(json.dumps(result))
-        validation_paths.append(path)
-
-    output = tmp_path / "release-assets"
-    copy_validation_assets(validation_paths, output, config)
-
-    assert {
-        path.name: json.loads(path.read_text()) for path in output.iterdir()
-    } == {
-        f"marin-vllm-validation-{result['hardware']['requested'].lower()}.json": result
-        for result in validations
-    }
-
-
-def test_staged_release_rejects_changed_qualification_provenance(tmp_path):
-    config = load_json(CONFIG_PATH)
-    candidate_manifest = staged_candidate(tmp_path)
-    validations = [
-        validation(candidate_manifest, architecture)
-        for architecture in config["platforms"]
-    ]
-    qualification = {
-        "system": "GitHub Actions",
-        "workflow_commit": "c" * 40,
-        "workflow_ref": (
-            "marin-community/vllm/.github/workflows/"
-            "marin-gpu-release.yaml@refs/heads/main"
-        ),
-        "run_id": "456",
-        "run_attempt": "1",
-        "run_url": "https://github.com/marin-community/vllm/actions/runs/456",
-    }
-    manifest = finalize_release(
-        candidate_manifest,
-        validations,
-        config=config,
-        release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
-        published_at="2026-08-04T00:00:00Z",
-        provenance={"run_id": "789"},
-        qualification_provenance=qualification,
-    )
-    manifest["validation"]["provenance"]["run_url"] = (
-        "https://github.com/marin-community/vllm/actions/runs/999"
-    )
-
-    with pytest.raises(ReleaseError, match="qualification provenance"):
-        validate_release(manifest, config)
-
-
-@pytest.mark.parametrize(
-    ("mutation", "failure"),
-    [
-        ({"conclusion": "failure"}, "conclusion"),
-        ({"head_branch": "feature"}, "head_branch"),
-        ({"path": ".github/workflows/other.yaml"}, "path"),
-        (
-            {"html_url": "https://github.com/marin-community/vllm/actions/runs/999"},
-            "URL",
-        ),
-        ({"run_attempt": 0}, "attempt"),
-        ({"repository": {"full_name": "someone/vllm"}}, "repository"),
-    ],
-)
-def test_staged_release_rejects_stale_qualification_metadata(
-    tmp_path, mutation, failure
-):
-    config = load_json(CONFIG_PATH)
-    candidate_manifest = staged_candidate(tmp_path)
-    validations = [
-        validation(candidate_manifest, architecture)
-        for architecture in config["platforms"]
-    ]
-    run_metadata = qualification_run_metadata(**mutation)
-
-    with pytest.raises(ReleaseError, match=failure):
-        validate_qualification_run(
-            run_metadata,
-            validations,
-            candidate_manifest,
-            config,
-            repository="marin-community/vllm",
-            run_id="456",
-        )
-
-
-def test_staged_release_rejects_qualification_for_other_candidate(tmp_path):
-    config = load_json(CONFIG_PATH)
-    candidate_manifest = staged_candidate(tmp_path)
-    validations = [
-        validation(candidate_manifest, architecture)
-        for architecture in config["platforms"]
-    ]
-    validations[0]["candidate_tag"] = (
-        f"{STAGED_CANDIDATE_TAG_PREFIX}{'c' * 12}"
-    )
-    run_metadata = qualification_run_metadata()
-
-    with pytest.raises(ReleaseError, match="different candidate"):
-        validate_qualification_run(
-            run_metadata,
-            validations,
-            candidate_manifest,
-            config,
-            repository="marin-community/vllm",
-            run_id="456",
-        )
-
-
-def test_staged_release_rejects_missing_qualification_provenance(tmp_path):
-    config = load_json(CONFIG_PATH)
-    candidate_manifest = staged_candidate(tmp_path)
-    validations = [
-        validation(candidate_manifest, architecture)
-        for architecture in config["platforms"]
-    ]
-
-    with pytest.raises(ReleaseError, match="qualification provenance"):
-        finalize_release(
-            candidate_manifest,
-            validations,
-            config=config,
-            release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
-            published_at="2026-08-04T00:00:00Z",
-            provenance={"run_id": "789"},
-        )
-
-
-def test_staged_release_cli_requires_prior_qualification_provenance(tmp_path):
-    config = load_json(CONFIG_PATH)
-    candidate_manifest = staged_candidate(tmp_path)
-    validations = [
-        validation(candidate_manifest, architecture)
-        for architecture in config["platforms"]
-    ]
-    candidate_path = tmp_path / "candidate.json"
-    candidate_path.write_text(json.dumps(candidate_manifest))
-    command = [
-        sys.executable,
-        str(REPOSITORY_ROOT / "infra/release/gpu_release.py"),
-        "finalize-release",
-        "--candidate",
-        str(candidate_path),
-        "--config",
-        str(CONFIG_PATH),
-        "--release-tag",
-        f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
-        "--published-at",
-        "2026-08-04T00:00:00Z",
-        "--output",
-        str(tmp_path / "release.json"),
-    ]
-    for index, result in enumerate(validations):
-        result_path = tmp_path / f"validation-{index}.json"
-        result_path.write_text(json.dumps(result))
-        command.extend(("--validation", str(result_path)))
-
-    completed = subprocess.run(command, capture_output=True, text=True)
-
-    assert completed.returncode == 1
-    assert "staged release qualification provenance is missing" in completed.stderr
 
 
 def test_release_rejects_allocator_absence_from_gpu_result(tmp_path):
