@@ -11,6 +11,7 @@ import copy
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -775,6 +776,26 @@ def index_validations(
     return by_architecture
 
 
+def copy_validation_assets(
+    validation_paths: list[Path], directory: Path, config: dict[str, Any]
+) -> None:
+    """Copy one validation record per release architecture into an asset directory."""
+    results = [load_json(path) for path in validation_paths]
+    by_architecture = index_validations(results, config)
+    paths_by_architecture = {
+        result["architecture"]: path
+        for result, path in zip(results, validation_paths, strict=True)
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    for architecture in sorted(by_architecture):
+        result = by_architecture[architecture]
+        hardware = result["hardware"]["requested"].lower()
+        destination = directory / f"marin-vllm-validation-{hardware}.json"
+        if destination.exists():
+            raise ReleaseError(f"validation asset already exists: {destination}")
+        shutil.copyfile(paths_by_architecture[architecture], destination)
+
+
 def finalize_release(
     candidate: dict[str, Any],
     validations: list[dict[str, Any]],
@@ -1090,6 +1111,13 @@ def parse_args() -> argparse.Namespace:
     qualification_parser.add_argument("--run-id", required=True)
     qualification_parser.add_argument("--output", type=Path, required=True)
 
+    copy_validations_parser = subparsers.add_parser("copy-validation-assets")
+    copy_validations_parser.add_argument(
+        "--validation", type=Path, action="append", required=True
+    )
+    copy_validations_parser.add_argument("--config", type=Path, required=True)
+    copy_validations_parser.add_argument("--directory", type=Path, required=True)
+
     finalize_parser = subparsers.add_parser("finalize-release")
     finalize_parser.add_argument("--candidate", type=Path, required=True)
     finalize_parser.add_argument(
@@ -1235,6 +1263,13 @@ def main() -> int:
             )
             write_json(args.output, provenance)
             return 0
+        if args.command == "copy-validation-assets":
+            copy_validation_assets(
+                args.validation,
+                args.directory,
+                load_json(args.config),
+            )
+            return 0
         if args.command == "finalize-release":
             manifest = finalize_release(
                 load_json(args.candidate),
@@ -1246,7 +1281,7 @@ def main() -> int:
                 qualification_provenance=(
                     load_json(args.qualification_provenance)
                     if args.qualification_provenance
-                    else provenance_from_environment("", "")
+                    else None
                 ),
             )
             write_json(args.output, manifest)
