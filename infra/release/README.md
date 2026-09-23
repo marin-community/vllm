@@ -95,8 +95,8 @@ A source refresh uses the separate `main-next` staging lane. `gpu_mode=stage`
 requires the workflow source to equal the current remote `main-next` tip and
 publishes under `marin-vllm-gpu-staged-candidate-<12-character-sha>`. Staged
 candidates never match scheduled candidate selection. The manifest binds the
-source and workflow commit, workflow ref and run, and both wheel digests.
-Arbitrary branches cannot publish either candidate kind.
+source commit and both wheel digests. Arbitrary branches cannot publish either
+candidate kind.
 
 The `qualify-x86_64` and `qualify-aarch64` modes remain useful for branch-only
 dependency checks. They build one short-lived Actions artifact and publish no
@@ -145,8 +145,9 @@ For a staged refresh, dispatch the release workflow from trusted `main` with
 runs the normal H100 and GB200 gates, and retains their artifacts without
 publishing a final release. After an administrator promotes that exact source to
 `main`, dispatch again with the successful qualification run ID. The promotion
-rechecks the candidate assets, source lineage, workflow run, validation records,
-and wheel digests, then publishes the same bytes without another GPU allocation.
+accepts only a successful release-workflow run from `main`, then checks that its
+validation records name the same candidate, source commit, and wheel digests.
+It publishes the same bytes without another GPU allocation.
 Complete promotion within the validation artifacts' 14-day retention window;
 after expiry, the exact qualification records cannot be reused.
 
