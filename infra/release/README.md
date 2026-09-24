@@ -96,7 +96,7 @@ requires the workflow source to equal the current remote `main-next` tip and
 publishes under `marin-vllm-gpu-staged-candidate-<12-character-sha>`. Staged
 candidates never match scheduled candidate selection. The manifest binds the
 source commit and both wheel digests. Arbitrary branches cannot publish either
-candidate kind.
+candidate kind. These wheels contain the exact `main-next` code under test.
 
 The `qualify-x86_64` and `qualify-aarch64` modes remain useful for branch-only
 dependency checks. They build one short-lived Actions artifact and publish no
@@ -143,11 +143,17 @@ release tag or asset.
 For a staged refresh, dispatch the release workflow from trusted `main` with
 `qualification_only=true`. It accepts only the exact current `main-next` source,
 runs the normal H100 and GB200 gates, and retains their artifacts without
-publishing a final release. After an administrator promotes that exact source to
-`main`, dispatch again with the successful qualification run ID. The promotion
-accepts only a successful release-workflow run from `main`, then checks that its
-validation records name the same candidate, source commit, and wheel digests.
-It publishes the same bytes without another GPU allocation.
+publishing a final release. Here `--ref main` selects the trusted qualification
+harness; it does not change the `main-next` code inside the candidate wheels.
+
+Before source promotion, temporarily pin the staged x86_64 wheel in Marin and
+run `tests/cluster/vllm/test_snowball_backend_parity.py`. Both that Marin
+end-to-end and the fork's H100 and GB200 gates must pass. After an administrator
+promotes the exact source to `main`, dispatch again with the successful
+qualification run ID. The promotion accepts only a successful release-workflow
+run from `main`, then checks that its validation records name the same candidate,
+source commit, and wheel digests. It publishes the same bytes without another
+GPU allocation.
 Complete promotion within the validation artifacts' 14-day retention window;
 after expiry, the exact qualification records cannot be reused.
 
