@@ -50,8 +50,10 @@ STABLE_LIBTORCH_GATE = "vllm._C_stable_libtorch"
 REQUIRED_EXTENSIONS = (STABLE_LIBTORCH_GATE, "vllm.cumem_allocator")
 GRUG_ARCHITECTURE = "GrugMoeForCausalLM"
 CANDIDATE_TAG_PREFIX = "marin-vllm-gpu-candidate-"
+STAGED_CANDIDATE_TAG_PREFIX = "marin-vllm-gpu-staged-candidate-"
 RELEASE_TAG_PREFIX = "marin-vllm-gpu-"
 MAINTAINED_BRANCH = "main"
+STAGING_BRANCH = "main-next"
 BUILD_ABI_KEYS = (
     "python_version",
     "torch_version",
@@ -367,10 +369,13 @@ def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None
     if manifest["release"]["status"] != "candidate":
         raise ReleaseError("manifest is not a candidate")
     _validate_manifest_common(manifest, config)
-    expected_tag = (
-        CANDIDATE_TAG_PREFIX + manifest["source"]["fork_commit"][:12]
-    )
-    if manifest["release"]["tag"] != expected_tag:
+    source_commit = manifest["source"]["fork_commit"]
+    expected_tags = {
+        CANDIDATE_TAG_PREFIX + source_commit[:12],
+        STAGED_CANDIDATE_TAG_PREFIX + source_commit[:12],
+    }
+    candidate_tag = manifest["release"]["tag"]
+    if candidate_tag not in expected_tags:
         raise ReleaseError("candidate tag does not match its fork commit")
     if manifest["validation"] != {"status": "pending", "targets": []}:
         raise ReleaseError("candidate validation state is not pending")
@@ -419,6 +424,51 @@ def verify_main_lineage(
             f"GPU lineage rejected: {context}; "
             f"source is not an ancestor of {default_branch} (compare status={status})"
         )
+
+
+def _branch_head(repository: str, branch: str, context: str) -> str:
+    return _github_api(f"repos/{repository}/git/ref/heads/{branch}", context)["object"][
+        "sha"
+    ]
+
+
+def verify_candidate_lineage(
+    repository: str,
+    workflow_ref: str,
+    source_commit: str,
+    candidate_tag: str,
+) -> None:
+    """Allow a main candidate or the exact main-next staged candidate."""
+    context = (
+        f"candidate={candidate_tag} source={source_commit} workflow_ref={workflow_ref}"
+    )
+    default_branch = _github_api(f"repos/{repository}", context)["default_branch"]
+    if default_branch != MAINTAINED_BRANCH or workflow_ref not in {
+        f"refs/heads/{MAINTAINED_BRANCH}",
+        f"refs/heads/{STAGING_BRANCH}",
+    }:
+        raise ReleaseError(
+            f"GPU candidate workflow ran from an unsupported ref: {context}"
+        )
+    staged_tag = f"{STAGED_CANDIDATE_TAG_PREFIX}{source_commit[:12]}"
+    if workflow_ref == f"refs/heads/{STAGING_BRANCH}" and candidate_tag != staged_tag:
+        raise ReleaseError(
+            f"GPU candidate rejected: {context}; {STAGING_BRANCH} requires a staged tag"
+        )
+    status = _github_api(
+        f"repos/{repository}/compare/{source_commit}...{MAINTAINED_BRANCH}", context
+    )["status"]
+    if status in {"identical", "ahead"}:
+        return
+    if (
+        candidate_tag == staged_tag
+        and _branch_head(repository, STAGING_BRANCH, context) == source_commit
+    ):
+        return
+    raise ReleaseError(
+        f"GPU candidate rejected: {context}; source is neither on "
+        f"{MAINTAINED_BRANCH} nor the exact {STAGING_BRANCH} tip"
+    )
 
 
 def _validate_manifest_common(
@@ -506,9 +556,11 @@ def validate_release(manifest: dict[str, Any], config: dict[str, Any]) -> None:
         raise ReleaseError("manifest is not a final release")
     _validate_manifest_common(manifest, config)
     source_prefix = manifest["source"]["fork_commit"][:12]
-    if manifest["release"].get("candidate_tag") != (
-        f"{CANDIDATE_TAG_PREFIX}{source_prefix}"
-    ):
+    candidate_tag = manifest["release"].get("candidate_tag", "")
+    if candidate_tag not in {
+        f"{CANDIDATE_TAG_PREFIX}{source_prefix}",
+        f"{STAGED_CANDIDATE_TAG_PREFIX}{source_prefix}",
+    }:
         raise ReleaseError("release names the wrong candidate tag")
     if re.fullmatch(
         rf"{RELEASE_TAG_PREFIX}[0-9]{{8}}-{source_prefix}",
@@ -519,7 +571,6 @@ def validate_release(manifest: dict[str, Any], config: dict[str, Any]) -> None:
         raise ReleaseError("release validation status is not passed")
     validations = manifest["validation"].get("targets", [])
     index_validations(validations, config)
-
     candidate = copy.deepcopy(manifest)
     candidate["release"]["tag"] = manifest["release"]["candidate_tag"]
     candidate["release"]["status"] = "candidate"
@@ -813,6 +864,12 @@ def parse_args() -> argparse.Namespace:
     lineage_parser.add_argument("--source-commit", required=True)
     lineage_parser.add_argument("--candidate-tag")
 
+    candidate_lineage_parser = subparsers.add_parser("verify-candidate-lineage")
+    candidate_lineage_parser.add_argument("--repository", required=True)
+    candidate_lineage_parser.add_argument("--workflow-ref", required=True)
+    candidate_lineage_parser.add_argument("--source-commit", required=True)
+    candidate_lineage_parser.add_argument("--candidate-tag", required=True)
+
     subparsers.add_parser("select-newest-candidate")
 
     inspect_parser = subparsers.add_parser("inspect-wheel")
@@ -899,6 +956,14 @@ def main() -> int:
             return 0
         if args.command == "verify-main-lineage":
             verify_main_lineage(
+                args.repository,
+                args.workflow_ref,
+                args.source_commit,
+                args.candidate_tag,
+            )
+            return 0
+        if args.command == "verify-candidate-lineage":
+            verify_candidate_lineage(
                 args.repository,
                 args.workflow_ref,
                 args.source_commit,

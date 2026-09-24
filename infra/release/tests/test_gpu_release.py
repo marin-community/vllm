@@ -18,6 +18,7 @@ from infra.release.gpu_release import (
     GRUG_ARCHITECTURE,
     SPARSE_NCCL_GATE,
     STABLE_LIBTORCH_GATE,
+    STAGED_CANDIDATE_TAG_PREFIX,
     assemble_candidate,
     build_matrix,
     extract_validation,
@@ -25,8 +26,10 @@ from infra.release.gpu_release import (
     inspect_wheel,
     newest_published_candidate,
     validate_candidate,
+    validate_release,
     validate_wheel_fragment,
     validation_matrix,
+    verify_candidate_lineage,
     verify_main_lineage,
     verify_published_candidate,
     verify_release_assets,
@@ -45,6 +48,7 @@ FORK_COMMIT = "a" * 40
 UPSTREAM_BASE = "b" * 40
 BUILT_AT = "2026-08-03T12:00:00Z"
 CANDIDATE_TAG = f"marin-vllm-gpu-candidate-{FORK_COMMIT[:12]}"
+STAGED_CANDIDATE_TAG = f"{STAGED_CANDIDATE_TAG_PREFIX}{FORK_COMMIT[:12]}"
 
 
 def test_publish_uses_current_release_automation_for_an_older_candidate():
@@ -94,12 +98,14 @@ def test_candidate_gpu_modes_keep_single_architecture_builds_nonpublishing():
     assert gpu_mode["default"] == "publish"
     assert gpu_mode["options"] == [
         "publish",
+        "stage",
         "qualify-x86_64",
         "qualify-aarch64",
     ]
-    assert publish["if"] == (
-        "github.event_name == 'push' || inputs.gpu_mode == 'publish'"
-    )
+    publish_condition = " ".join(publish["if"].split())
+    assert "inputs.gpu_mode == 'stage'" in publish_condition
+    assert "inputs.gpu_mode == 'qualify-x86_64'" not in publish_condition
+    assert "inputs.gpu_mode == 'qualify-aarch64'" not in publish_condition
 
 
 def test_server_command_pins_requested_attention_backend():
@@ -215,6 +221,17 @@ def candidate(tmp_path: Path) -> dict:
     )
 
 
+def staged_candidate(tmp_path: Path) -> dict:
+    config = load_json(CONFIG_PATH)
+    return assemble_candidate(
+        [fragment(tmp_path, architecture) for architecture in config["platforms"]],
+        config=config,
+        repository="marin-community/vllm",
+        candidate_tag=STAGED_CANDIDATE_TAG,
+        created_at=BUILT_AT,
+    )
+
+
 def test_newest_candidate_uses_publication_time_without_provenance_fallback():
     releases = [
         dict(
@@ -231,6 +248,15 @@ def test_newest_candidate_uses_publication_time_without_provenance_fallback():
             ]
         )
     ]
+    releases.append(
+        dict(
+            tag_name=STAGED_CANDIDATE_TAG,
+            prerelease=True,
+            draft=False,
+            published_at="2026-09-22T00:00:00Z",
+            id=3,
+        )
+    )
     assert newest_published_candidate(releases) == releases[1]["tag_name"]
     releases[0]["published_at"] = "2026-09-21T00:00:00Z"
     assert newest_published_candidate(releases) == releases[0]["tag_name"]
@@ -304,6 +330,68 @@ def test_gpu_lineage_policy(
             value in str(exc.value)
             for value in (workflow_ref, branch, source, CANDIDATE_TAG)
         )
+
+
+def test_staged_candidate_lifecycle_fails_if_the_source_moves(monkeypatch, tmp_path):
+    state = {"main_status": "diverged", "staging_tip": FORK_COMMIT}
+
+    def gh_api(args, **kwargs):
+        path = args[2]
+        if path == "repos/marin-community/vllm":
+            body = {"default_branch": "main"}
+        elif path.endswith("/git/ref/heads/main-next"):
+            body = {"object": {"sha": state["staging_tip"]}}
+        else:
+            body = {"status": state["main_status"]}
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(body), stderr="")
+
+    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
+    staged = staged_candidate(tmp_path)
+    validate_candidate(staged, load_json(CONFIG_PATH))
+    verify_candidate_lineage(
+        "marin-community/vllm",
+        "refs/heads/main-next",
+        FORK_COMMIT,
+        STAGED_CANDIDATE_TAG,
+    )
+    with pytest.raises(ReleaseError, match="requires a staged tag"):
+        verify_candidate_lineage(
+            "marin-community/vllm", "refs/heads/main-next", FORK_COMMIT, CANDIDATE_TAG
+        )
+    verify_candidate_lineage(
+        "marin-community/vllm", "refs/heads/main", FORK_COMMIT, STAGED_CANDIDATE_TAG
+    )
+
+    state["staging_tip"] = "c" * 40
+    with pytest.raises(
+        ReleaseError, match="neither on main nor the exact main-next tip"
+    ):
+        verify_candidate_lineage(
+            "marin-community/vllm", "refs/heads/main", FORK_COMMIT, STAGED_CANDIDATE_TAG
+        )
+    with pytest.raises(ReleaseError, match="unsupported ref"):
+        verify_candidate_lineage(
+            "marin-community/vllm",
+            "refs/heads/feature",
+            FORK_COMMIT,
+            STAGED_CANDIDATE_TAG,
+        )
+
+    state["main_status"] = "ahead"
+    verify_main_lineage("marin-community/vllm", "refs/heads/main", FORK_COMMIT)
+    config = load_json(CONFIG_PATH)
+    validations = [
+        validation(staged, architecture) for architecture in config["platforms"]
+    ]
+    release = finalize_release(
+        staged,
+        validations,
+        config=config,
+        release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
+        published_at="2026-08-04T00:00:00Z",
+        provenance={"run_id": "789"},
+    )
+    validate_release(release, config)
 
 
 def test_candidate_rejects_abi_change(tmp_path):
