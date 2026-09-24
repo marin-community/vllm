@@ -207,7 +207,9 @@ checks = ["ruff-check"]
 ruff_version = "0.14.0"
 include = [
     "vllm/model_executor/models/grugmoe.py",
+    "vllm/reasoning/grug_reasoning_parser.py",
     "vllm/transformers_utils/configs/grugmoe.py",
     "tests/models/test_grugmoe.py",
+    "tests/reasoning/test_grug_reasoning_parser.py",
     "infra/**",
 ]
