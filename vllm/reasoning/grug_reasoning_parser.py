@@ -8,12 +8,13 @@ from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
+from vllm.tokenizers import TokenizerLike
 
 
 class GrugReasoningParser(BaseThinkingReasoningParser):
     """Separate Grug's special-token reasoning block from its final answer."""
 
-    def __init__(self, tokenizer: Any, *args: Any, **kwargs: Any):
+    def __init__(self, tokenizer: TokenizerLike, *args: Any, **kwargs: Any):
         chat_kwargs = kwargs.get("chat_template_kwargs") or {}
         self._thinking_enabled = chat_kwargs.get("enable_thinking") is not False
         super().__init__(tokenizer, *args, **kwargs)
@@ -26,13 +27,16 @@ class GrugReasoningParser(BaseThinkingReasoningParser):
     def end_token(self) -> str:
         return "<|end_think|>"
 
+    def _nothink_content(self, input_ids: Sequence[int]) -> bool:
+        return not self._thinking_enabled and self.start_token_id not in input_ids
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        if not self._thinking_enabled and self.start_token_id not in input_ids:
+        if self._nothink_content(input_ids):
             return True
         return super().is_reasoning_end(input_ids)
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        if not self._thinking_enabled and self.start_token_id not in input_ids:
+        if self._nothink_content(input_ids):
             return input_ids
         return super().extract_content_ids(input_ids)
 
@@ -71,6 +75,7 @@ class GrugReasoningParser(BaseThinkingReasoningParser):
             and delta.reasoning is not None
             and self.start_token_id in delta_token_ids
         ):
+            # The base parser includes a start marker when it shares a text delta.
             reasoning = delta.reasoning.replace(self.start_token, "", 1)
             return delta.model_copy(update={"reasoning": reasoning})
         return delta
