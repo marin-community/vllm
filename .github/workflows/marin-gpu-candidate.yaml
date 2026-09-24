@@ -91,7 +91,10 @@ jobs:
       - name: Create the metadata environment
         run: uv venv --python 3.12
 
-      - name: Require a main-line GPU source
+      # Branch qualifications produce short-lived build artifacts only. The
+      # publish job still verifies main lineage before creating a release.
+      - name: Require a main-line GPU source for publication
+        if: github.event_name == 'push' || inputs.gpu_mode == 'publish'
         run: |
           .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
             --repository "$GITHUB_REPOSITORY" \
