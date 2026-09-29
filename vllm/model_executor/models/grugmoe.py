@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness-first GPU and TPU implementation of Marin GrugMoE."""
 
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import islice
@@ -1297,27 +1296,28 @@ _EXPERT_WEIGHT_MAPPING: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
-_SPLIT_EXPERT_WEIGHT_RE = re.compile(
-    r"(?P<prefix>(?:.*\.)?experts)\.(?P<expert_id>\d+)\."
-    r"(?P<projection>gate_proj|down_proj|up_proj)\.weight"
-)
-
-
 def _try_load_grug_expert_weight(
     name: str,
     loaded_weight: torch.Tensor,
     params_dict: dict[str, nn.Parameter],
 ) -> str | None:
     split_expert_id = None
-    split_match = _SPLIT_EXPERT_WEIGHT_RE.fullmatch(name)
-    if split_match is not None:
-        if loaded_weight.ndim != 2:
-            raise ValueError(
-                f"Split Grug expert weight must be 2D, got "
-                f"{loaded_weight.ndim}D for {name!r}"
-            )
-        split_expert_id = int(split_match.group("expert_id"))
-        name = f"{split_match['prefix']}.{split_match['projection']}.weight"
+    parts = name.rsplit(".", 3)
+    if len(parts) == 4:
+        prefix, expert_id, projection, suffix = parts
+        if (
+            prefix.rsplit(".", 1)[-1] == "experts"
+            and expert_id.isdecimal()
+            and projection in {"gate_proj", "down_proj", "up_proj"}
+            and suffix == "weight"
+        ):
+            if loaded_weight.ndim != 2:
+                raise ValueError(
+                    f"Split Grug expert weight must be 2D, got "
+                    f"{loaded_weight.ndim}D for {name!r}"
+                )
+            split_expert_id = int(expert_id)
+            name = f"{prefix}.{projection}.weight"
 
     for weight_name, param_name, shard_id in _EXPERT_WEIGHT_MAPPING:
         if weight_name not in name:
