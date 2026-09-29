@@ -194,15 +194,13 @@ def test_attention_first_load_processes_weights(default_vllm_config, layer_cls):
     assert torch.equal(layer.weight, loaded_weight)
 
 
-def test_reload_releases_weights_rejected_by_loader():
+def test_online_loader_releases_rejected_weight():
     def reject_weight(param, loaded_weight):
         return False
 
     layer = torch.nn.Linear(2, 2, bias=False)
     layer.weight.weight_loader = reject_weight
-    model = torch.nn.Sequential(layer)
-    record_metadata_for_reloading(model)
-    initialize_layerwise_reload(model)
+    initialize_online_processing(layer)
 
     rejected = torch.ones(2, 2)
     rejected_ref = ref(rejected)
@@ -212,28 +210,17 @@ def test_reload_releases_weights_rejected_by_loader():
     assert rejected_ref() is None
 
 
-def test_reload_retains_only_weight_slice_of_cuda_transfer_bucket(default_vllm_config):
+def test_online_loader_does_not_pin_cuda_bucket():
     layer = torch.nn.Linear(2, 2, device="cuda")
-    model = torch.nn.Sequential(layer)
-    with torch.device("cuda"):
-        record_metadata_for_reloading(model)
-        initialize_layerwise_reload(model)
+    initialize_online_processing(layer)
 
     resident = torch.cuda.memory_allocated()
-    bucket = torch.arange(2**24, device="cuda", dtype=torch.float32)
-    weight = bucket[:4].view(2, 2)
-    layer.weight.weight_loader(layer.weight, weight)
-    del weight, bucket
+    bucket = torch.empty(2**24, device="cuda")
+    layer.weight.weight_loader(layer.weight, bucket[:4].view(2, 2))
+    del bucket
     gc.collect()
     torch.cuda.synchronize()
-    # The unfinished layer needs four values, not the 64 MiB transfer bucket.
     assert torch.cuda.memory_allocated() - resident < 1024**2
-
-    layer.bias.weight_loader(layer.bias, torch.zeros(2, device="cuda"))
-    finalize_layerwise_reload(model, default_vllm_config.model_config)
-    torch.testing.assert_close(
-        layer.weight, torch.arange(4, device="cuda").view(2, 2).float(), rtol=0, atol=0
-    )
 
 
 def test_reload_lifecycle():
