@@ -79,6 +79,14 @@ The candidate manifest records:
 Candidate tags and assets are immutable. A rerun verifies an existing
 candidate instead of replacing it.
 
+Before merge, a branch can build either architecture through the same release
+recipe without publishing a candidate. Dispatch `marin-gpu-candidate.yaml` on
+the branch with `lane=gpu` and `gpu_mode=qualify-x86_64` or
+`gpu_mode=qualify-aarch64`. Each run uploads its inspected wheel and provenance
+fragment as a 14-day workflow artifact. Record both wheel hashes before using
+them in a consumer qualification. These branch builds cannot enter the GPU
+release lane; publication still requires a source commit on `main`.
+
 GPU publication runs must use the repository's default branch, which this fork
 expects to be `main`. A candidate from a prior `main` commit remains valid after
 `main` advances. To build immediately after a merge, dispatch from `main`:
