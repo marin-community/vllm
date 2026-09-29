@@ -1226,7 +1226,8 @@ def test_grug_moe_router_selects_logical_expert_ids():
     assert selected_expert_ids == list(range(8))
 
 
-def test_grug_moe_3d_expert_weights_load_into_fused_moe_layout():
+@pytest.mark.parametrize("split", [False, True], ids=["stacked", "split"])
+def test_grug_moe_expert_weights_load_into_fused_moe_layout(split: bool):
     cfg = _tiny_config()
     mlp = GrugMoeMLP(cfg, params_dtype=torch.float32)
     params_dict = dict(mlp.named_parameters())
@@ -1240,30 +1241,20 @@ def test_grug_moe_3d_expert_weights_load_into_fused_moe_layout():
         dtype=torch.float32,
     ).view(cfg.num_experts, cfg.hidden_dim, cfg.intermediate_dim)
 
-    assert (
-        _try_load_grug_expert_weight(
-            "experts.gate_proj.weight",
-            gate_weight,
-            params_dict,
-        )
-        == "experts.routed_experts.w13_weight"
-    )
-    assert (
-        _try_load_grug_expert_weight(
-            "experts.up_proj.weight",
-            up_weight,
-            params_dict,
-        )
-        == "experts.routed_experts.w13_weight"
-    )
-    assert (
-        _try_load_grug_expert_weight(
-            "experts.down_proj.weight",
-            down_weight,
-            params_dict,
-        )
-        == "experts.routed_experts.w2_weight"
-    )
+    for projection, weight in (
+        ("gate_proj", gate_weight),
+        ("up_proj", up_weight),
+        ("down_proj", down_weight),
+    ):
+        if split:
+            shards = (
+                (f"experts.{expert_id}.{projection}.weight", weight[expert_id])
+                for expert_id in reversed(range(cfg.num_experts))
+            )
+        else:
+            shards = ((f"experts.{projection}.weight", weight),)
+        for name, shard in shards:
+            _try_load_grug_expert_weight(name, shard, params_dict)
 
     routed_experts = mlp.experts.routed_experts
     torch.testing.assert_close(
