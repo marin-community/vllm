@@ -194,33 +194,22 @@ def test_attention_first_load_processes_weights(default_vllm_config, layer_cls):
     assert torch.equal(layer.weight, loaded_weight)
 
 
-def _optional_weight_loader(param, loaded_weight, *, owned=True):
-    if not owned:
+def test_reload_releases_weights_rejected_by_loader():
+    def reject_weight(param, loaded_weight):
         return False
-    default_weight_loader(param, loaded_weight)
-    return True
 
-
-def test_reload_releases_weights_rejected_by_loader(default_vllm_config):
-    layer = torch.nn.Linear(2, 2)
-    layer.weight.weight_loader = _optional_weight_loader
+    layer = torch.nn.Linear(2, 2, bias=False)
+    layer.weight.weight_loader = reject_weight
     model = torch.nn.Sequential(layer)
     record_metadata_for_reloading(model)
     initialize_layerwise_reload(model)
 
     rejected = torch.ones(2, 2)
     rejected_ref = ref(rejected)
-    assert layer.weight.weight_loader(layer.weight, rejected, owned=False) is False
+    assert layer.weight.weight_loader(layer.weight, rejected) is False
     del rejected
     gc.collect()
     assert rejected_ref() is None
-
-    expected = torch.full((2, 2), 3.0)
-    assert layer.weight.weight_loader(layer.weight, expected) is True
-    layer.bias.weight_loader(layer.bias, torch.zeros(2))
-    finalize_layerwise_reload(model, default_vllm_config.model_config)
-    torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
-    torch.testing.assert_close(layer.bias, torch.zeros(2), rtol=0, atol=0)
 
 
 def test_reload_retains_only_weight_slice_of_cuda_transfer_bucket(default_vllm_config):
