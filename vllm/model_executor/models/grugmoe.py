@@ -1298,8 +1298,8 @@ _EXPERT_WEIGHT_MAPPING: tuple[tuple[str, str, str], ...] = (
 )
 
 _SPLIT_EXPERT_WEIGHT_RE = re.compile(
-    r"^(?P<prefix>(?:.*\.)?experts)\.(?P<expert_id>\d+)\."
-    r"(?P<projection>gate_proj|down_proj|up_proj)\.weight$"
+    r"(?P<prefix>(?:.*\.)?experts)\.(?P<expert_id>\d+)\."
+    r"(?P<projection>gate_proj|down_proj|up_proj)\.weight"
 )
 
 
@@ -1308,15 +1308,16 @@ def _try_load_grug_expert_weight(
     loaded_weight: torch.Tensor,
     params_dict: dict[str, nn.Parameter],
 ) -> str | None:
+    split_expert_id = None
     split_match = _SPLIT_EXPERT_WEIGHT_RE.fullmatch(name)
     if split_match is not None:
-        expert_id = int(split_match.group("expert_id"))
-        name = (
-            f'{split_match.group("prefix")}.'
-            f'{split_match.group("projection")}.weight'
-        )
-    else:
-        expert_id = None
+        if loaded_weight.ndim != 2:
+            raise ValueError(
+                f"Split Grug expert weight must be 2D, got "
+                f"{loaded_weight.ndim}D for {name!r}"
+            )
+        split_expert_id = int(split_match.group("expert_id"))
+        name = f"{split_match['prefix']}.{split_match['projection']}.weight"
 
     for weight_name, param_name, shard_id in _EXPERT_WEIGHT_MAPPING:
         if weight_name not in name:
@@ -1333,24 +1334,22 @@ def _try_load_grug_expert_weight(
             raise ValueError(
                 f"Grug expert parameter {mapped_name!r} has no FusedMoE weight_loader"
             )
-        if expert_id is not None:
-            if loaded_weight.dim() != 2:
-                raise ValueError(
-                    f"Split Grug expert weight must be 2D, got "
-                    f"{loaded_weight.dim()}D for {name!r}"
-                )
-            loaded_experts = ((expert_id, loaded_weight),)
-        elif loaded_weight.dim() == 3:
-            loaded_experts = enumerate(loaded_weight.unbind(dim=0))
+        if split_expert_id is not None:
+            expert_weights = ((split_expert_id, loaded_weight),)
         else:
-            loaded_experts = ((0, loaded_weight),)
-        for loaded_expert_id, loaded_expert in loaded_experts:
+            weights = (
+                loaded_weight.unbind(0)
+                if loaded_weight.ndim == 3
+                else (loaded_weight,)
+            )
+            expert_weights = enumerate(weights)
+        for expert_id, expert_weight in expert_weights:
             weight_loader(
                 param,
-                loaded_expert,
+                expert_weight,
                 mapped_name,
                 shard_id=shard_id,
-                expert_id=loaded_expert_id,
+                expert_id=expert_id,
                 return_success=True,
             )
         return mapped_name
