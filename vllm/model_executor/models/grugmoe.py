@@ -1296,12 +1296,29 @@ _EXPERT_WEIGHT_MAPPING: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
-
 def _try_load_grug_expert_weight(
     name: str,
     loaded_weight: torch.Tensor,
     params_dict: dict[str, nn.Parameter],
 ) -> str | None:
+    split_expert_id = None
+    parts = name.rsplit(".", 3)
+    if len(parts) == 4:
+        prefix, expert_id, projection, suffix = parts
+        if (
+            prefix.rsplit(".", 1)[-1] == "experts"
+            and expert_id.isdecimal()
+            and projection in {"gate_proj", "down_proj", "up_proj"}
+            and suffix == "weight"
+        ):
+            if loaded_weight.ndim != 2:
+                raise ValueError(
+                    f"Split Grug expert weight must be 2D, got "
+                    f"{loaded_weight.ndim}D for {name!r}"
+                )
+            split_expert_id = int(expert_id)
+            name = f"{prefix}.{projection}.weight"
+
     for weight_name, param_name, shard_id in _EXPERT_WEIGHT_MAPPING:
         if weight_name not in name:
             continue
@@ -1317,14 +1334,19 @@ def _try_load_grug_expert_weight(
             raise ValueError(
                 f"Grug expert parameter {mapped_name!r} has no FusedMoE weight_loader"
             )
-        if loaded_weight.dim() == 3:
-            loaded_experts = loaded_weight.unbind(dim=0)
+        if split_expert_id is not None:
+            expert_weights = ((split_expert_id, loaded_weight),)
         else:
-            loaded_experts = (loaded_weight,)
-        for expert_id, loaded_expert in enumerate(loaded_experts):
+            weights = (
+                loaded_weight.unbind(0)
+                if loaded_weight.ndim == 3
+                else (loaded_weight,)
+            )
+            expert_weights = enumerate(weights)
+        for expert_id, expert_weight in expert_weights:
             weight_loader(
                 param,
-                loaded_expert,
+                expert_weight,
                 mapped_name,
                 shard_id=shard_id,
                 expert_id=expert_id,
