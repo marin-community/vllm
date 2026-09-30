@@ -16,7 +16,7 @@ depends on where the change is headed:
 ## The Marin delta
 
 For BF16 Snowball or Hero serving performance on H100 or GB200, start with the
-[performance task chooser](https://github.com/marin-community/MarinSkyRL/blob/15bba4f6ba6b767a218f837b8cb7040811ed47a5/docs/performance.md)
+[performance task chooser](https://github.com/marin-community/MarinSkyRL/blob/3c9ade6b83b2ac22d7720d8c16b26d265da77a96/docs/performance.md)
 and its vLLM guide.
 
 Everything Marin adds on top of upstream is small and deliberate:
