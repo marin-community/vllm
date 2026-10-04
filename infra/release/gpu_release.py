@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import hashlib
 import json
 import os
 import re
@@ -57,6 +58,7 @@ BUILD_ABI_KEYS = (
     "torch_version",
     "torch_index_url",
     "cuda_toolkit_version",
+    "cuda_compiler_version",
     "cuda_variant",
 )
 RELEASE_ABI_KEYS = (*BUILD_ABI_KEYS, "cuda_runtime_version")
@@ -97,9 +99,7 @@ def _packaged_contents(wheel: Path) -> dict[str, str]:
     with zipfile.ZipFile(wheel) as archive:
         members = archive.namelist()
         grug_sources = [
-            name
-            for name in members
-            if name == "vllm/model_executor/models/grugmoe.py"
+            name for name in members if name == "vllm/model_executor/models/grugmoe.py"
         ]
         grug_state = "absent"
         if grug_sources:
@@ -125,6 +125,31 @@ def _packaged_contents(wheel: Path) -> dict[str, str]:
             ),
             GRUG_ARCHITECTURE: grug_state,
         }
+
+
+def _native_artifacts(wheel: Path) -> list[dict[str, Any]]:
+    """Hash every native member, including the serving FA2 and FA3 extensions."""
+    artifacts = []
+    with zipfile.ZipFile(wheel) as archive:
+        for member in archive.infolist():
+            if not member.filename.endswith(".so"):
+                continue
+            digest = hashlib.sha256()
+            with archive.open(member) as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            artifacts.append(
+                {
+                    "path": member.filename,
+                    "sha256": digest.hexdigest(),
+                    "size_bytes": member.file_size,
+                    "producer_evidence": (
+                        "compiler inputs in build.provenance.compiler; "
+                        "runtime producer inspection is separate"
+                    ),
+                }
+            )
+    return artifacts
 
 
 def inspect_wheel(
@@ -223,6 +248,7 @@ def inspect_wheel(
             "wheel_tags": wheel_tags,
             "filename_tag": filename_tag,
             "packaged": packaged,
+            "native_artifacts": _native_artifacts(wheel),
             "wheel": {
                 "filename": wheel.name,
                 "sha256": sha256_file(wheel),
@@ -367,9 +393,7 @@ def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None
     if manifest["release"]["status"] != "candidate":
         raise ReleaseError("manifest is not a candidate")
     _validate_manifest_common(manifest, config)
-    expected_tag = (
-        CANDIDATE_TAG_PREFIX + manifest["source"]["fork_commit"][:12]
-    )
+    expected_tag = CANDIDATE_TAG_PREFIX + manifest["source"]["fork_commit"][:12]
     if manifest["release"]["tag"] != expected_tag:
         raise ReleaseError("candidate tag does not match its fork commit")
     if manifest["validation"] != {"status": "pending", "targets": []}:
@@ -421,9 +445,7 @@ def verify_main_lineage(
         )
 
 
-def _validate_manifest_common(
-    manifest: dict[str, Any], config: dict[str, Any]
-) -> None:
+def _validate_manifest_common(manifest: dict[str, Any], config: dict[str, Any]) -> None:
     release = manifest["release"]
     source = manifest["source"]
     if manifest["schema_version"] != config["schema_version"]:
@@ -445,9 +467,8 @@ def _validate_manifest_common(
     if manifest["abi"] != expected_abi:
         raise ReleaseError("release ABI changed")
     architectures = {item["architecture"] for item in manifest["platforms"]}
-    if (
-        architectures != set(config["platforms"])
-        or len(manifest["platforms"]) != len(config["platforms"])
+    if architectures != set(config["platforms"]) or len(manifest["platforms"]) != len(
+        config["platforms"]
     ):
         raise ReleaseError("release platform set is incomplete")
     if not manifest["distribution"].get("version"):
@@ -458,18 +479,17 @@ def _validate_manifest_common(
         if platform["sm_targets"] != expected_platform["sm_targets"]:
             raise ReleaseError(f"{architecture} SM targets changed")
         filename = platform["wheel"]["filename"]
-        if re.fullmatch(
-            rf".+-manylinux_[0-9]+_[0-9]+_{architecture}\.whl", filename
-        ) is None:
+        if (
+            re.fullmatch(rf".+-manylinux_[0-9]+_[0-9]+_{architecture}\.whl", filename)
+            is None
+        ):
             raise ReleaseError(f"{architecture} wheel filename is not manylinux")
         filename_parts = Path(filename).stem.rsplit("-", 3)
         if len(filename_parts) != 4 or platform["filename_tag"] != "-".join(
             filename_parts[-3:]
         ):
             raise ReleaseError(f"{architecture} wheel filename tag changed")
-        if not any(
-            tag.endswith(f"_{architecture}") for tag in platform["wheel_tags"]
-        ):
+        if not any(tag.endswith(f"_{architecture}") for tag in platform["wheel_tags"]):
             raise ReleaseError(f"{architecture} wheel metadata tags changed")
         expected_url = release_asset_url(
             release["repository"], release["tag"], filename
@@ -484,9 +504,12 @@ def _validate_manifest_common(
         for key, expected in expected_build.items():
             if build.get(key) != expected:
                 raise ReleaseError(f"{architecture} build {key} changed")
-        if re.fullmatch(
-            r"[^@]+@sha256:[0-9a-f]{64}", build.get("base_image_digest", "")
-        ) is None:
+        if (
+            re.fullmatch(
+                r"[^@]+@sha256:[0-9a-f]{64}", build.get("base_image_digest", "")
+            )
+            is None
+        ):
             raise ReleaseError(f"{architecture} base image digest is malformed")
         expected_digest = expected_platform["build_base_image"].rsplit("@", 1)[-1]
         if build["base_image_digest"].rsplit("@", 1)[-1] != expected_digest:
@@ -510,10 +533,13 @@ def validate_release(manifest: dict[str, Any], config: dict[str, Any]) -> None:
         f"{CANDIDATE_TAG_PREFIX}{source_prefix}"
     ):
         raise ReleaseError("release names the wrong candidate tag")
-    if re.fullmatch(
-        rf"{RELEASE_TAG_PREFIX}[0-9]{{8}}-{source_prefix}",
-        manifest["release"]["tag"],
-    ) is None:
+    if (
+        re.fullmatch(
+            rf"{RELEASE_TAG_PREFIX}[0-9]{{8}}-{source_prefix}",
+            manifest["release"]["tag"],
+        )
+        is None
+    ):
         raise ReleaseError("release tag does not match its fork commit")
     if manifest["validation"].get("status") != "passed":
         raise ReleaseError("release validation status is not passed")
@@ -566,9 +592,10 @@ def validate_validation_result(
         raise ReleaseError(f"{architecture} validation names a different commit")
     if result.get("hardware", {}).get("requested") != expected_validation["gpu"]:
         raise ReleaseError(f"{architecture} validation used the wrong GPU")
-    if result.get("hardware", {}).get("compute_capability") != expected_validation[
-        "compute_capability"
-    ]:
+    if (
+        result.get("hardware", {}).get("compute_capability")
+        != expected_validation["compute_capability"]
+    ):
         raise ReleaseError(f"{architecture} validation used the wrong SM")
     expected_wheel = {
         key: platform["wheel"][key] for key in ("filename", "sha256", "url")
@@ -682,6 +709,11 @@ def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 # Build-arg values are sourced from config.json so the workflow
                 # holds no toolchain literals that can drift from the base image.
                 "cuda_version": config["cuda_toolkit_version"],
+                "constraints_file": (
+                    "infra/release/gpu-constraints-aarch64.txt"
+                    if architecture == "aarch64"
+                    else "infra/release/gpu-constraints.txt"
+                ),
                 "python_version": config["python_version"],
                 "max_jobs": platform["max_jobs"],
                 "max_wheel_size_mb": platform["max_wheel_size_mb"],
@@ -824,6 +856,7 @@ def parse_args() -> argparse.Namespace:
     inspect_parser.add_argument("--built-at", required=True)
     inspect_parser.add_argument("--base-image", required=True)
     inspect_parser.add_argument("--base-image-digest", required=True)
+    inspect_parser.add_argument("--compiler-provenance", type=Path, required=True)
     inspect_parser.add_argument("--output", type=Path, required=True)
 
     assemble_parser = subparsers.add_parser("assemble-candidate")
@@ -884,9 +917,7 @@ def main() -> int:
     try:
         if args.command == "build-matrix":
             print(
-                json.dumps(
-                    build_matrix(load_json(args.config)), separators=(",", ":")
-                )
+                json.dumps(build_matrix(load_json(args.config)), separators=(",", ":"))
             )
             return 0
         if args.command == "validation-matrix":
@@ -909,18 +940,28 @@ def main() -> int:
             print(newest_published_candidate([json.loads(line) for line in sys.stdin]))
             return 0
         if args.command == "inspect-wheel":
+            compiler = load_json(args.compiler_provenance)
+            config = load_json(args.config)
+            if compiler["compiler_version"] != config["cuda_compiler_version"]:
+                raise ReleaseError("native compiler version does not match config")
+            if compiler["architecture"] != args.architecture:
+                raise ReleaseError("native compiler architecture does not match wheel")
             fragment = inspect_wheel(
                 args.wheel,
                 architecture=args.architecture,
-                config=load_json(args.config),
+                config=config,
                 fork_commit=args.fork_commit,
                 upstream_base=args.upstream_base,
                 built_at=args.built_at,
                 base_image=args.base_image,
                 base_image_digest=args.base_image_digest,
-                provenance=provenance_from_environment(
-                    args.base_image, args.base_image_digest
-                ),
+                provenance={
+                    **provenance_from_environment(
+                        args.base_image, args.base_image_digest
+                    ),
+                    "compiler": compiler,
+                    "compiler_provenance_sha256": sha256_file(args.compiler_provenance),
+                },
             )
             write_json(args.output, fragment)
             validate_wheel_fragment(fragment)

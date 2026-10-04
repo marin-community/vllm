@@ -161,7 +161,7 @@ ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 # the manylinux image.
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && curl -LsSf https://astral.sh/uv/0.11.21/install.sh | sh \
     # `--seed` installs pip/setuptools/wheel into the venv so `python3 -m
     # pip` works regardless of how uv happens to link the venv back to the
     # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,
@@ -209,7 +209,8 @@ COPY requirements/common.txt requirements/common.txt
 COPY requirements/cuda.txt requirements/cuda.txt
 COPY use_existing_torch.py use_existing_torch.py
 COPY pyproject.toml pyproject.toml
-COPY infra/release/gpu-constraints.txt /opt/marin-gpu-constraints.txt
+ARG MARIN_GPU_CONSTRAINT_FILE=infra/release/gpu-constraints.txt
+COPY ${MARIN_GPU_CONSTRAINT_FILE} /opt/marin-gpu-constraints.txt
 ARG UV_CONSTRAINT
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
@@ -249,6 +250,18 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     else \
         uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+    fi
+
+# Marin builds replace the compiler cohort with immutable, hash-checked wheels.
+# The digest-pinned base continues to supply the rest of the manylinux toolkit.
+ARG MARIN_FIXED_CUDA_COMPILER=false
+COPY infra/release/compiler_provenance.py /opt/marin-compiler-provenance.py
+COPY infra/release/cuda-compiler-inputs.json /opt/marin-cuda-compiler-inputs.json
+RUN if [ "${MARIN_FIXED_CUDA_COMPILER}" = "true" ]; then \
+        python3 /opt/marin-compiler-provenance.py \
+            --inputs /opt/marin-cuda-compiler-inputs.json \
+            --cuda-home /usr/local/cuda \
+            --output /opt/marin-compiler-provenance.json; \
     fi
 
 # CUDA 13.4 Rubin images need a compatibility link for the prerelease
@@ -706,6 +719,7 @@ RUN sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
 # duplicates its toolchains and intermediate objects on the hosted runner.
 FROM scratch AS marin-wheel-export
 COPY --from=wheel-build /workspace/dist /dist
+COPY --from=base /opt/marin-compiler-provenance.json /compiler-provenance.json
 
 #################### DEV IMAGE ####################
 FROM base AS dev

@@ -1,12 +1,15 @@
 -r ../../requirements/cuda.txt
 -r ../../requirements/build/cuda.txt
 
-cuda-toolkit[nvcc,cccl]==13.2.1
-torch==2.13.0+cu132
+# Shared GPU ABI agreed with the trainer refresh. The TPU lane is isolated.
+cuda-toolkit[nvcc,cccl,nvrtc]==13.2.2
+torch==2.14.1+cu132
 torchaudio==2.11.0+cpu
-torchvision==0.28.0+cu132
+torchvision==0.29.1+cu132
+nvidia-cudnn-frontend==1.30.0
+tokenizers==0.23.2
+transformers==5.18.0
 
-# Match the selected upstream CUDA test environment. Newer releases are not
-# part of the source revision's qualified dependency set.
-tokenizers==0.23.1
-transformers==5.16.1
+# NVIDIA's 0.8.1 ARM wheel has an unsupported sbsa WHEEL tag. This repair changes
+# only WHEEL/RECORD; the trainer's maintained recipe verifies native byte identity.
+nvidia-cusparselt-cu13 @ https://github.com/marin-community/MarinSkyRL/releases/download/native-cu132-cusparselt081-armtag-20261004/nvidia_cusparselt_cu13-0.8.1-py3-none-manylinux2014_aarch64.whl#sha256=76c16ba86fc7b15771e0f4df42256a4a29bdd378a186ddfd4744e51fdb384594 ; platform_machine == "aarch64"

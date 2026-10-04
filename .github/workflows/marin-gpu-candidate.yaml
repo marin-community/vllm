@@ -175,8 +175,14 @@ jobs:
         run: |
           git remote add upstream https://github.com/vllm-project/vllm.git 2>/dev/null || \
             git remote set-url upstream https://github.com/vllm-project/vllm.git
-          git fetch --quiet --no-tags upstream main
-          UPSTREAM_BASE=$(git merge-base upstream/main "$GITHUB_SHA")
+          UPSTREAM_RELEASE=$(jq -r '.upstream_release' "$RELEASE_CONFIG")
+          UPSTREAM_BASE=$(jq -r '.upstream_base' "$RELEASE_CONFIG")
+          git fetch --quiet --no-tags upstream "refs/tags/$UPSTREAM_RELEASE"
+          if [[ $(git rev-parse 'FETCH_HEAD^{commit}') != "$UPSTREAM_BASE" ]]; then
+            echo "Selected upstream release no longer matches its frozen commit." >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor "$UPSTREAM_BASE" "$GITHUB_SHA"
 
           VERSION_DATE=$(date -u -d "${{ needs.prepare.outputs.created_at }}" +%Y%m%d)
           VERSION_TAG="v0.0.0.dev${VERSION_DATE}+marin.$(git rev-parse --short=12 "$GITHUB_SHA")"
@@ -231,6 +237,8 @@ jobs:
             --build-arg BUILD_OS=manylinux \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
             --build-arg UV_CONSTRAINT=/opt/marin-gpu-constraints.txt \
+            --build-arg MARIN_GPU_CONSTRAINT_FILE="${{ matrix.constraints_file }}" \
+            --build-arg MARIN_FIXED_CUDA_COMPILER=true \
             --build-arg CUDA_VERSION="${{ matrix.cuda_version }}" \
             --build-arg PYTHON_VERSION="${{ matrix.python_version }}" \
             --build-arg torch_cuda_arch_list="${{ matrix.sm_targets }}" \
@@ -266,6 +274,7 @@ jobs:
             --built-at "${{ steps.provenance.outputs.built_at }}" \
             --base-image "${{ matrix.build_base_image }}" \
             --base-image-digest "${{ steps.provenance.outputs.base_image_digest }}" \
+            --compiler-provenance artifacts/compiler-provenance.json \
             --output "artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json"
           mv "${WHEELS[0]}" artifacts/
 
@@ -275,6 +284,7 @@ jobs:
           path: |
             artifacts/*.whl
             artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json
+            artifacts/compiler-provenance.json
           if-no-files-found: error
           retention-days: 14
 

@@ -38,9 +38,7 @@ CONFIG_PATH = Path(__file__).parents[1] / "config.json"
 GPU_CANDIDATE_WORKFLOW_PATH = (
     REPOSITORY_ROOT / ".github/workflows/marin-gpu-candidate.yaml"
 )
-GPU_RELEASE_WORKFLOW_PATH = (
-    REPOSITORY_ROOT / ".github/workflows/marin-gpu-release.yaml"
-)
+GPU_RELEASE_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/marin-gpu-release.yaml"
 FORK_COMMIT = "a" * 40
 UPSTREAM_BASE = "b" * 40
 BUILT_AT = "2026-08-03T12:00:00Z"
@@ -138,7 +136,7 @@ def write_wheel(
         "Name: vllm\n"
         f"Version: {version}\n"
         "Requires-Python: >=3.10,<3.15\n"
-        "Requires-Dist: torch==2.13.0\n"
+        "Requires-Dist: torch==2.14.1\n"
         "Requires-Dist: transformers>=4.56.0\n"
         "\n"
     )
@@ -154,9 +152,7 @@ def write_wheel(
         archive.writestr(f"{dist_info}/WHEEL", wheel_metadata)
         archive.writestr("vllm/_C_stable_libtorch.cpython-312-test.so", b"compiled")
         if include_cumem:
-            archive.writestr(
-                "vllm/cumem_allocator.cpython-312-test.so", b"compiled"
-            )
+            archive.writestr("vllm/cumem_allocator.cpython-312-test.so", b"compiled")
         archive.writestr(
             "vllm/model_executor/models/grugmoe.py",
             b"class GrugMoeForCausalLM:\n    pass\n",
@@ -281,9 +277,7 @@ def test_published_candidate_rejects_changed_assets_and_target(monkeypatch):
         ("develop", "refs/heads/develop", FORK_COMMIT, "ahead", "maintained main"),
     ],
 )
-def test_gpu_lineage_policy(
-    monkeypatch, branch, workflow_ref, source, status, failure
-):
+def test_gpu_lineage_policy(monkeypatch, branch, workflow_ref, source, status, failure):
     def gh_api(args, **kwargs):
         body = (
             {"default_branch": branch}
@@ -322,9 +316,7 @@ def validation(candidate_manifest: dict, architecture: str) -> dict:
         if item["architecture"] == architecture
     )
     validation_config = config["platforms"][architecture]["validation"]
-    source_status = (
-        "passed" if validation_config["run_source_tests"] else "not_run"
-    )
+    source_status = "passed" if validation_config["run_source_tests"] else "not_run"
     return {
         "schema_version": 1,
         "candidate_tag": candidate_manifest["release"]["tag"],
@@ -390,16 +382,12 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
         "name": "vllm",
         "version": "0.0.0.dev20260803+marin.test.cu130",
         "requires_python": ">=3.10,<3.15",
-        "torch_metadata_requirement": "torch==2.13.0",
+        "torch_metadata_requirement": "torch==2.14.1",
     }
     assert record["source"]["fork_commit"] == FORK_COMMIT
     assert record["source"]["upstream_base"] == UPSTREAM_BASE
-    assert record["platform"]["wheel_tags"] == [
-        "cp38-abi3-manylinux_2_28_x86_64"
-    ]
-    assert record["platform"]["filename_tag"] == (
-        "cp38-abi3-manylinux_2_28_x86_64"
-    )
+    assert record["platform"]["wheel_tags"] == ["cp38-abi3-manylinux_2_28_x86_64"]
+    assert record["platform"]["filename_tag"] == ("cp38-abi3-manylinux_2_28_x86_64")
     assert record["platform"]["packaged"] == {
         STABLE_LIBTORCH_GATE: "included",
         "vllm.cumem_allocator": "included",
@@ -419,6 +407,15 @@ def test_inspect_wheel_cli_runs_without_site_packages(tmp_path):
         f"manylinux_2_28_{architecture}.whl"
     )
     output = tmp_path / "fragment.json"
+    compiler_record = tmp_path / "compiler.json"
+    compiler_record.write_text(
+        json.dumps(
+            {
+                "compiler_version": config["cuda_compiler_version"],
+                "architecture": architecture,
+            }
+        )
+    )
     write_wheel(wheel, architecture=architecture)
 
     completed = subprocess.run(
@@ -444,6 +441,8 @@ def test_inspect_wheel_cli_runs_without_site_packages(tmp_path):
             platform["build_base_image"],
             "--base-image-digest",
             platform["build_base_image"],
+            "--compiler-provenance",
+            str(compiler_record),
             "--output",
             str(output),
         ],

@@ -3,10 +3,10 @@
   "brand": "Marin vLLM",
   "distribution_name": "vllm",
   "python_version": "3.12",
-  "torch_version": "2.13.0+cu132",
-  "torch_metadata_requirement": "torch==2.13.0",
+  "torch_version": "2.14.1+cu132",
+  "torch_metadata_requirement": "torch==2.14.1",
   "torch_index_url": "https://download.pytorch.org/whl/cu132",
-  "cuda_toolkit_version": "13.2.1",
+  "cuda_toolkit_version": "13.2.2",
   "cuda_runtime_version": "13.2",
   "cuda_variant": "cu132",
   "validation_task_image": "ghcr.io/marin-community/iris-task@sha256:9af9a3d38f57c2ed8dfe1d6f6657a9f4a00c582ec06a5ac2af8fcddbe51da03c",
@@ -53,5 +53,8 @@
         "spec": "infra/nightly/specs/qwen3-0.6b-gb200.json"
       }
     }
-  }
+  },
+  "cuda_compiler_version": "13.2.86",
+  "upstream_release": "v0.30.0",
+  "upstream_base": "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 }

@@ -372,8 +372,14 @@ def install_wheel_environment(
             "https://flashinfer.ai/whl/",
             str(wheel),
             "--constraint",
-            str(Path(__file__).with_name("gpu-constraints.txt")),
-            "cuda-toolkit[nvcc,cccl]",
+            str(
+                Path(__file__).with_name(
+                    "gpu-constraints-aarch64.txt"
+                    if platform.machine() == "aarch64"
+                    else "gpu-constraints.txt"
+                )
+            ),
+            "cuda-toolkit[nvcc,cccl,nvrtc]",
             "flashinfer-cubin",
             "pytest",
             "tblib",
@@ -448,10 +454,7 @@ def run_source_suite(
         [
             "--",
             "-v",
-            *(
-                source_node_id(validation_source_root, test)
-                for test in SOURCE_TESTS
-            ),
+            *(source_node_id(validation_source_root, test) for test in SOURCE_TESTS),
         ]
     )
     return_code = run_command(command, cwd=workdir, environment=environment)
@@ -554,9 +557,7 @@ def validate(args: argparse.Namespace) -> int:
             result["environment"]["attention_backend"] = expected_validation[
                 "attention_backend"
             ]
-            python = install_wheel_environment(
-                workdir, wheel, config, environment
-            )
+            python = install_wheel_environment(workdir, wheel, config, environment)
             cuda_home = (
                 python.parent.parent
                 / "lib"
@@ -645,9 +646,7 @@ def parse_args() -> argparse.Namespace:
     validate_parser.add_argument("--hardware", required=True)
     validate_parser.add_argument("--task-image", required=True)
     validate_parser.add_argument("--model", required=True)
-    validate_parser.add_argument(
-        "--validation-source-root", type=Path, required=True
-    )
+    validate_parser.add_argument("--validation-source-root", type=Path, required=True)
 
     probe_parser = subparsers.add_parser("probe-installed")
     probe_parser.add_argument("--distribution", required=True)
