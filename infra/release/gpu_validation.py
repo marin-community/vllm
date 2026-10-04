@@ -369,6 +369,8 @@ def install_wheel_environment(
             "--extra-index-url",
             config["torch_index_url"],
             "--extra-index-url",
+            "https://download.pytorch.org/whl/cpu",
+            "--extra-index-url",
             "https://flashinfer.ai/whl/",
             str(wheel),
             "--constraint",
