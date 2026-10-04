@@ -48,7 +48,7 @@ filelock==4.0.10
 flashinfer-cubin==0.6.18.post1
 flashinfer-python==0.6.18.post1
 frozenlist==1.8.0
-fsspec==2026.9.0
+fsspec==2026.6.0
 googleapis-common-protos==1.75.5
 grpcio==1.84.0
 h11==0.16.0

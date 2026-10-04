@@ -34,6 +34,9 @@ The generated file records the PyPI, CUDA 13.2, CPU Torch, and FlashInfer
 indexes. uv selects compatible wheels for the builder architecture from those
 indexes.
 
+Keep `fsspec==2026.6.0` aligned with the trainer's dataset-compatible runtime.
+Datasets 5.0.1 caps that dependency at 2026.6.0; vLLM allows the same version.
+
 Use uv 0.11.21 and regenerate the file from the repository root with:
 
 ```bash

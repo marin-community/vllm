@@ -10,6 +10,9 @@ nvidia-cudnn-frontend==1.30.0
 tokenizers==0.23.2
 transformers==5.18.0
 
+# Datasets 5.0.1 in the shared trainer runtime caps fsspec at this version.
+fsspec==2026.6.0
+
 # NVIDIA's 0.8.1 ARM wheel has an unsupported sbsa WHEEL tag. This repair changes
 # only WHEEL/RECORD; the trainer's maintained recipe verifies native byte identity.
 nvidia-cusparselt-cu13 @ https://github.com/marin-community/MarinSkyRL/releases/download/native-cu132-cusparselt081-armtag-20261004/nvidia_cusparselt_cu13-0.8.1-py3-none-manylinux2014_aarch64.whl#sha256=76c16ba86fc7b15771e0f4df42256a4a29bdd378a186ddfd4744e51fdb384594 ; platform_machine == "aarch64"
