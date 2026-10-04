@@ -203,6 +203,7 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self.held_request_ids: set[str] = set()
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -613,6 +614,9 @@ class Scheduler(SchedulerInterface):
             request = self.running[req_index]
             if input_budget <= draft_slots:
                 break
+            if request.request_id in self.held_request_ids:
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -1922,7 +1926,10 @@ class Scheduler(SchedulerInterface):
         # whose routing was just D2H'd into model_runner_output.
         routing_data = None
         routing_offsets: dict[str, int] = {}
-        if model_runner_output.routed_experts is not None:
+        if (
+            self.enable_return_routed_experts
+            and model_runner_output.routed_experts is not None
+        ):
             re = model_runner_output.routed_experts
             self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
             routing_data = re.routing_data.astype(

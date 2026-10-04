@@ -88,7 +88,11 @@ def is_metadata_only_build() -> bool:
     return bool({"egg_info", "dist_info"}.intersection(sys.argv[1:]))
 
 
-if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
+if (
+    sys.platform.startswith("darwin")
+    and os.getenv("VLLM_TARGET_DEVICE") is None
+    and VLLM_TARGET_DEVICE != "cpu"
+):
     logger.warning("VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
     VLLM_TARGET_DEVICE = "cpu"
 elif not (sys.platform.startswith("linux") or sys.platform.startswith("darwin")):
@@ -1303,7 +1307,19 @@ def get_vllm_version() -> str:
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(write_to="vllm/_version.py")
 
-    version = get_version(write_to="vllm/_version.py")
+    try:
+        version = get_version(write_to="vllm/_version.py")
+    except Exception as exc:
+        git_sha = subprocess.check_output(
+            ["git", "rev-parse", "--short=9", "HEAD"], text=True
+        ).strip()
+        version = f"0.30.0.dev0+g{git_sha}"
+        print(
+            "Falling back to "
+            f"{version} because setuptools-scm could not parse this checkout: {exc!r}"
+        )
+        os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = version
+        version = get_version(write_to="vllm/_version.py")
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
@@ -1547,8 +1563,11 @@ rust_build.prepare_build_environment()
 
 # Rust artifacts, built via setuptools-rust and installed into the package
 # directory alongside the Python modules.
-rust_extensions = rust_build.rust_extensions(
-    optional=not should_require_rust_frontend()
+require_rust_frontend = should_require_rust_frontend()
+rust_extensions = (
+    rust_build.rust_extensions(optional=not require_rust_frontend)
+    if not _is_tpu() or require_rust_frontend
+    else []
 )
 
 setup(
