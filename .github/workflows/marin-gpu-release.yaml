@@ -260,7 +260,7 @@ jobs:
           set -o pipefail
           iris --cluster marin job run \
             --target-cluster "${{ matrix.target_cluster }}" \
-            --priority production \
+            --priority interactive \
             --job-name "$JOB_NAME" \
             --user "$JOB_USER" \
             --task-image "$TASK_IMAGE" \

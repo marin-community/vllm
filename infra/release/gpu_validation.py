@@ -564,7 +564,15 @@ def validate(args: argparse.Namespace) -> int:
                 / f"python{config['python_version']}"
                 / "site-packages/nvidia/cu13"
             )
-            environment.update(CUDA_HOME=str(cuda_home), NVRTC_HOME=str(cuda_home))
+            environment.update(
+                CUDA_HOME=str(cuda_home),
+                NVRTC_HOME=str(cuda_home),
+                FLASHINFER_NVCC=str(cuda_home / "bin/nvcc"),
+                TRITON_PTXAS_PATH=str(cuda_home / "bin/ptxas"),
+                TRITON_PTXAS_BLACKWELL_PATH=str(cuda_home / "bin/ptxas"),
+                TRITON_CACHE_DIR=str(workdir / "triton-cache"),
+                VLLM_CACHE_ROOT=str(workdir / "vllm-cache"),
+            )
             environment["PATH"] = f"{python.parent}:{environment.get('PATH', '')}"
             # The NVIDIA runtime wheel omits the unversioned linker name.
             linker_directory = python.parent.parent / "lib"
