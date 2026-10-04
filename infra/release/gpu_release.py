@@ -154,6 +154,14 @@ def _native_artifacts(wheel: Path) -> list[dict[str, Any]]:
     return artifacts
 
 
+def _constraints_filename(architecture: str) -> str:
+    return (
+        "gpu-constraints-aarch64.txt"
+        if architecture == "aarch64"
+        else "gpu-constraints.txt"
+    )
+
+
 def inspect_wheel(
     wheel: Path,
     *,
@@ -246,6 +254,15 @@ def inspect_wheel(
         },
         "platform": {
             "architecture": architecture,
+            "constraints": {
+                "url": (
+                    f"https://raw.githubusercontent.com/{SOURCE_REPOSITORY}/"
+                    f"{fork_commit}/infra/release/{_constraints_filename(architecture)}"
+                ),
+                "sha256": sha256_file(
+                    Path(__file__).with_name(_constraints_filename(architecture))
+                ),
+            },
             "sm_targets": platform_config["sm_targets"],
             "wheel_tags": wheel_tags,
             "filename_tag": filename_tag,
@@ -530,6 +547,16 @@ def _validate_manifest_common(
     for platform in manifest["platforms"]:
         architecture = platform["architecture"]
         expected_platform = config["platforms"][architecture]
+        constraints = platform.get("constraints")
+        if constraints is not None:
+            expected_constraints_url = (
+                f"https://raw.githubusercontent.com/{SOURCE_REPOSITORY}/"
+                f"{source['fork_commit']}/infra/release/{_constraints_filename(architecture)}"
+            )
+            if constraints.get("url") != expected_constraints_url:
+                raise ReleaseError(f"{architecture} constraints are not source-pinned")
+            if re.fullmatch(r"[0-9a-f]{64}", constraints.get("sha256", "")) is None:
+                raise ReleaseError(f"{architecture} constraints SHA-256 is malformed")
         if platform["sm_targets"] != expected_platform["sm_targets"]:
             raise ReleaseError(f"{architecture} SM targets changed")
         filename = platform["wheel"]["filename"]
@@ -765,9 +792,7 @@ def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 # holds no toolchain literals that can drift from the base image.
                 "cuda_version": config["cuda_toolkit_version"],
                 "constraints_file": (
-                    "infra/release/gpu-constraints-aarch64.txt"
-                    if architecture == "aarch64"
-                    else "infra/release/gpu-constraints.txt"
+                    f"infra/release/{_constraints_filename(architecture)}"
                 ),
                 "python_version": config["python_version"],
                 "max_jobs": platform["max_jobs"],

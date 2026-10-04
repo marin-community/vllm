@@ -486,6 +486,20 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
     assert wheel["size_bytes"] == wheel_path.stat().st_size
 
 
+@pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
+def test_candidate_rejects_constraints_from_another_source(tmp_path, architecture):
+    manifest = candidate(tmp_path)
+    record = next(
+        item for item in manifest["platforms"] if item["architecture"] == architecture
+    )
+    record["constraints"]["url"] = record["constraints"]["url"].replace(
+        FORK_COMMIT, "c" * 40
+    )
+
+    with pytest.raises(ReleaseError, match="constraints are not source-pinned"):
+        validate_candidate(manifest, load_json(CONFIG_PATH))
+
+
 def test_inspect_wheel_cli_runs_without_site_packages(tmp_path):
     config = load_json(CONFIG_PATH)
     architecture = "x86_64"

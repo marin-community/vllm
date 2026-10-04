@@ -97,6 +97,8 @@ The candidate manifest records:
 - Python, Torch, CUDA, platform, and SM targets;
 - builder image and GitHub Actions provenance;
 - wheel filename, tags, size, and SHA-256;
+- hashes of every packaged native library, including FA2 and FA3;
+- source-pinned architecture-specific dependency constraints and their SHA-256;
 - packaged `_C`, cuMem allocator, and Grug model state.
 
 Candidate tags and assets are immutable. A rerun verifies an existing
