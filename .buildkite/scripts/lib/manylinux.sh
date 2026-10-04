@@ -41,10 +41,11 @@ if [[ -n "${_MANYLINUX_LIB_SOURCED:-}" ]]; then
 fi
 _MANYLINUX_LIB_SOURCED=1
 
-# Pin both sides. Bump these deliberately and re-run a representative
-# wheel from each build target through the detection.
+# Pin the complete retagging toolchain. Bump these deliberately and re-run a
+# representative wheel from each build target through the detection.
 _MANYLINUX_PYTHON_IMAGE="python:3.12-slim"
 _MANYLINUX_AUDITWHEEL_VERSION="6.6.0"
+_MANYLINUX_WHEEL_VERSION="0.47.0"
 
 # Resolve our own directory (and the sibling detect script) using the
 # canonical, symlink-resolved path. The container mounts cwd at the
@@ -71,7 +72,8 @@ _MANYLINUX_CONTAINER="$(docker run -d --rm \
 docker exec "$_MANYLINUX_CONTAINER" \
     pip install --quiet --disable-pip-version-check \
     --root-user-action=ignore \
-    "auditwheel==${_MANYLINUX_AUDITWHEEL_VERSION}"
+    "auditwheel==${_MANYLINUX_AUDITWHEEL_VERSION}" \
+    "wheel==${_MANYLINUX_WHEEL_VERSION}"
 
 # Public cleanup -- safe to call multiple times.
 manylinux_cleanup() {

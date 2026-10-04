@@ -148,7 +148,7 @@ RUN if [ "$USE_SCCACHE" = "1" ]; then \
         && export SCCACHE_DOWNLOAD_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
         && curl -L -o sccache.tar.gz ${SCCACHE_DOWNLOAD_URL} \
         && tar -xzf sccache.tar.gz \
-        && sudo mv sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
+        && mv sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
         && rm -rf sccache.tar.gz sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl; \
     fi
 
@@ -209,6 +209,8 @@ COPY requirements/common.txt requirements/common.txt
 COPY requirements/cuda.txt requirements/cuda.txt
 COPY use_existing_torch.py use_existing_torch.py
 COPY pyproject.toml pyproject.toml
+COPY infra/release/gpu-constraints.txt /opt/marin-gpu-constraints.txt
+ARG UV_CONSTRAINT
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ] && \
@@ -335,7 +337,11 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
-        if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi; \
+        if [ -z "${SCCACHE_BUCKET}" ]; then \
+            unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
+        elif [ -n "${SCCACHE_ENDPOINT}" ]; then \
+            export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; \
+        fi; \
         export RUSTC_WRAPPER=sccache; \
         sccache --show-stats; \
     fi \
@@ -439,19 +445,36 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Build the vLLM wheel
 # if USE_SCCACHE is set, use sccache to speed up compilation
 # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)
-RUN --mount=type=cache,target=/opt/uv/cache \
+RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
-        if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi \
+        if [ -z "${SCCACHE_BUCKET}" ]; then \
+            unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
+        elif [ -n "${SCCACHE_ENDPOINT}" ]; then \
+            export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; \
+        fi \
         && export CMAKE_BUILD_TYPE=Release \
         && export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" \
         && export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" \
         && export VLLM_MAIN_CUDA_VERSION="${VLLM_MAIN_CUDA_VERSION}" \
         && export VLLM_DOCKER_BUILD_CONTEXT=1 \
         && export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) \
-        && sccache --show-stats \
+        && echo "Compiler launcher: $(command -v sccache)" \
+        && sccache --version \
+        && sccache --zero-stats \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
-        && sccache --show-stats; \
+        && sccache --show-stats > /tmp/sccache-stats.txt \
+        && du -sh /root/.cache/sccache > /tmp/sccache-size.txt; \
+    fi
+
+# Keep the summary outside the verbose compile step so BuildKit's per-step log
+# limit cannot clip the cache evidence.
+RUN if [ "$USE_SCCACHE" = "1" ]; then \
+        echo "Final sccache statistics:"; \
+        cat /tmp/sccache-stats.txt; \
+        echo "Final sccache size:"; \
+        cat /tmp/sccache-size.txt; \
     fi
 
 ARG vllm_target_device="cuda"
@@ -572,7 +595,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 #################### EXTENSIONS BUILD IMAGE ####################
 
 #################### WHEEL BUILD IMAGE ####################
-FROM base AS build
+FROM base AS wheel-build
 ARG TARGETPLATFORM
 ARG INSTALL_RUBIN_PRERELEASE
 
@@ -658,13 +681,6 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # when the wheel changes, without copying the wheel itself into the image.
 RUN sha256sum dist/*.whl > dist/wheel.sha256
 
-# Copy extension wheels from extensions-build stage for later use
-COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
-
-# Record the EP kernels wheel checksum for the same cache-busting purpose.
-RUN sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
-    > /tmp/ep_kernels_workspace/dist/wheels.sha256
-
 # Check the size of the CUDA 13 wheel uploaded to PyPI
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
 # sync the default value with .buildkite/check-wheel-size.py
@@ -679,6 +695,17 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
     fi
 
 #################### WHEEL BUILD IMAGE ####################
+
+# The container also ships EP wheels. The Marin wheel release only needs vLLM.
+FROM wheel-build AS build
+COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
+RUN sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
+    > /tmp/ep_kernels_workspace/dist/wheels.sha256
+
+# Export only the release artifact. Loading the full build stage into Docker
+# duplicates its toolchains and intermediate objects on the hosted runner.
+FROM scratch AS marin-wheel-export
+COPY --from=wheel-build /workspace/dist /dist
 
 #################### DEV IMAGE ####################
 FROM base AS dev

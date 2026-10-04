@@ -1,0 +1,13 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "expected_prompts": 4,
+  "min_completion_tokens": 32,
+  "min_output_tokens_per_second": 1.0,
+  "provenance": {
+    "recorded_at": null,
+    "recorded_from": null,
+    "commit": "bootstrap",
+    "hardware": "GB200x1 on cw-us-east-08a via iris",
+    "note": "The first release records the GB200 baseline. This initial lane gates answer correctness, completion length, native aarch64 wheel loading, SM 10.0 execution, and the cuMem allocator. Its throughput floor is a liveness floor until a measured baseline is committed."
+  }
+}

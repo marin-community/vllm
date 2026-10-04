@@ -1,0 +1,12 @@
+-r ../../requirements/cuda.txt
+-r ../../requirements/build/cuda.txt
+
+cuda-toolkit[nvcc,cccl]==13.2.1
+torch==2.13.0+cu132
+torchaudio==2.11.0+cpu
+torchvision==0.28.0+cu132
+
+# Match the selected upstream CUDA test environment. Newer releases are not
+# part of the source revision's qualified dependency set.
+tokenizers==0.23.1
+transformers==5.16.1
