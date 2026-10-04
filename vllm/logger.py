@@ -61,6 +61,13 @@ DEFAULT_LOGGING_CONFIG: dict[str, dict[str, Any] | Any] = {
         },
     },
     "loggers": {
+        # Model Streamer uses a separate logger. Route it through vLLM so model
+        # loading throughput is visible without application-specific config.
+        "runai_model_streamer": {
+            "handlers": ["vllm"],
+            "level": envs.VLLM_LOGGING_LEVEL,
+            "propagate": False,
+        },
         "vllm": {
             "handlers": ["vllm"],
             "level": envs.VLLM_LOGGING_LEVEL,

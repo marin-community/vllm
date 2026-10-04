@@ -16,6 +16,18 @@ def set_eagle3_aux_hidden_state_layers(
     model: nn.Module,
     spec_config: SpeculativeConfig,
 ) -> None:
+    eagle3_model, aux_layers = resolve_eagle3_aux_hidden_state_layers(
+        model, spec_config
+    )
+    eagle3_model.set_aux_hidden_state_layers(aux_layers)
+    reserve_aux_intermediate_tensor_slots(model)
+
+
+def resolve_eagle3_aux_hidden_state_layers(
+    model: nn.Module,
+    spec_config: SpeculativeConfig,
+) -> tuple[SupportsEagle3, tuple[int, ...]]:
+    """Return the EAGLE-3 target interface and configured auxiliary layers."""
     if not supports_eagle3(model):
         raise RuntimeError("Model does not support EAGLE3 interface")
     if isinstance(model, type):
@@ -28,8 +40,7 @@ def set_eagle3_aux_hidden_state_layers(
     else:
         aux_layers = eagle3_model.get_eagle3_default_aux_hidden_state_layers()
         logger.info("Using Eagle3 auxiliary layers from model: %s", aux_layers)
-    eagle3_model.set_aux_hidden_state_layers(aux_layers)
-    reserve_aux_intermediate_tensor_slots(model)
+    return eagle3_model, tuple(aux_layers)
 
 
 def _inner_decoder(model: nn.Module) -> nn.Module | None:

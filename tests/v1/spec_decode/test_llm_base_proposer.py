@@ -17,6 +17,7 @@ import pytest
 
 import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.llm_base_proposer import draft_requires_dp_sync
 
 SCHEDULER_BLOCK_SIZE = 256
 KERNEL_BLOCK_SIZE = 64
@@ -110,3 +111,18 @@ def test_draft_layer_iteration_is_deterministic(monkeypatch: pytest.MonkeyPatch)
         assert len(proposer.draft_attn_groups) == 1
         assert proposer.draft_attn_groups[0].layer_names == expected_order
         assert proposer.block_size == KERNEL_BLOCK_SIZE
+
+
+@pytest.mark.parametrize(
+    ("method", "is_moe", "expected"),
+    [
+        ("eagle3", False, False),
+        ("eagle3", True, True),
+        ("mtp", False, True),
+        ("draft_model", False, True),
+    ],
+)
+def test_only_dense_eagle3_skips_draft_dp_coordination(
+    method: str, is_moe: bool, expected: bool
+):
+    assert draft_requires_dp_sync(method, is_moe) is expected

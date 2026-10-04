@@ -240,6 +240,12 @@ WeightTransferEngineFactory.register_engine(
     "ShardedRDTWeightTransferEngine",
 )
 
+WeightTransferEngineFactory.register_engine(
+    "runai_streamer",
+    "vllm.distributed.weight_transfer.runai_streamer_engine",
+    "RunaiStreamerWeightTransferEngine",
+)
+
 
 # Trainer-side engines, parallel to the worker registry above.
 WeightTransferTrainerFactory.register_engine(

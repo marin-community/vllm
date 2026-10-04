@@ -1423,7 +1423,16 @@ class ModelConfig:
     ) -> None:
         total_num_attention_heads = self.model_arch_config.total_num_attention_heads
         tensor_parallel_size = parallel_config.tensor_parallel_size
-        if total_num_attention_heads % tensor_parallel_size != 0:
+        # The TPU Grug backend pads attention projections before sharding, so
+        # its TP mesh need not divide the model's logical attention-head count.
+        allows_tpu_grug_head_padding = (
+            current_platform.is_tpu()
+            and "GrugMoeForCausalLM" in self.architectures
+        )
+        if (
+            total_num_attention_heads % tensor_parallel_size != 0
+            and not allows_tpu_grug_head_padding
+        ):
             raise ValueError(
                 f"Total number of attention heads ({total_num_attention_heads})"
                 " must be divisible by tensor parallel size "
@@ -1899,6 +1908,10 @@ class ModelConfig:
     def is_hybrid(self) -> bool:
         if not self._model_info.is_hybrid:
             return False
+        # Snowball GrugMoE is attention-only. Hero uses the same serialized
+        # model identity but becomes hybrid when short convolutions are enabled.
+        if getattr(self.hf_text_config, "model_type", None) == "grug_moe":
+            return bool(getattr(self.hf_text_config, "sconv", False))
         # Handle granite-4.0-micro case which uses hybrid config but does not
         # actually contain any non-attention layers.
         layer_types = getattr(self.hf_config, "layer_types", None)
@@ -1912,6 +1925,10 @@ class ModelConfig:
 
     @property
     def has_inner_state(self):
+        if getattr(self.hf_text_config, "model_type", None) == "grug_moe":
+            return self._model_info.has_inner_state and bool(
+                getattr(self.hf_text_config, "sconv", False)
+            )
         return self._model_info.has_inner_state
 
     @property

@@ -197,6 +197,35 @@ def test_attention_first_load_processes_weights(default_vllm_config, layer_cls):
     assert torch.equal(layer.weight, loaded_weight)
 
 
+def test_online_loader_releases_rejected_weight():
+    def reject_weight(param, loaded_weight):
+        return False
+
+    layer = torch.nn.Linear(2, 2, bias=False)
+    layer.weight.weight_loader = reject_weight
+    initialize_online_processing(layer)
+
+    rejected = torch.ones(2, 2)
+    rejected_ref = ref(rejected)
+    assert layer.weight.weight_loader(layer.weight, rejected) is False
+    del rejected
+    gc.collect()
+    assert rejected_ref() is None
+
+
+def test_online_loader_does_not_pin_cuda_bucket():
+    layer = torch.nn.Linear(2, 2, device="cuda")
+    initialize_online_processing(layer)
+
+    resident = torch.cuda.memory_allocated()
+    bucket = torch.empty(2**24, device="cuda")
+    layer.weight.weight_loader(layer.weight, bucket[:4].view(2, 2))
+    del bucket
+    gc.collect()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() - resident < 1024**2
+
+
 def test_reload_lifecycle():
     layer = torch.nn.Linear(2, 3)
     info = LayerReloadingInfo(

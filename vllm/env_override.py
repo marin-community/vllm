@@ -3,6 +3,32 @@
 # ruff: noqa: E402
 import importlib.util
 import os
+import socket
+
+VLLM_FORCE_IPV4 = "VLLM_FORCE_IPV4"
+
+
+def force_ipv4_enabled() -> bool:
+    return os.environ.get(VLLM_FORCE_IPV4, "0").strip().lower() in ("1", "true")
+
+
+def _apply_ipv4_only_getaddrinfo_patch() -> None:
+    """Force unconstrained address resolution to use IPv4."""
+    original_getaddrinfo = socket.getaddrinfo
+    if getattr(original_getaddrinfo, "_vllm_ipv4_only", False):
+        return
+
+    def getaddrinfo_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        if family in (0, socket.AF_UNSPEC):
+            family = socket.AF_INET
+        return original_getaddrinfo(host, port, family, type, proto, flags)
+
+    getaddrinfo_ipv4_only._vllm_ipv4_only = True  # type: ignore[attr-defined]
+    socket.getaddrinfo = getaddrinfo_ipv4_only
+
+
+if force_ipv4_enabled():
+    _apply_ipv4_only_getaddrinfo_patch()
 
 
 def _get_torch_root():
