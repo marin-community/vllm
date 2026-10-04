@@ -601,7 +601,7 @@ jobs:
         if: always()
         run: |
           if [[ -n "${JOB_NAME:-}" ]]; then
-            iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
+            iris --cluster marin job cancel "/$JOB_USER/$JOB_NAME" || true
           fi
 
       - name: Wait for the federated validation record

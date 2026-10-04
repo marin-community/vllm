@@ -464,6 +464,7 @@ jobs:
               --requirements requirements/build/tpu.txt
             VLLM_TARGET_DEVICE="${{ steps.pair.outputs.target_device }}" \
               VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.vllm_version }}" \
+              SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
               uv build --wheel \
                 --no-build-isolation \
                 --python .tpu-wheel-build/bin/python \
@@ -472,7 +473,8 @@ jobs:
           )
           (
             cd sources/tpu-inference
-            VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.tpu_version }}" uv build --wheel \
+            VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.tpu_version }}" \
+              SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" uv build --wheel \
               --python "${{ steps.pair.outputs.python_version }}" \
               --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
               --out-dir "$GITHUB_WORKSPACE/candidate"
