@@ -1,7 +1,7 @@
 name: Marin vLLM Candidate
 
-# Marin fork only. GPU candidates follow main. The manual TPU lane packages the
-# two exact source commits supplied by the caller.
+# Marin fork only. Stable GPU candidates follow main; staged candidates use the
+# exact main-next tip. The manual TPU lane packages the two supplied commits.
 
 on:
   push:

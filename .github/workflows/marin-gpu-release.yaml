@@ -414,11 +414,14 @@ jobs:
           set -o pipefail
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$QUALIFICATION_RUN_ID/artifacts?per_page=100" \
             --jq '.artifacts[]' | jq -s '{artifacts: .}' > qualification-artifacts.json
+          VALIDATION_NAMES=()
+          while IFS= read -r hardware; do
+            VALIDATION_NAMES+=(--name "marin-vllm-validation-$hardware")
+          done < <(jq -r '.platforms[].validation.gpu' "$RELEASE_CONFIG")
           mkdir validations
           gh run download "$QUALIFICATION_RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
-            --name marin-vllm-validation-H100 \
-            --name marin-vllm-validation-GB200 \
+            "${VALIDATION_NAMES[@]}" \
             --dir validations || {
               echo "Qualification evidence is missing or expired; requalify the same candidate. Do not rebuild or bypass the gate." >&2
               exit 1

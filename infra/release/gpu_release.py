@@ -57,6 +57,8 @@ MAINTAINED_BRANCH = "main"
 STAGING_BRANCH = "main-next"
 GPU_CANDIDATE_WORKFLOW = ".github/workflows/marin-gpu-candidate.yaml"
 GPU_RELEASE_WORKFLOW = ".github/workflows/marin-gpu-release.yaml"
+FULL_COMMIT_PATTERN = r"[0-9a-f]{40}"
+POSITIVE_ID_PATTERN = r"[1-9][0-9]*"
 BUILD_ABI_KEYS = (
     "python_version",
     "torch_version",
@@ -365,7 +367,7 @@ def materialize_candidate_inputs(
 ) -> None:
     """Read data from the manifest's exact Git source using trusted tooling."""
     source = candidate["source"]["fork_commit"]
-    if re.fullmatch(r"[0-9a-f]{40}", source) is None:
+    if re.fullmatch(FULL_COMMIT_PATTERN, source) is None:
         raise ReleaseError("candidate source is not a full Git commit")
     source_config = subprocess.run(
         ["git", "show", f"{source}:infra/release/config.json"],
@@ -438,18 +440,16 @@ def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None
         builds = [platform["build"]["provenance"] for platform in manifest["platforms"]]
         first = builds[0]
         for build in builds:
-            if (
-                build.get("control_commit") != source_commit
-                or build.get("workflow_ref")
-                != (
+            validate_workflow_provenance(
+                build,
+                workflow_ref=(
                     f"{RELEASE_REPOSITORY}/{GPU_CANDIDATE_WORKFLOW}"
                     f"@refs/heads/{STAGING_BRANCH}"
-                )
-                or re.fullmatch(r"[1-9][0-9]*", str(build.get("run_id", ""))) is None
-                or re.fullmatch(r"[1-9][0-9]*", str(build.get("run_attempt", "")))
-                is None
-                or build.get("run_url")
-                != f"{SOURCE_REPOSITORY}/actions/runs/{build.get('run_id')}"
+                ),
+                context="staged candidate build",
+            )
+            if (
+                build.get("control_commit") != source_commit
                 or any(
                     build.get(key) != first.get(key)
                     for key in ("run_id", "run_attempt")
@@ -596,7 +596,7 @@ def _validate_manifest_common(
     if source["upstream_repository"] != UPSTREAM_REPOSITORY:
         raise ReleaseError("upstream repository changed")
     for field in ("fork_commit", "upstream_base"):
-        if re.fullmatch(r"[0-9a-f]{40}", source[field]) is None:
+        if re.fullmatch(FULL_COMMIT_PATTERN, source[field]) is None:
             raise ReleaseError(f"source {field} is not a full Git commit")
     if manifest["distribution"]["name"] != config["distribution_name"]:
         raise ReleaseError("distribution name changed")
@@ -845,23 +845,35 @@ def finalize_release(
     return manifest
 
 
-def validate_qualification_provenance(provenance: dict[str, Any]) -> None:
-    """Require an exact GitHub Actions run of the trusted GPU release workflow."""
-    expected_ref = (
-        f"{RELEASE_REPOSITORY}/{GPU_RELEASE_WORKFLOW}@refs/heads/{MAINTAINED_BRANCH}"
-    )
+def validate_workflow_provenance(
+    provenance: dict[str, Any], *, workflow_ref: str, context: str
+) -> None:
+    """Bind a workflow record to its exact control commit and run attempt."""
     if (
         provenance.get("system") != "GitHub Actions"
-        or provenance.get("workflow_ref") != expected_ref
-        or re.fullmatch(r"[0-9a-f]{40}", provenance.get("control_commit", "")) is None
-        or re.fullmatch(r"[1-9][0-9]*", str(provenance.get("run_id", ""))) is None
-        or re.fullmatch(r"[1-9][0-9]*", str(provenance.get("run_attempt", ""))) is None
+        or provenance.get("workflow_ref") != workflow_ref
+        or re.fullmatch(FULL_COMMIT_PATTERN, provenance.get("control_commit", ""))
+        is None
+        or re.fullmatch(POSITIVE_ID_PATTERN, str(provenance.get("run_id", ""))) is None
+        or re.fullmatch(POSITIVE_ID_PATTERN, str(provenance.get("run_attempt", "")))
+        is None
         or provenance.get("run_url")
         != f"{SOURCE_REPOSITORY}/actions/runs/{provenance.get('run_id')}"
     ):
         raise ReleaseError(
-            "qualification provenance is not a trusted main GPU release run"
+            f"{context} provenance does not match expected workflow {workflow_ref}"
         )
+
+
+def validate_qualification_provenance(provenance: dict[str, Any]) -> None:
+    """Require an exact GitHub Actions run of the trusted GPU release workflow."""
+    validate_workflow_provenance(
+        provenance,
+        workflow_ref=(
+            f"{RELEASE_REPOSITORY}/{GPU_RELEASE_WORKFLOW}@refs/heads/{MAINTAINED_BRANCH}"
+        ),
+        context="qualification",
+    )
 
 
 def validate_qualification_run(

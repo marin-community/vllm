@@ -190,8 +190,9 @@ consumer gate whose source or bytes changed. Do not bypass qualification or
 rebuild under the old candidate tag. Before source promotion the candidate must
 still be the exact `main-next` tip; after promotion it must be on `main`.
 
-Land the workflow repair and Marin updater before starting this sequence.
-The serving owner must carry the repaired workflows and release helpers onto
+Land the candidate workflow's `stage` mode, the release workflow's qualification
+and reuse modes, and Marin's `--stage-gpu-candidate` updater before this sequence.
+The serving owner must carry those workflows and release helpers onto
 the proposed source before freezing its SHA or building wheels, so the exact
 source swap preserves the trusted publication harness. The serving owner owns
 both wheel builds, accelerator qualification and Snowball parity; an admin owns
