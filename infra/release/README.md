@@ -89,7 +89,7 @@ upstream base, build ABI, builder image, wheel contents, and SHA-256. Schema 2
 uses the final release tag throughout, including each qualification record's
 `release_tag` and wheel URL.
 
-The existing qualification runs on the configured Iris hardware:
+Qualification runs on the configured Iris hardware:
 
 - H100x1 on `cw-rno2a` installs the x86_64 wheel, checks the stable Torch
   extension and Grug model, validates sparse NCCL weight transfer, allocates

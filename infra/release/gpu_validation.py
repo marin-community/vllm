@@ -534,7 +534,9 @@ def validate(args: argparse.Namespace) -> int:
             print(
                 f"::: downloading wheel artifact {args.wheel_artifact_url}", flush=True
             )
-            download_wheel_artifact(args.wheel_artifact_url, wheel)
+            download_wheel_artifact(
+                args.wheel_artifact_url, wheel, token=os.environ["GH_TOKEN"]
+            )
             actual_digest = sha256_file(wheel)
             expected_digest = platform_record["wheel"]["sha256"]
             if actual_digest != expected_digest:

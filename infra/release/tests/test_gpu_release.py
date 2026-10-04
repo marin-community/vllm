@@ -408,7 +408,7 @@ def test_release_binds_passed_gpu_results_to_built_wheel_digests(tmp_path):
 
 
 def test_wheel_artifact_download_follows_redirect_and_extracts_exact_wheel(
-    tmp_path, monkeypatch
+    tmp_path
 ):
     wheel = tmp_path / "wheel.whl"
     artifact = tmp_path / "artifact.zip"
@@ -432,13 +432,13 @@ def test_wheel_artifact_download_follows_redirect_and_extracts_exact_wheel(
         def log_message(self, *args):
             pass
 
-    monkeypatch.setenv("GH_TOKEN", "test-read-only-token")
     with HTTPServer(("127.0.0.1", 0), ArtifactServer) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             download_wheel_artifact(
-                f"http://127.0.0.1:{server.server_port}/api/artifact", wheel
+                f"http://127.0.0.1:{server.server_port}/api/artifact", wheel,
+                token="test-read-only-token",
             )
         finally:
             server.shutdown()

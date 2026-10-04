@@ -312,13 +312,13 @@ def assemble_manifest(
     }
 
 
-def download_wheel_artifact(url: str, destination: Path) -> None:
+def download_wheel_artifact(url: str, destination: Path, *, token: str) -> None:
     """Download one wheel from a GitHub Actions artifact ZIP."""
     request = urllib.request.Request(
         url, headers={"User-Agent": "marin-release-validation"}
     )
     # GitHub redirects to a short-lived storage URL. Keep the token on the API request.
-    request.add_unredirected_header("Authorization", f"Bearer {os.environ['GH_TOKEN']}")
+    request.add_unredirected_header("Authorization", f"Bearer {token}")
     with tempfile.TemporaryDirectory(prefix="vllm-artifact-") as directory:
         archive_path = Path(directory) / "artifact.zip"
         with (
@@ -470,7 +470,7 @@ def validate_validation_result(
     )
     expected_validation = config["platforms"][architecture]["validation"]
     if result.get("release_tag") != manifest["release"]["tag"]:
-        raise ReleaseError(f"{architecture} validation names a different manifest")
+        raise ReleaseError(f"{architecture} validation names a different release")
     if result.get("source_commit") != manifest["source"]["fork_commit"]:
         raise ReleaseError(f"{architecture} validation names a different commit")
     if result.get("hardware", {}).get("requested") != expected_validation["gpu"]:
@@ -722,10 +722,6 @@ def parse_args() -> argparse.Namespace:
     verify_parser.add_argument("--directory", type=Path, required=True)
     verify_parser.add_argument("--config", type=Path)
 
-    build_parser = subparsers.add_parser("validate-build")
-    build_parser.add_argument("--manifest", type=Path, required=True)
-    build_parser.add_argument("--config", type=Path, required=True)
-
     release_parser = subparsers.add_parser("verify-release")
     release_parser.add_argument("--manifest", type=Path, required=True)
     release_parser.add_argument("--directory", type=Path, required=True)
@@ -805,9 +801,6 @@ def main() -> int:
             if args.config:
                 validate_build(manifest, load_json(args.config))
             verify_manifest_assets(manifest, args.directory)
-            return 0
-        if args.command == "validate-build":
-            validate_build(load_json(args.manifest), load_json(args.config))
             return 0
         if args.command == "verify-release":
             verify_release_assets(
