@@ -267,6 +267,7 @@ jobs:
 
       - name: Tag the wheel
         run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           source .buildkite/scripts/lib/manylinux.sh
           WHEELS=(artifacts/dist/*.whl)
           if [[ ${#WHEELS[@]} -ne 1 ]]; then

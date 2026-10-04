@@ -59,6 +59,10 @@ uses the maintained cuSPARSELt 0.8.1 wheel tag repair because the vendor's ARM
 wheel declares the unsupported `manylinux2014_sbsa` tag. The repair changes
 WHEEL and RECORD metadata; its native bytes are unchanged.
 
+Wheel packaging and platform tagging use the package source's Git timestamp
+as `SOURCE_DATE_EPOCH`. The tagger forwards it into its helper container so
+the regenerated RECORD entry also has a stable timestamp.
+
 The toolkit extras pin the compiler and headers used by
 runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the
 available CUDA 13.0 TorchAudio wheel rejects Torch cu132, while audio

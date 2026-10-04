@@ -117,8 +117,13 @@ apply_manylinux_tag() {
     local wheel="$1"
     local abs_wheel
     abs_wheel="$(realpath "$wheel")"
+    local -a manylinux_epoch_env=()
+    if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
+        manylinux_epoch_env=(--env "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}")
+    fi
     local new_wheel
     new_wheel="$(docker exec -u "$(id -u):$(id -g)" \
+        "${manylinux_epoch_env[@]}" \
         "$_MANYLINUX_CONTAINER" \
         python "$_MANYLINUX_DETECT_SCRIPT" "$abs_wheel")"
     if [[ -z "$new_wheel" || ! -f "$new_wheel" ]]; then
