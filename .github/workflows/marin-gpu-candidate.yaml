@@ -49,7 +49,7 @@ on:
       tpu_inference_commit:
         description: "Exact tpu-inference package source for the TPU lane"
         required: true
-        default: ce8334572ff8f994ac763c8fd1e6f3c8abe6ef8d
+        default: 66c5d8952eec0c263361915cb4613d8f30737955
         type: string
       exclude_newer:
         description: "UTC dependency cutoff for the TPU pair"
