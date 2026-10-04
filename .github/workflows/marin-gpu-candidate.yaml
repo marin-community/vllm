@@ -44,17 +44,17 @@ on:
       vllm_commit:
         description: "Exact vLLM package source for the TPU lane"
         required: true
-        default: 4c1c798a7b6072aab4f435b0fe0eb9e3ae9e5e19
+        default: 39e62869693c46402b1a95fde4fc55ca1aab9ae1
         type: string
       tpu_inference_commit:
         description: "Exact tpu-inference package source for the TPU lane"
         required: true
-        default: 29548fbab663b7ea946546ca7efaa473dab55ba5
+        default: ce8334572ff8f994ac763c8fd1e6f3c8abe6ef8d
         type: string
       exclude_newer:
         description: "UTC dependency cutoff for the TPU pair"
         required: true
-        default: "2026-09-13T03:00:00Z"
+        default: "2026-10-04T20:00:00Z"
         type: string
 
 concurrency:
