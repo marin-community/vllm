@@ -22,8 +22,8 @@ TPU_INFERENCE_COMMIT = "b" * 40
 EXCLUDE_NEWER = "2026-09-13T03:00:00Z"
 CREATED_AT = "2026-08-08T00:30:00Z"
 RUN_URL = "https://github.com/marin-community/vllm/actions/runs/123"
-VLLM_VERSION = "0.20.1rc1.dev0+marin.aaaaaaaaaaaa.tpu"
-TPU_INFERENCE_VERSION = "0.29.0+marin.bbbbbbbbbbbb"
+VLLM_VERSION = "0.0.0.dev20260929+marin.aaaaaaaaaaaa.tpu"
+TPU_INFERENCE_VERSION = "0.30.0+marin.bbbbbbbbbbbb"
 
 
 def _write_wheel(

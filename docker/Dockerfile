@@ -684,6 +684,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Build the vLLM wheel
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=.git,target=.git \
+    export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" && \
     if [ "${vllm_target_device}" = "cuda" ]; then \
         export VLLM_USE_PRECOMPILED=1; \
         export VLLM_PRECOMPILED_WHEEL_LOCATION=$(ls /precompiled-wheels/*.whl); \

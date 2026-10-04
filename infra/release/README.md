@@ -7,16 +7,16 @@ a moving `latest` alias.
 ## GPU build configuration
 
 [`config.json`](config.json) is the release ABI contract. It pins CPython 3.12,
-Torch 2.13.0+cu132, CUDA 13.2.1, digest-pinned upstream manylinux builder
+Torch 2.14.1+cu132, CUDA 13.2.2, digest-pinned upstream manylinux builder
 images, deployment-specific SM targets, Iris validation hardware, and the digest-pinned
 multi-architecture validation image. Update the config and workflows in one PR
 when an ABI changes.
 
 The x86_64 and aarch64 builds reuse the `wheel-build` target in
 [`docker/Dockerfile`](../../docker/Dockerfile). That is the same build path
-used by upstream's release pipeline. Release code does not edit
-`requirements/cuda.txt`, `requirements/build/cuda.txt`, or the `vllm`
-distribution metadata. A final scratch stage contains only `/dist`; BuildKit
+used by upstream's release pipeline. The source requirements and release config
+agree on Torch 2.14.1. A final scratch stage contains `/dist` and compiler
+provenance; BuildKit
 exports that directory directly instead of loading the build image into the
 runner's Docker image store.
 
@@ -24,9 +24,10 @@ The x86_64 wheel targets SM90 on H100, and the aarch64 wheel targets SM100 on
 GB200. Every configured validation gate must pass. Compilation uses two jobs
 with one NVCC thread each and an 800 MiB wheel limit.
 
-`gpu-constraints.txt` pins the Python build and runtime dependencies for CPython
-3.12 on manylinux 2.28 for both architectures. The release Docker build and
-wheel validation consume it. Its direct inputs live in `gpu-constraints.in`,
+`gpu-constraints.txt` and `gpu-constraints-aarch64.txt` pin the Python build and
+runtime dependencies for CPython 3.12 on manylinux 2.28. Each architecture's
+release Docker build and wheel validation consume its file. Their direct inputs
+live in `gpu-constraints.in`,
 including one `torchaudio==2.11.0+cpu` constraint and the Transformers and
 Tokenizers versions qualified by the selected upstream CUDA test environment.
 The generated file records the PyPI, CUDA 13.2, CPU Torch, and FlashInfer
@@ -49,11 +50,33 @@ uv pip compile infra/release/gpu-constraints.in \
 
 The checked-in output seeds regeneration, so this command retains the frozen
 dependency closure. Use `--upgrade` only when intentionally requalifying that
-closure. The same inputs resolve for `aarch64-manylinux_2_28`; only the selected
-platform wheel changes. The toolkit extras pin the compiler and headers used by
+closure. Repeat with `--python-platform aarch64-manylinux_2_28` and
+`--output-file infra/release/gpu-constraints-aarch64.txt` for ARM. That closure
+uses the maintained cuSPARSELt 0.8.1 wheel tag repair because the vendor's ARM
+wheel declares the unsupported `manylinux2014_sbsa` tag. The repair changes
+WHEEL and RECORD metadata; its native bytes are unchanged.
+
+The toolkit extras pin the compiler and headers used by
 runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the
 available CUDA 13.0 TorchAudio wheel rejects Torch cu132, while audio
 preprocessing uses Torch's tensor operators.
+
+`cuda-compiler-inputs.json` fixes component URLs and SHA-256 values for the
+13.2.86 NVCC, CRT, NVVM, runtime, CCCL and NVRTC cohort. The Docker recipe
+overlays those owned files into its full CUDA prefix before native compilation.
+`compiler_provenance.py` verifies the compiler and assembler versions, hashes
+every installed component file, and compiles an SM90/SM100 fatbin probe. The
+candidate manifest embeds that record and hashes every packaged shared library,
+including the native FA2 and FA3 attention modules.
+
+Wheel archives use their source commit's `SOURCE_DATE_EPOCH`. This removes
+wall-clock ZIP timestamps from repeated builds. Native byte reproducibility
+still needs a repeated native build comparison; fixed compiler inputs alone do
+not prove it. Vendor cubins/libraries, Torch native kernels, CuTe compiler
+libraries and driver JIT have separate provenance. During qualification,
+FlashInfer NVCC and both Triton assembler selectors use the installed 13.2.86
+tools with fresh owned caches. Record actual attention selection and kernel
+results before treating any path as qualified.
 
 Each candidate job removes unused Android, .NET, and GHC toolchains from its
 ephemeral hosted runner before compiling. The wheel-only BuildKit export also

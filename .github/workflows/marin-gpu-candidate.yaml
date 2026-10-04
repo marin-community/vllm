@@ -45,17 +45,17 @@ on:
       vllm_commit:
         description: "Exact vLLM package source for the TPU lane"
         required: true
-        default: 4c1c798a7b6072aab4f435b0fe0eb9e3ae9e5e19
+        default: 39e62869693c46402b1a95fde4fc55ca1aab9ae1
         type: string
       tpu_inference_commit:
         description: "Exact tpu-inference package source for the TPU lane"
         required: true
-        default: 29548fbab663b7ea946546ca7efaa473dab55ba5
+        default: 66c5d8952eec0c263361915cb4613d8f30737955
         type: string
       exclude_newer:
         description: "UTC dependency cutoff for the TPU pair"
         required: true
-        default: "2026-09-13T03:00:00Z"
+        default: "2026-10-04T20:00:00Z"
         type: string
 
 concurrency:
@@ -493,6 +493,7 @@ jobs:
               --requirements requirements/build/tpu.txt
             VLLM_TARGET_DEVICE="${{ steps.pair.outputs.target_device }}" \
               VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.vllm_version }}" \
+              SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
               uv build --wheel \
                 --no-build-isolation \
                 --python .tpu-wheel-build/bin/python \
@@ -501,7 +502,8 @@ jobs:
           )
           (
             cd sources/tpu-inference
-            VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.tpu_version }}" uv build --wheel \
+            VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.tpu_version }}" \
+              SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" uv build --wheel \
               --python "${{ steps.pair.outputs.python_version }}" \
               --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
               --out-dir "$GITHUB_WORKSPACE/candidate"
