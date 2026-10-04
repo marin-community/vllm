@@ -136,7 +136,7 @@ jobs:
           inputs.gpu_mode == 'publish' ||
           inputs.gpu_mode == 'stage'
         run: |
-          .venv/bin/python infra/release/gpu_release.py verify-candidate-lineage \
+          .venv/bin/python infra/release/gpu_release.py verify-candidate-build-lineage \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-ref "$GITHUB_REF" \
             --source-commit "$GITHUB_SHA" \
@@ -370,7 +370,7 @@ jobs:
             echo "Candidate source $SOURCE_COMMIT does not match workflow commit $GITHUB_SHA" >&2
             exit 1
           fi
-          .venv/bin/python infra/release/gpu_release.py verify-candidate-lineage \
+          .venv/bin/python infra/release/gpu_release.py verify-candidate-build-lineage \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-ref "$GITHUB_REF" \
             --source-commit "$SOURCE_COMMIT" \

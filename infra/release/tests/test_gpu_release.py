@@ -5,9 +5,11 @@ import base64
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -24,17 +26,25 @@ from infra.release.gpu_release import (
     extract_validation,
     finalize_release,
     inspect_wheel,
+    materialize_candidate_inputs,
     newest_published_candidate,
     validate_candidate,
+    validate_qualification_run,
     validate_release,
     validate_wheel_fragment,
     validation_matrix,
-    verify_candidate_lineage,
+    verify_candidate_build_lineage,
+    verify_candidate_qualification_lineage,
     verify_main_lineage,
     verify_published_candidate,
     verify_release_assets,
 )
-from infra.release.release_common import ReleaseError, load_json, sha256_file
+from infra.release.release_common import (
+    ReleaseError,
+    load_json,
+    release_asset_url,
+    sha256_file,
+)
 
 REPOSITORY_ROOT = Path(__file__).parents[3]
 CONFIG_PATH = Path(__file__).parents[1] / "config.json"
@@ -221,15 +231,100 @@ def candidate(tmp_path: Path) -> dict:
     )
 
 
-def staged_candidate(tmp_path: Path) -> dict:
-    config = load_json(CONFIG_PATH)
+def staged_candidate(tmp_path: Path, config: dict | None = None) -> dict:
+    if config is None:
+        config = load_json(CONFIG_PATH)
+    fragments = [
+        fragment(tmp_path, architecture, config=config)
+        for architecture in config["platforms"]
+    ]
+    for item in fragments:
+        item["build"]["provenance"] |= {
+            "control_commit": FORK_COMMIT,
+            "workflow_ref": (
+                "marin-community/vllm/.github/workflows/"
+                "marin-gpu-candidate.yaml@refs/heads/main-next"
+            ),
+            "run_attempt": "1",
+        }
     return assemble_candidate(
-        [fragment(tmp_path, architecture) for architecture in config["platforms"]],
+        fragments,
         config=config,
         repository="marin-community/vllm",
         candidate_tag=STAGED_CANDIDATE_TAG,
         created_at=BUILT_AT,
     )
+
+
+@pytest.mark.parametrize("weaken_gate", [False, True])
+def test_candidate_inputs_use_frozen_source_abi_and_preserve_trusted_gates(
+    tmp_path, monkeypatch, weaken_gate
+):
+    trusted = load_json(CONFIG_PATH)
+    selected = copy.deepcopy(trusted)
+    selected["cuda_toolkit_version"] = "13.2.2"
+    if weaken_gate:
+        selected["platforms"]["x86_64"]["validation"]["run_source_tests"] = False
+    source = tmp_path / "source"
+    inputs = source / "infra/release"
+    inputs.mkdir(parents=True)
+    frozen_config = json.dumps(selected).encode()
+    frozen_constraints = b"torch==2.13.0\n"
+    (inputs / "config.json").write_bytes(frozen_config)
+    (inputs / "gpu-constraints.txt").write_bytes(frozen_constraints)
+    for command in (
+        ["git", "init", "--quiet"],
+        ["git", "add", "infra"],
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Freeze candidate build inputs",
+        ],
+    ):
+        subprocess.run(command, cwd=source, check=True, capture_output=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    staged = staged_candidate(tmp_path, selected)
+    staged["source"]["fork_commit"] = commit
+    staged["release"]["tag"] = STAGED_CANDIDATE_TAG_PREFIX + commit[:12]
+    for platform in staged["platforms"]:
+        platform["build"]["provenance"]["control_commit"] = commit
+        platform["wheel"]["url"] = release_asset_url(
+            "marin-community/vllm",
+            staged["release"]["tag"],
+            platform["wheel"]["filename"],
+        )
+    # A moving working tree cannot change the candidate's frozen build inputs.
+    (inputs / "config.json").write_text("{}")
+    (inputs / "gpu-constraints.txt").write_text("different dependencies")
+    config_output = tmp_path / "selected-config.json"
+    constraints_output = tmp_path / "selected-constraints.txt"
+    monkeypatch.chdir(source)
+    if weaken_gate:
+        with pytest.raises(ReleaseError, match="trusted GPU validation policy"):
+            materialize_candidate_inputs(
+                staged, trusted, config_output, constraints_output
+            )
+        assert not config_output.exists()
+        assert not constraints_output.exists()
+    else:
+        materialize_candidate_inputs(staged, trusted, config_output, constraints_output)
+        assert config_output.read_bytes() == frozen_config
+        assert constraints_output.read_bytes() == frozen_constraints
+        validate_candidate(staged, load_json(config_output))
+        with pytest.raises(ReleaseError, match="release ABI changed"):
+            validate_candidate(staged, trusted)
 
 
 def test_newest_candidate_uses_publication_time_without_provenance_fallback():
@@ -348,17 +443,17 @@ def test_staged_candidate_lifecycle_fails_if_the_source_moves(monkeypatch, tmp_p
     monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
     staged = staged_candidate(tmp_path)
     validate_candidate(staged, load_json(CONFIG_PATH))
-    verify_candidate_lineage(
+    verify_candidate_build_lineage(
         "marin-community/vllm",
         "refs/heads/main-next",
         FORK_COMMIT,
         STAGED_CANDIDATE_TAG,
     )
-    with pytest.raises(ReleaseError, match="requires a staged tag"):
-        verify_candidate_lineage(
+    with pytest.raises(ReleaseError, match="unsupported ref"):
+        verify_candidate_build_lineage(
             "marin-community/vllm", "refs/heads/main-next", FORK_COMMIT, CANDIDATE_TAG
         )
-    verify_candidate_lineage(
+    verify_candidate_qualification_lineage(
         "marin-community/vllm", "refs/heads/main", FORK_COMMIT, STAGED_CANDIDATE_TAG
     )
 
@@ -366,16 +461,32 @@ def test_staged_candidate_lifecycle_fails_if_the_source_moves(monkeypatch, tmp_p
     with pytest.raises(
         ReleaseError, match="neither on main nor the exact main-next tip"
     ):
-        verify_candidate_lineage(
+        verify_candidate_qualification_lineage(
             "marin-community/vllm", "refs/heads/main", FORK_COMMIT, STAGED_CANDIDATE_TAG
         )
-    with pytest.raises(ReleaseError, match="unsupported ref"):
-        verify_candidate_lineage(
+    with pytest.raises(ReleaseError, match="trusted main"):
+        verify_candidate_qualification_lineage(
             "marin-community/vllm",
             "refs/heads/feature",
             FORK_COMMIT,
             STAGED_CANDIDATE_TAG,
         )
+    with pytest.raises(ReleaseError, match="trusted main"):
+        verify_candidate_qualification_lineage(
+            "marin-community/vllm",
+            "refs/heads/main-next",
+            FORK_COMMIT,
+            STAGED_CANDIDATE_TAG,
+        )
+    with pytest.raises(ReleaseError, match="tip moved"):
+        verify_candidate_build_lineage(
+            "marin-community/vllm",
+            "refs/heads/main-next",
+            FORK_COMMIT,
+            STAGED_CANDIDATE_TAG,
+        )
+    with pytest.raises(ReleaseError, match="not an ancestor"):
+        verify_main_lineage("marin-community/vllm", "refs/heads/main", FORK_COMMIT)
 
     state["main_status"] = "ahead"
     verify_main_lineage("marin-community/vllm", "refs/heads/main", FORK_COMMIT)
@@ -383,6 +494,18 @@ def test_staged_candidate_lifecycle_fails_if_the_source_moves(monkeypatch, tmp_p
     validations = [
         validation(staged, architecture) for architecture in config["platforms"]
     ]
+    metadata, artifacts = qualification_evidence(config)
+    accepted = validate_qualification_run(
+        metadata,
+        artifacts,
+        staged,
+        staged,
+        validations,
+        config=config,
+        repository="marin-community/vllm",
+        run_id="456",
+        now=datetime(2026, 8, 5, tzinfo=timezone.utc),
+    )
     release = finalize_release(
         staged,
         validations,
@@ -390,8 +513,293 @@ def test_staged_candidate_lifecycle_fails_if_the_source_moves(monkeypatch, tmp_p
         release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
         published_at="2026-08-04T00:00:00Z",
         provenance={"run_id": "789"},
+        qualification_provenance=accepted,
     )
     validate_release(release, config)
+    assert release["validation"]["provenance"]["run_id"] == "456"
+    assert {
+        item["architecture"]: item["wheel"]["sha256"] for item in release["platforms"]
+    } == {item["architecture"]: item["wheel"]["sha256"] for item in staged["platforms"]}
+    write_validation_assets(tmp_path, validations)
+    verify_release_assets(release, tmp_path, config)
+
+
+def qualification_evidence(config: dict) -> tuple[dict, list[dict]]:
+    metadata = {
+        "id": 456,
+        "status": "completed",
+        "conclusion": "success",
+        "event": "workflow_dispatch",
+        "head_branch": "main",
+        "head_sha": "c" * 40,
+        "path": ".github/workflows/marin-gpu-release.yaml",
+        "repository": {"full_name": "marin-community/vllm"},
+        "html_url": "https://github.com/marin-community/vllm/actions/runs/456",
+        "run_attempt": 2,
+        "run_started_at": "2026-08-04T00:00:00Z",
+    }
+    names = ["marin-vllm-resolved-candidate"] + [
+        f"marin-vllm-validation-{platform['validation']['gpu']}"
+        for platform in config["platforms"].values()
+    ]
+    artifacts = [
+        {
+            "id": index + 100,
+            "name": name,
+            "expired": False,
+            "created_at": "2026-08-04T01:00:00Z",
+            "expires_at": "2026-08-18T01:00:00Z",
+            "workflow_run": {"id": 456},
+        }
+        for index, name in enumerate(names)
+    ]
+    return metadata, artifacts
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "source",
+        "x86_64-hash",
+        "aarch64-hash",
+        "tag",
+        "build-commit",
+        "build-ref",
+        "run-id",
+        "run-status",
+        "run-failed",
+        "run-branch",
+        "run-workflow",
+        "run-repository",
+        "run-event",
+        "run-attempt",
+        "run-url",
+        "missing",
+        "expired",
+        "expired-time",
+        "old-attempt",
+        "foreign-artifact",
+        "duplicate",
+    ],
+)
+def test_reused_qualification_rejects_changed_candidate_or_untrusted_evidence(
+    tmp_path, corruption
+):
+    config = load_json(CONFIG_PATH)
+    staged = staged_candidate(tmp_path)
+    qualified = copy.deepcopy(staged)
+    validations = [
+        validation(staged, architecture) for architecture in config["platforms"]
+    ]
+    metadata, artifacts = qualification_evidence(config)
+    if corruption == "source":
+        staged["source"]["fork_commit"] = "d" * 40
+    elif corruption.endswith("-hash"):
+        architecture = corruption.removesuffix("-hash")
+        next(
+            item for item in staged["platforms"] if item["architecture"] == architecture
+        )["wheel"]["sha256"] = "0" * 64
+    elif corruption == "tag":
+        staged["release"]["tag"] = CANDIDATE_TAG
+    elif corruption.startswith("build-"):
+        field = "control_commit" if corruption == "build-commit" else "workflow_ref"
+        staged["platforms"][0]["build"]["provenance"][field] = "wrong"
+    elif corruption.startswith("run-"):
+        fields = {
+            "run-id": ("id", 789),
+            "run-status": ("status", "in_progress"),
+            "run-failed": ("conclusion", "failure"),
+            "run-branch": ("head_branch", "main-next"),
+            "run-workflow": ("path", ".github/workflows/other.yaml"),
+            "run-repository": ("repository", {"full_name": "other/vllm"}),
+            "run-event": ("event", "pull_request"),
+            "run-attempt": ("run_attempt", None),
+            "run-url": ("html_url", "https://github.com/other/vllm/actions/runs/456"),
+        }
+        field, value = fields[corruption]
+        metadata[field] = value
+    elif corruption == "missing":
+        artifacts.pop()
+    elif corruption == "expired":
+        artifacts[0]["expired"] = True
+    elif corruption == "expired-time":
+        artifacts[0]["expires_at"] = "2026-08-05T00:00:00Z"
+    elif corruption == "old-attempt":
+        artifacts[0]["created_at"] = "2026-08-03T00:00:00Z"
+    elif corruption == "foreign-artifact":
+        artifacts[0]["workflow_run"]["id"] = 789
+    else:
+        artifacts.append(copy.deepcopy(artifacts[0]))
+    with pytest.raises(ReleaseError):
+        validate_qualification_run(
+            metadata,
+            artifacts,
+            qualified,
+            staged,
+            validations,
+            config=config,
+            repository="marin-community/vllm",
+            run_id="456",
+            now=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        )
+
+
+def test_staged_release_cannot_finalize_without_qualification_provenance(tmp_path):
+    config = load_json(CONFIG_PATH)
+    staged = staged_candidate(tmp_path)
+    with pytest.raises(ReleaseError, match="qualification provenance is missing"):
+        finalize_release(
+            staged,
+            [validation(staged, arch) for arch in config["platforms"]],
+            config=config,
+            release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
+            published_at="2026-08-04T00:00:00Z",
+            provenance={"run_id": "789"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("workflow_ref", "main_status"),
+    [
+        ("refs/heads/main-next", "ahead"),
+        ("refs/heads/feature", "ahead"),
+        ("refs/heads/main", "diverged"),
+    ],
+)
+def test_publication_workflow_rejects_untrusted_ref_or_unpromoted_source(
+    tmp_path, workflow_ref, main_status
+):
+    """Run the real publication step against a local GitHub CLI boundary."""
+    workflow = yaml.safe_load(GPU_RELEASE_WORKFLOW_PATH.read_text())
+    step = next(
+        step
+        for step in workflow["jobs"]["publish"]["steps"]
+        if step.get("name") == "Publish release assets once"
+    )
+    (tmp_path / "infra").symlink_to(REPOSITORY_ROOT / "infra", target_is_directory=True)
+    venv = tmp_path / ".venv/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").symlink_to(sys.executable)
+    assets = tmp_path / "release-assets"
+    assets.mkdir()
+    (assets / "marin-vllm-gpu-manifest.json").write_text(
+        json.dumps(
+            {
+                "source": {"fork_commit": FORK_COMMIT},
+                "release": {"candidate_tag": STAGED_CANDIDATE_TAG},
+            }
+        )
+    )
+    cli = tmp_path / "gh"
+    cli.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "if args[0] == 'api':\n"
+        "    print(json.dumps({'status': os.environ['MAIN_STATUS']} "
+        "if '/compare/' in args[1] else {'default_branch': 'main'}))\n"
+        "elif args[:2] == ['release', 'create']:\n"
+        "    Path('publication-attempted').write_text('published')\n"
+        "else:\n"
+        "    sys.exit(1)\n"
+    )
+    cli.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "GITHUB_REPOSITORY": "marin-community/vllm",
+            "GITHUB_REF": workflow_ref,
+            "MAIN_STATUS": main_status,
+            "SOURCE_COMMIT": FORK_COMMIT,
+            "CANDIDATE_TAG": STAGED_CANDIDATE_TAG,
+            "RELEASE_TAG": f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
+        },
+    )
+    assert result.returncode != 0
+    assert "GPU lineage rejected" in result.stderr, result.stderr
+    assert not (tmp_path / "publication-attempted").exists()
+
+
+def test_finalize_workflow_reuses_successful_qualification_and_identical_wheels(
+    tmp_path,
+):
+    config = load_json(CONFIG_PATH)
+    staged = staged_candidate(tmp_path)
+    validations = [validation(staged, arch) for arch in config["platforms"]]
+    metadata, artifacts = qualification_evidence(config)
+    current_time = datetime.now(timezone.utc)
+    metadata["run_started_at"] = (current_time - timedelta(days=1)).isoformat()
+    for artifact in artifacts:
+        artifact["created_at"] = current_time.isoformat()
+        artifact["expires_at"] = (current_time + timedelta(days=13)).isoformat()
+    (tmp_path / "infra").symlink_to(REPOSITORY_ROOT / "infra", target_is_directory=True)
+    venv = tmp_path / ".venv/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").symlink_to(sys.executable)
+    for directory in (
+        "candidate",
+        "qualified-candidate",
+        "candidate-assets",
+        "release-assets",
+        "validations",
+    ):
+        (tmp_path / directory).mkdir()
+    for directory in ("candidate", "qualified-candidate", "candidate-assets"):
+        (tmp_path / directory / "marin-vllm-gpu-manifest.json").write_text(
+            json.dumps(staged)
+        )
+    for directory in ("candidate", "qualified-candidate"):
+        (tmp_path / directory / "release-config.json").write_text(json.dumps(config))
+        (tmp_path / directory / "gpu-constraints.txt").write_text(
+            "frozen constraints\n"
+        )
+    for platform in staged["platforms"]:
+        filename = platform["wheel"]["filename"]
+        shutil.copyfile(tmp_path / filename, tmp_path / "release-assets" / filename)
+    write_validation_assets(tmp_path / "validations", validations)
+    (tmp_path / "qualification-run.json").write_text(json.dumps(metadata))
+    (tmp_path / "qualification-artifacts.json").write_text(
+        json.dumps({"artifacts": artifacts})
+    )
+    workflow = yaml.safe_load(GPU_RELEASE_WORKFLOW_PATH.read_text())
+    step = next(
+        step
+        for step in workflow["jobs"]["publish"]["steps"]
+        if step.get("name") == "Finalize the release manifest"
+    )
+    completed = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            "GITHUB_REPOSITORY": "marin-community/vllm",
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_WORKFLOW_REF": (
+                "marin-community/vllm/.github/workflows/"
+                "marin-gpu-release.yaml@refs/heads/main"
+            ),
+            "GITHUB_RUN_ID": "789",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_SHA": "c" * 40,
+            "QUALIFICATION_RUN_ID": "456",
+            "RELEASE_CONFIG": "candidate/release-config.json",
+            "RELEASE_TAG": f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
+        },
+    )
+    assert completed.returncode == 0, completed.stderr
+    manifest = load_json(tmp_path / "release-assets/marin-vllm-gpu-manifest.json")
+    assert manifest["validation"]["provenance"]["run_id"] == "456"
+    assert manifest["release"]["provenance"]["run_id"] == "789"
+    assert manifest["source"]["fork_commit"] == FORK_COMMIT
+    verify_release_assets(manifest, tmp_path / "release-assets", config)
 
 
 def test_candidate_rejects_abi_change(tmp_path):

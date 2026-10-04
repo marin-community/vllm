@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,8 @@ STAGED_CANDIDATE_TAG_PREFIX = "marin-vllm-gpu-staged-candidate-"
 RELEASE_TAG_PREFIX = "marin-vllm-gpu-"
 MAINTAINED_BRANCH = "main"
 STAGING_BRANCH = "main-next"
+GPU_CANDIDATE_WORKFLOW = ".github/workflows/marin-gpu-candidate.yaml"
+GPU_RELEASE_WORKFLOW = ".github/workflows/marin-gpu-release.yaml"
 BUILD_ABI_KEYS = (
     "python_version",
     "torch_version",
@@ -327,6 +330,60 @@ def verify_manifest_assets(manifest: dict[str, Any], directory: Path) -> None:
             )
 
 
+def validate_candidate_release_config(
+    candidate: dict[str, Any],
+    source_config: dict[str, Any],
+    trusted_config: dict[str, Any],
+) -> None:
+    """Use the candidate's ABI without changing the trusted GPU gate policy."""
+    if (
+        source_config["validation_task_image"]
+        != trusted_config["validation_task_image"]
+    ):
+        raise ReleaseError("candidate changes the trusted validation task image")
+    trusted_policy = {
+        architecture: platform["validation"]
+        for architecture, platform in trusted_config["platforms"].items()
+    }
+    candidate_policy = {
+        architecture: platform["validation"]
+        for architecture, platform in source_config["platforms"].items()
+    }
+    if candidate_policy != trusted_policy:
+        raise ReleaseError(
+            "candidate changes trusted GPU validation policy; "
+            "land the gate change on main before qualification"
+        )
+    validate_candidate(candidate, source_config)
+
+
+def materialize_candidate_inputs(
+    candidate: dict[str, Any],
+    trusted_config: dict[str, Any],
+    config_output: Path,
+    constraints_output: Path,
+) -> None:
+    """Read data from the manifest's exact Git source using trusted tooling."""
+    source = candidate["source"]["fork_commit"]
+    if re.fullmatch(r"[0-9a-f]{40}", source) is None:
+        raise ReleaseError("candidate source is not a full Git commit")
+    source_config = subprocess.run(
+        ["git", "show", f"{source}:infra/release/config.json"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    constraints = subprocess.run(
+        ["git", "show", f"{source}:infra/release/gpu-constraints.txt"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    validate_candidate_release_config(
+        candidate, json.loads(source_config), trusted_config
+    )
+    config_output.write_bytes(source_config)
+    constraints_output.write_bytes(constraints)
+
+
 def _github_api(path: str, context: str) -> dict[str, Any]:
     try:
         response = subprocess.run(
@@ -377,6 +434,31 @@ def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None
     candidate_tag = manifest["release"]["tag"]
     if candidate_tag not in expected_tags:
         raise ReleaseError("candidate tag does not match its fork commit")
+    if candidate_tag.startswith(STAGED_CANDIDATE_TAG_PREFIX):
+        builds = [platform["build"]["provenance"] for platform in manifest["platforms"]]
+        first = builds[0]
+        for build in builds:
+            if (
+                build.get("control_commit") != source_commit
+                or build.get("workflow_ref")
+                != (
+                    f"{RELEASE_REPOSITORY}/{GPU_CANDIDATE_WORKFLOW}"
+                    f"@refs/heads/{STAGING_BRANCH}"
+                )
+                or re.fullmatch(r"[1-9][0-9]*", str(build.get("run_id", ""))) is None
+                or re.fullmatch(r"[1-9][0-9]*", str(build.get("run_attempt", "")))
+                is None
+                or build.get("run_url")
+                != f"{SOURCE_REPOSITORY}/actions/runs/{build.get('run_id')}"
+                or any(
+                    build.get(key) != first.get(key)
+                    for key in ("run_id", "run_attempt")
+                )
+            ):
+                raise ReleaseError(
+                    "staged candidate build provenance does not match "
+                    "its source and workflow"
+                )
     if manifest["validation"] != {"status": "pending", "targets": []}:
         raise ReleaseError("candidate validation state is not pending")
 
@@ -432,28 +514,55 @@ def _branch_head(repository: str, branch: str, context: str) -> str:
     ]
 
 
-def verify_candidate_lineage(
+def verify_candidate_build_lineage(
     repository: str,
     workflow_ref: str,
     source_commit: str,
     candidate_tag: str,
 ) -> None:
-    """Allow a main candidate or the exact main-next staged candidate."""
+    """Build stable candidates on main and staged candidates at the main-next tip."""
     context = (
         f"candidate={candidate_tag} source={source_commit} workflow_ref={workflow_ref}"
     )
     default_branch = _github_api(f"repos/{repository}", context)["default_branch"]
-    if default_branch != MAINTAINED_BRANCH or workflow_ref not in {
-        f"refs/heads/{MAINTAINED_BRANCH}",
-        f"refs/heads/{STAGING_BRANCH}",
-    }:
+    staged_tag = f"{STAGED_CANDIDATE_TAG_PREFIX}{source_commit[:12]}"
+    expected_branch = (
+        STAGING_BRANCH if candidate_tag == staged_tag else MAINTAINED_BRANCH
+    )
+    if (
+        default_branch != MAINTAINED_BRANCH
+        or workflow_ref != f"refs/heads/{expected_branch}"
+    ):
         raise ReleaseError(
             f"GPU candidate workflow ran from an unsupported ref: {context}"
         )
-    staged_tag = f"{STAGED_CANDIDATE_TAG_PREFIX}{source_commit[:12]}"
-    if workflow_ref == f"refs/heads/{STAGING_BRANCH}" and candidate_tag != staged_tag:
+    if expected_branch == STAGING_BRANCH:
+        if _branch_head(repository, STAGING_BRANCH, context) != source_commit:
+            raise ReleaseError(
+                f"GPU candidate rejected: {context}; main-next tip moved"
+            )
+        return
+    verify_main_lineage(repository, workflow_ref, source_commit, candidate_tag)
+
+
+def verify_candidate_qualification_lineage(
+    repository: str,
+    workflow_ref: str,
+    source_commit: str,
+    candidate_tag: str,
+) -> None:
+    """Qualify a main source or the exact staged source using trusted main."""
+    context = (
+        f"candidate={candidate_tag} source={source_commit} workflow_ref={workflow_ref}"
+    )
+    default_branch = _github_api(f"repos/{repository}", context)["default_branch"]
+    if (
+        default_branch != MAINTAINED_BRANCH
+        or workflow_ref != f"refs/heads/{MAINTAINED_BRANCH}"
+    ):
         raise ReleaseError(
-            f"GPU candidate rejected: {context}; {STAGING_BRANCH} requires a staged tag"
+            f"GPU qualification rejected: {context}; "
+            "workflow must run from trusted main"
         )
     status = _github_api(
         f"repos/{repository}/compare/{source_commit}...{MAINTAINED_BRANCH}", context
@@ -461,7 +570,7 @@ def verify_candidate_lineage(
     if status in {"identical", "ahead"}:
         return
     if (
-        candidate_tag == staged_tag
+        candidate_tag == f"{STAGED_CANDIDATE_TAG_PREFIX}{source_commit[:12]}"
         and _branch_head(repository, STAGING_BRANCH, context) == source_commit
     ):
         return
@@ -562,14 +671,19 @@ def validate_release(manifest: dict[str, Any], config: dict[str, Any]) -> None:
         f"{STAGED_CANDIDATE_TAG_PREFIX}{source_prefix}",
     }:
         raise ReleaseError("release names the wrong candidate tag")
-    if re.fullmatch(
-        rf"{RELEASE_TAG_PREFIX}[0-9]{{8}}-{source_prefix}",
-        manifest["release"]["tag"],
-    ) is None:
+    if (
+        re.fullmatch(
+            rf"{RELEASE_TAG_PREFIX}[0-9]{{8}}-{source_prefix}",
+            manifest["release"]["tag"],
+        )
+        is None
+    ):
         raise ReleaseError("release tag does not match its fork commit")
     if manifest["validation"].get("status") != "passed":
         raise ReleaseError("release validation status is not passed")
     validations = manifest["validation"].get("targets", [])
+    if candidate_tag.startswith(STAGED_CANDIDATE_TAG_PREFIX):
+        validate_qualification_provenance(manifest["validation"].get("provenance", {}))
     index_validations(validations, config)
     candidate = copy.deepcopy(manifest)
     candidate["release"]["tag"] = manifest["release"]["candidate_tag"]
@@ -693,6 +807,7 @@ def finalize_release(
     release_tag: str,
     published_at: str,
     provenance: dict[str, Any],
+    qualification_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_candidate(candidate, config)
     by_architecture = index_validations(validations, config)
@@ -719,7 +834,122 @@ def finalize_release(
         "status": "passed",
         "targets": [by_architecture[key] for key in sorted(by_architecture)],
     }
+    if qualification_provenance is not None:
+        validate_qualification_provenance(qualification_provenance)
+        manifest["validation"]["provenance"] = qualification_provenance
+    if (
+        candidate_tag.startswith(STAGED_CANDIDATE_TAG_PREFIX)
+        and qualification_provenance is None
+    ):
+        raise ReleaseError("staged release qualification provenance is missing")
     return manifest
+
+
+def validate_qualification_provenance(provenance: dict[str, Any]) -> None:
+    """Require an exact GitHub Actions run of the trusted GPU release workflow."""
+    expected_ref = (
+        f"{RELEASE_REPOSITORY}/{GPU_RELEASE_WORKFLOW}@refs/heads/{MAINTAINED_BRANCH}"
+    )
+    if (
+        provenance.get("system") != "GitHub Actions"
+        or provenance.get("workflow_ref") != expected_ref
+        or re.fullmatch(r"[0-9a-f]{40}", provenance.get("control_commit", "")) is None
+        or re.fullmatch(r"[1-9][0-9]*", str(provenance.get("run_id", ""))) is None
+        or re.fullmatch(r"[1-9][0-9]*", str(provenance.get("run_attempt", ""))) is None
+        or provenance.get("run_url")
+        != f"{SOURCE_REPOSITORY}/actions/runs/{provenance.get('run_id')}"
+    ):
+        raise ReleaseError(
+            "qualification provenance is not a trusted main GPU release run"
+        )
+
+
+def validate_qualification_run(
+    run_metadata: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    qualified_candidate: dict[str, Any],
+    candidate: dict[str, Any],
+    validations: list[dict[str, Any]],
+    *,
+    config: dict[str, Any],
+    repository: str,
+    run_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Bind successful trusted qualification artifacts to the exact candidate."""
+    validate_candidate(candidate, config)
+    if qualified_candidate != candidate:
+        raise ReleaseError("qualification candidate manifest changed")
+    expected = {
+        "id": int(run_id),
+        "status": "completed",
+        "conclusion": "success",
+        "head_branch": MAINTAINED_BRANCH,
+        "path": GPU_RELEASE_WORKFLOW,
+    }
+    if (
+        repository != RELEASE_REPOSITORY
+        or run_metadata.get("repository", {}).get("full_name") != repository
+    ):
+        raise ReleaseError("qualification run belongs to a different repository")
+    for key, value in expected.items():
+        if run_metadata.get(key) != value:
+            raise ReleaseError(
+                f"qualification run has {key}={run_metadata.get(key)!r}, "
+                f"expected {value!r}"
+            )
+    if run_metadata.get("event") not in {"workflow_dispatch", "schedule"}:
+        raise ReleaseError("qualification run used an untrusted event")
+    provenance = {
+        "system": "GitHub Actions",
+        "workflow_ref": (
+            f"{repository}/{GPU_RELEASE_WORKFLOW}@refs/heads/{MAINTAINED_BRANCH}"
+        ),
+        "control_commit": run_metadata.get("head_sha", ""),
+        "run_id": str(run_metadata["id"]),
+        "run_attempt": str(run_metadata.get("run_attempt", "")),
+        "run_url": run_metadata.get("html_url", ""),
+    }
+    validate_qualification_provenance(provenance)
+    current_time = now or datetime.now(timezone.utc)
+    started_at = datetime.fromisoformat(
+        run_metadata["run_started_at"].replace("Z", "+00:00")
+    )
+    required_names = {"marin-vllm-resolved-candidate"} | {
+        f"marin-vllm-validation-{platform['validation']['gpu']}"
+        for platform in config["platforms"].values()
+    }
+    evidence_ids = {}
+    for name in sorted(required_names):
+        matches = [artifact for artifact in artifacts if artifact["name"] == name]
+        if len(matches) != 1:
+            raise ReleaseError(
+                f"qualification evidence {name} is missing or ambiguous; "
+                "requalify the same candidate"
+            )
+        artifact = matches[0]
+        if (
+            artifact.get("expired")
+            or datetime.fromisoformat(artifact["expires_at"].replace("Z", "+00:00"))
+            <= current_time
+        ):
+            raise ReleaseError(
+                f"qualification evidence {name} expired; requalify the same candidate"
+            )
+        if (
+            artifact.get("workflow_run", {}).get("id") != int(run_id)
+            or datetime.fromisoformat(artifact["created_at"].replace("Z", "+00:00"))
+            < started_at
+        ):
+            raise ReleaseError(
+                f"qualification evidence {name} belongs to a different run or attempt"
+            )
+        evidence_ids[name] = artifact["id"]
+    index_validations(validations, config)
+    for result in validations:
+        validate_validation_result(result, candidate, config)
+    provenance["artifact_ids"] = evidence_ids
+    return provenance
 
 
 def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -835,6 +1065,7 @@ def provenance_from_environment(
     provenance = {
         "system": "GitHub Actions",
         "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF", "unknown"),
+        "control_commit": os.environ.get("GITHUB_SHA", "unknown"),
         "run_id": run_id,
         "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "unknown"),
         "job": os.environ.get("GITHUB_JOB", "unknown"),
@@ -864,11 +1095,15 @@ def parse_args() -> argparse.Namespace:
     lineage_parser.add_argument("--source-commit", required=True)
     lineage_parser.add_argument("--candidate-tag")
 
-    candidate_lineage_parser = subparsers.add_parser("verify-candidate-lineage")
-    candidate_lineage_parser.add_argument("--repository", required=True)
-    candidate_lineage_parser.add_argument("--workflow-ref", required=True)
-    candidate_lineage_parser.add_argument("--source-commit", required=True)
-    candidate_lineage_parser.add_argument("--candidate-tag", required=True)
+    for command in (
+        "verify-candidate-build-lineage",
+        "verify-candidate-qualification-lineage",
+    ):
+        candidate_lineage_parser = subparsers.add_parser(command)
+        candidate_lineage_parser.add_argument("--repository", required=True)
+        candidate_lineage_parser.add_argument("--workflow-ref", required=True)
+        candidate_lineage_parser.add_argument("--source-commit", required=True)
+        candidate_lineage_parser.add_argument("--candidate-tag", required=True)
 
     subparsers.add_parser("select-newest-candidate")
 
@@ -902,6 +1137,10 @@ def parse_args() -> argparse.Namespace:
     candidate_parser.add_argument("--manifest", type=Path, required=True)
     candidate_parser.add_argument("--config", type=Path, required=True)
 
+    inputs_parser = subparsers.add_parser("materialize-candidate-inputs")
+    for field in ("manifest", "trusted-config", "config-output", "constraints-output"):
+        inputs_parser.add_argument(f"--{field}", type=Path, required=True)
+
     published_candidate_parser = subparsers.add_parser("verify-published-candidate")
     published_candidate_parser.add_argument("--manifest", type=Path, required=True)
     published_candidate_parser.add_argument("--repository", required=True)
@@ -916,6 +1155,22 @@ def parse_args() -> argparse.Namespace:
     validation_parser.add_argument("--candidate", type=Path, required=True)
     validation_parser.add_argument("--config", type=Path, required=True)
 
+    qualification_parser = subparsers.add_parser("validate-qualification-run")
+    for field in (
+        "run-metadata",
+        "artifacts",
+        "qualified-candidate",
+        "candidate",
+        "config",
+        "output",
+    ):
+        qualification_parser.add_argument(f"--{field}", type=Path, required=True)
+    qualification_parser.add_argument(
+        "--validation", type=Path, action="append", required=True
+    )
+    qualification_parser.add_argument("--repository", required=True)
+    qualification_parser.add_argument("--run-id", required=True)
+
     finalize_parser = subparsers.add_parser("finalize-release")
     finalize_parser.add_argument("--candidate", type=Path, required=True)
     finalize_parser.add_argument(
@@ -924,6 +1179,7 @@ def parse_args() -> argparse.Namespace:
     finalize_parser.add_argument("--config", type=Path, required=True)
     finalize_parser.add_argument("--release-tag", required=True)
     finalize_parser.add_argument("--published-at", required=True)
+    finalize_parser.add_argument("--qualification-provenance", type=Path)
     finalize_parser.add_argument("--output", type=Path, required=True)
 
     extract_parser = subparsers.add_parser("extract-validation")
@@ -941,9 +1197,7 @@ def main() -> int:
     try:
         if args.command == "build-matrix":
             print(
-                json.dumps(
-                    build_matrix(load_json(args.config)), separators=(",", ":")
-                )
+                json.dumps(build_matrix(load_json(args.config)), separators=(",", ":"))
             )
             return 0
         if args.command == "validation-matrix":
@@ -962,8 +1216,16 @@ def main() -> int:
                 args.candidate_tag,
             )
             return 0
-        if args.command == "verify-candidate-lineage":
-            verify_candidate_lineage(
+        if args.command in {
+            "verify-candidate-build-lineage",
+            "verify-candidate-qualification-lineage",
+        }:
+            verifier = (
+                verify_candidate_build_lineage
+                if args.command == "verify-candidate-build-lineage"
+                else verify_candidate_qualification_lineage
+            )
+            verifier(
                 args.repository,
                 args.workflow_ref,
                 args.source_commit,
@@ -1009,6 +1271,14 @@ def main() -> int:
         if args.command == "validate-candidate":
             validate_candidate(load_json(args.manifest), load_json(args.config))
             return 0
+        if args.command == "materialize-candidate-inputs":
+            materialize_candidate_inputs(
+                load_json(args.manifest),
+                load_json(args.trusted_config),
+                args.config_output,
+                args.constraints_output,
+            )
+            return 0
         if args.command == "verify-published-candidate":
             verify_published_candidate(load_json(args.manifest), args.repository)
             return 0
@@ -1024,6 +1294,19 @@ def main() -> int:
                 load_json(args.config),
             )
             return 0
+        if args.command == "validate-qualification-run":
+            qualification = validate_qualification_run(
+                load_json(args.run_metadata),
+                load_json(args.artifacts)["artifacts"],
+                load_json(args.qualified_candidate),
+                load_json(args.candidate),
+                [load_json(path) for path in args.validation],
+                config=load_json(args.config),
+                repository=args.repository,
+                run_id=args.run_id,
+            )
+            write_json(args.output, qualification)
+            return 0
         if args.command == "finalize-release":
             manifest = finalize_release(
                 load_json(args.candidate),
@@ -1032,6 +1315,11 @@ def main() -> int:
                 release_tag=args.release_tag,
                 published_at=args.published_at,
                 provenance=provenance_from_environment("", ""),
+                qualification_provenance=(
+                    load_json(args.qualification_provenance)
+                    if args.qualification_provenance
+                    else None
+                ),
             )
             write_json(args.output, manifest)
             return 0
@@ -1041,7 +1329,7 @@ def main() -> int:
         if args.command == "release-notes":
             args.output.write_text(release_notes(load_json(args.manifest)))
             return 0
-    except (KeyError, OSError, ReleaseError, zipfile.BadZipFile) as exc:
+    except (KeyError, OSError, ValueError, ReleaseError, zipfile.BadZipFile) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     raise AssertionError(f"unhandled command {args.command}")

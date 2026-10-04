@@ -79,6 +79,20 @@ The candidate manifest records:
 Candidate tags and assets are immutable. A rerun verifies an existing
 candidate instead of replacing it.
 
+Staged manifests use the same schema and commands. Each architecture's
+`build.provenance` also records the exact workflow `control_commit`,
+`workflow_ref`, `run_id`, `run_attempt`, and `run_url`. Both builds must name
+the same candidate workflow attempt on `main-next`, at the full source SHA.
+Existing stable manifests remain accepted.
+
+The trusted release workflow reads `config.json` and `gpu-constraints.txt` from
+the manifest's full source SHA and retains them with the candidate snapshot.
+This selects the serving owner's frozen build ABI and dependency closure.
+The validation program, serving specs, GPU targets and gate policy come from
+trusted `main`. A candidate that changes that policy or task image is rejected;
+land the required harness change on `main` before freezing the serving source.
+Reused qualification must preserve both input files as well as the manifest.
+
 Before merge, a branch can build either architecture through the same release
 recipe without publishing a candidate. Dispatch `marin-gpu-candidate.yaml` on
 the branch with `lane=gpu` and `gpu_mode=qualify-x86_64` or
@@ -162,8 +176,26 @@ qualification run ID. The promotion accepts only a successful release-workflow
 run from `main`, then checks that its validation records name the same candidate,
 source commit, and wheel digests. It publishes the same bytes without another
 GPU allocation.
-Complete promotion within the validation artifacts' 14-day retention window;
-after expiry, the exact qualification records cannot be reused.
+Reuse checks the successful run's ID, repository, event, workflow path, trusted
+branch, workflow commit, and attempt. It requires the saved candidate manifest
+and both GPU results from that attempt, verifies their current artifact IDs and
+expiry, and records the accepted run provenance in the final manifest. The saved
+candidate must exactly match the published candidate manifest; each GPU result
+must bind its source, candidate tag, and architecture's wheel URL and SHA-256.
+
+The candidate snapshot and GPU results have 14-day retention. Missing, expired,
+duplicate, or earlier-attempt evidence fails publication. Start a new
+`qualification_only=true` run for the same immutable candidate and repeat any
+consumer gate whose source or bytes changed. Do not bypass qualification or
+rebuild under the old candidate tag. Before source promotion the candidate must
+still be the exact `main-next` tip; after promotion it must be on `main`.
+
+Land the workflow repair and Marin updater before starting this sequence.
+The serving owner must carry the repaired workflows and release helpers onto
+the proposed source before freezing its SHA or building wheels, so the exact
+source swap preserves the trusted publication harness. The serving owner owns
+both wheel builds, accelerator qualification and Snowball parity; an admin owns
+the protected source swap. No workflow tests replace those live gates.
 
 ```bash
 gh workflow run marin-gpu-candidate.yaml \
