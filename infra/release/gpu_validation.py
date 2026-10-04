@@ -28,12 +28,12 @@ from gpu_release import (
     TORCHAUDIO_GATE,
     VALIDATION_SENTINEL,
     WHEEL_SHA_GATE,
-    validate_candidate,
+    download_wheel_artifact,
+    validate_build,
 )
 from release_common import load_json, sha256_file, write_json
 from validation_common import (
     ValidationFailure,
-    download_url,
     emit_result,
     gate,
     require_command,
@@ -55,15 +55,15 @@ SOURCE_TEST_EXCLUDES = (
 
 
 def initial_result(
-    candidate: dict[str, Any], architecture: str, hardware: str, task_image: str
+    manifest: dict[str, Any], architecture: str, hardware: str, task_image: str
 ) -> dict[str, Any]:
     platform_record = next(
-        item for item in candidate["platforms"] if item["architecture"] == architecture
+        item for item in manifest["platforms"] if item["architecture"] == architecture
     )
     return {
-        "schema_version": 1,
-        "candidate_tag": candidate["release"]["tag"],
-        "source_commit": candidate["source"]["fork_commit"],
+        "schema_version": manifest["schema_version"],
+        "release_tag": manifest["release"]["tag"],
+        "source_commit": manifest["source"]["fork_commit"],
         "architecture": architecture,
         "wheel": {
             "filename": platform_record["wheel"]["filename"],
@@ -296,7 +296,7 @@ def run_wheel_tests(args: argparse.Namespace) -> int:
     print(f"::: wheel tests import vllm from {package_path}", flush=True)
 
     # `vllm` is now fixed in sys.modules with its site-packages __path__. Add the
-    # checkout only so pytest can import the candidate commit's `tests` package.
+    # checkout only so pytest can import the build commit's `tests` package.
     # Keep the process working directory outside the checkout: model inspection
     # launches fresh Python processes, and their first import path is the working
     # directory rather than this process's already-populated sys.modules.
@@ -390,7 +390,7 @@ def run_installed_probe(
     workdir: Path,
     package_source_root: Path,
     validation_source_root: Path,
-    candidate: dict[str, Any],
+    manifest: dict[str, Any],
     config: dict[str, Any],
     expected_validation: dict[str, Any],
     environment: dict[str, str],
@@ -402,9 +402,9 @@ def run_installed_probe(
             str(Path(__file__).resolve()),
             "probe-installed",
             "--distribution",
-            candidate["distribution"]["name"],
+            manifest["distribution"]["name"],
             "--version",
-            candidate["distribution"]["version"],
+            manifest["distribution"]["version"],
             "--torch-version",
             config["torch_version"],
             "--cuda-runtime",
@@ -495,16 +495,16 @@ def run_serving_smoke(
 
 def validate(args: argparse.Namespace) -> int:
     config = load_json(args.config)
-    candidate = load_json(args.candidate_manifest)
-    validate_candidate(candidate, config)
+    manifest = load_json(args.manifest)
+    validate_build(manifest, config)
     architecture = args.architecture
     platform_config = config["platforms"][architecture]
     expected_validation = platform_config["validation"]
     result = initial_result(
-        candidate, architecture, expected_validation["gpu"], args.task_image
+        manifest, architecture, expected_validation["gpu"], args.task_image
     )
     platform_record = next(
-        item for item in candidate["platforms"] if item["architecture"] == architecture
+        item for item in manifest["platforms"] if item["architecture"] == architecture
     )
     package_source_root = Path(__file__).resolve().parents[2]
     validation_source_root = args.validation_source_root.resolve()
@@ -512,7 +512,7 @@ def validate(args: argparse.Namespace) -> int:
     try:
         if not validation_source_root.is_dir():
             raise ValidationFailure(
-                "candidate validation source root does not exist: "
+                "validation source root does not exist: "
                 f"{validation_source_root}"
             )
         if platform.machine() != architecture:
@@ -531,8 +531,10 @@ def validate(args: argparse.Namespace) -> int:
         with tempfile.TemporaryDirectory(prefix="marin-vllm-release-") as directory:
             workdir = Path(directory)
             wheel = workdir / platform_record["wheel"]["filename"]
-            print(f"::: downloading {platform_record['wheel']['url']}", flush=True)
-            download_url(platform_record["wheel"]["url"], wheel)
+            print(
+                f"::: downloading wheel artifact {args.wheel_artifact_url}", flush=True
+            )
+            download_wheel_artifact(args.wheel_artifact_url, wheel)
             actual_digest = sha256_file(wheel)
             expected_digest = platform_record["wheel"]["sha256"]
             if actual_digest != expected_digest:
@@ -576,7 +578,7 @@ def validate(args: argparse.Namespace) -> int:
                 workdir,
                 package_source_root,
                 validation_source_root,
-                candidate,
+                manifest,
                 config,
                 expected_validation,
                 environment,
@@ -640,7 +642,8 @@ def parse_args() -> argparse.Namespace:
 
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--config", type=Path, required=True)
-    validate_parser.add_argument("--candidate-manifest", type=Path, required=True)
+    validate_parser.add_argument("--manifest", type=Path, required=True)
+    validate_parser.add_argument("--wheel-artifact-url", required=True)
     validate_parser.add_argument("--architecture", required=True)
     validate_parser.add_argument("--hardware", required=True)
     validate_parser.add_argument("--task-image", required=True)

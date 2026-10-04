@@ -55,186 +55,68 @@ runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the
 available CUDA 13.0 TorchAudio wheel rejects Torch cu132, while audio
 preprocessing uses Torch's tensor operators.
 
-Each candidate job removes unused Android, .NET, and GHC toolchains from its
+Each build job removes unused Android, .NET, and GHC toolchains from its
 ephemeral hosted runner before compiling. The wheel-only BuildKit export also
 avoids duplicating the build toolchains and intermediate objects in the
 runner's Docker image store. Together these keep compilation and artifact
 export within the hosted runners' root filesystems.
 
-## GPU candidate publication
+## GPU build, qualification, and publication
+
+Review and land vLLM source changes on `main` before building wheels. This
+applies to an upstream refresh and to patches authored in the fork. Marin keeps
+its existing wheel until a separate adoption PR passes its tests and merges.
 
 [`marin-gpu-candidate.yaml`](../../.github/workflows/marin-gpu-candidate.yaml)
-runs on every merge to `main`. It builds x86_64 SM90 and aarch64 SM100 wheels,
-derives the manylinux tag from each wheel's ELF symbols, and publishes a
-prerelease named `marin-vllm-gpu-candidate-<12-character-sha>`.
-
-The candidate manifest records:
-
-- fork commit and upstream merge base;
-- Python, Torch, CUDA, platform, and SM targets;
-- builder image and GitHub Actions provenance;
-- wheel filename, tags, size, and SHA-256;
-- packaged `_C`, cuMem allocator, and Grug model state.
-
-Candidate tags and assets are immutable. A rerun verifies an existing
-candidate instead of replacing it.
-
-Staged manifests use the same schema and commands. Each architecture's
-`build.provenance` also records the exact workflow `control_commit`,
-`workflow_ref`, `run_id`, `run_attempt`, and `run_url`. Both builds must name
-the same candidate workflow attempt on `main-next`, at the full source SHA.
-Existing stable manifests remain accepted.
-
-The trusted release workflow reads `config.json` and `gpu-constraints.txt` from
-the manifest's full source SHA and retains them with the candidate snapshot.
-This selects the serving owner's frozen build ABI and dependency closure.
-The validation program, serving specs, GPU targets and gate policy come from
-trusted `main`. A candidate that changes that policy or task image is rejected;
-land the required harness change on `main` before freezing the serving source.
-Reused qualification must preserve both input files as well as the manifest.
-
-Before merge, a branch can build either architecture through the same release
-recipe without publishing a candidate. Dispatch `marin-gpu-candidate.yaml` on
-the branch with `lane=gpu` and `gpu_mode=qualify-x86_64` or
-`gpu_mode=qualify-aarch64`. Each run uploads its inspected wheel and provenance
-fragment as a 14-day workflow artifact. Record both wheel hashes before using
-them in a consumer qualification. These branch builds cannot enter the GPU
-release lane; publication still requires a source commit on `main`.
-
-GPU publication runs must use the repository's default branch, which this fork
-expects to be `main`. A candidate from a prior `main` commit remains valid after
-`main` advances. To build immediately after a merge, dispatch from `main`:
+builds, qualifies, and publishes GPU wheels in one workflow. Source changes on
+`main` start it automatically; release-only and documentation changes are
+excluded by `paths-ignore`. A manual dispatch must also select `main`:
 
 ```bash
 gh workflow run marin-gpu-candidate.yaml \
-  --repo marin-community/vllm \
-  --ref main \
-  -f lane=gpu \
-  -f gpu_mode=publish
+  --repo marin-community/vllm --ref main -f lane=gpu
 ```
 
-A source refresh uses the separate `main-next` staging lane. `gpu_mode=stage`
-requires the workflow source to equal the current remote `main-next` tip and
-publishes under `marin-vllm-gpu-staged-candidate-<12-character-sha>`. Staged
-candidates never match scheduled candidate selection. The manifest binds the
-source commit and both wheel digests. Arbitrary branches cannot publish either
-candidate kind. These wheels contain the exact `main-next` code under test.
+The workflow selects `marin-vllm-gpu-<source-UTC-date>-<12-character-sha>` and
+skips the build if that release already exists. Both architecture builds,
+dependency constraints, validation sources, and qualification code come from
+the same workflow commit. A later change to `main` does not change a running
+build.
 
-The `qualify-x86_64` and `qualify-aarch64` modes remain useful for branch-only
-dependency checks. They build one short-lived Actions artifact and publish no
-GitHub release. They do not replace the two-wheel staged candidate used by a
-source refresh.
+The builds upload wheels and metadata to temporary GitHub Actions artifacts.
+No GPU candidate release is published. The metadata records the source SHA,
+upstream base, build ABI, builder image, wheel contents, and SHA-256. Schema 2
+uses the final release tag throughout, including each qualification record's
+`release_tag` and wheel URL.
 
-## GPU validation and release
+The existing qualification runs on the configured Iris hardware:
 
-[`marin-gpu-release.yaml`](../../.github/workflows/marin-gpu-release.yaml) runs
-on a schedule and through `workflow_dispatch`. The optional `candidate_tag`
-input selects an exact published candidate; an empty input selects the newest
-published candidate by GitHub's `published_at` timestamp across release-list
-pages. Drafts are ineligible. Invalid provenance, ABI, or assets fail the run;
-it does not try an older candidate.
+- H100x1 on `cw-rno2a` installs the x86_64 wheel, checks the stable Torch
+  extension and Grug model, validates sparse NCCL weight transfer, allocates
+  through cuMem, runs the Marin delta tests, and serves Qwen/Qwen3-0.6B against
+  the H100 spec.
+- GB200x1 on `cw-us-east-08a` installs the aarch64 wheel, checks the stable
+  Torch extension and Grug model, allocates through cuMem, and serves
+  Qwen/Qwen3-0.6B against the GB200 spec.
 
-The workflow qualifies both wheels on their configured hardware:
+Each Iris job downloads its wheel from the current workflow's Actions artifact
+with a temporary read-only GitHub token. It checks the wheel's SHA-256 before
+installation. The model probe and serving process run in a temporary environment
+outside the checkout, so they import the installed wheel. The source tests use
+a separate tree from the same commit.
 
-- H100x1 on `cw-rno2a` installs the x86_64 wheel, checks `_C` and
-  `GrugMoeForCausalLM`, validates the sparse NCCL trainer and worker contract,
-  allocates through cuMem, runs the Marin delta tests, and serves
-  Qwen/Qwen3-0.6B against the H100 spec.
-- GB200x1 on `cw-us-east-08a` installs the aarch64 wheel, checks `_C` and
-  `GrugMoeForCausalLM`, allocates through cuMem, and serves Qwen/Qwen3-0.6B
-  against the GB200 spec.
+Both qualification jobs must pass before publication. The workflow publishes
+the built wheels once, alongside the manifest and qualification records. It
+checks the recorded hashes and never overwrites a release. Failed qualification
+publishes no GPU release. The temporary artifacts remain available for 14 days;
+rerun the failed jobs in that workflow to retry. There is no separate GPU
+promotion dispatch or reuse of another qualification run.
 
-An absent cuMem extension is recorded as `absent` and fails promotion. Iris
-setup failures and missing validation output also become explicit failed JSON
-records.
-
-The runtime probe and serving process run with the temporary venv outside the
-checkout. The workflow extracts the candidate commit's tests and serving smoke
-into a separate validation-source tree, while the release harness comes from
-the workflow commit. Each validation runner imports and verifies `vllm` from
-the venv before adding that tree to `sys.path` for the `tests` package. It keeps
-its working directory outside the tree as well, so model-inspection
-subprocesses also import the wheel instead of an unbuilt source package.
-
-Both GPU results must pass before the workflow creates
-`marin-vllm-gpu-<UTC-date>-<12-character-sha>`. The final release contains the
-unchanged candidate wheels, their validation records, and a final manifest that
-binds every result to a wheel digest. The workflow never overwrites an existing
-release tag or asset.
-
-For a staged refresh, dispatch the release workflow from trusted `main` with
-`qualification_only=true`. It accepts only the exact current `main-next` source,
-runs the normal H100 and GB200 gates, and retains their artifacts without
-publishing a final release. Here `--ref main` selects the trusted qualification
-harness; it does not change the `main-next` code inside the candidate wheels.
-
-Before source promotion, temporarily pin the staged x86_64 wheel in Marin and
-run `tests/cluster/vllm/test_snowball_backend_parity.py`. Both that Marin
-end-to-end and the fork's H100 and GB200 gates must pass. After an administrator
-promotes the exact source to `main`, dispatch again with the successful
-qualification run ID. The promotion accepts only a successful release-workflow
-run from `main`, then checks that its validation records name the same candidate,
-source commit, and wheel digests. It publishes the same bytes without another
-GPU allocation.
-Reuse checks the successful run's ID, repository, event, workflow path, trusted
-branch, workflow commit, and attempt. It requires the saved candidate manifest
-and both GPU results from that attempt, verifies their current artifact IDs and
-expiry, and records the accepted run provenance in the final manifest. The saved
-candidate must exactly match the published candidate manifest; each GPU result
-must bind its source, candidate tag, and architecture's wheel URL and SHA-256.
-
-The candidate snapshot and GPU results have 14-day retention. Missing, expired,
-duplicate, or earlier-attempt evidence fails publication. Start a new
-`qualification_only=true` run for the same immutable candidate and repeat any
-consumer gate whose source or bytes changed. Do not bypass qualification or
-rebuild under the old candidate tag. Before source promotion the candidate must
-still be the exact `main-next` tip; after promotion it must be on `main`.
-
-Land the candidate workflow's `stage` mode, the release workflow's qualification
-and reuse modes, and Marin's `--stage-gpu-candidate` updater before this sequence.
-The serving owner must carry those workflows and release helpers onto
-the proposed source before freezing its SHA or building wheels, so the exact
-source swap preserves the trusted publication harness. The serving owner owns
-both wheel builds, accelerator qualification and Snowball parity; an admin owns
-the protected source swap. No workflow tests replace those live gates.
-
-```bash
-gh workflow run marin-gpu-candidate.yaml \
-  --repo marin-community/vllm \
-  --ref main-next \
-  -f lane=gpu \
-  -f gpu_mode=stage
-
-gh workflow run marin-gpu-release.yaml \
-  --repo marin-community/vllm \
-  --ref main \
-  -f lane=gpu \
-  -f candidate_tag=marin-vllm-gpu-staged-candidate-0123456789ab \
-  -f qualification_only=true
-
-# After the lease-checked main-next -> main promotion:
-gh workflow run marin-gpu-release.yaml \
-  --repo marin-community/vllm \
-  --ref main \
-  -f lane=gpu \
-  -f candidate_tag=marin-vllm-gpu-staged-candidate-0123456789ab \
-  -f qualification_run_id=<successful-qualification-run-id>
-```
-
-Dispatch a specific candidate with:
-
-```bash
-gh workflow run marin-gpu-release.yaml \
-  --repo marin-community/vllm \
-  --ref main \
-  -f lane=gpu \
-  -f candidate_tag=marin-vllm-gpu-candidate-0123456789ab
-```
-
-Check the published tag and final assets independently. [GitHub runs](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows)
-the workflow file on the selected ref, so an older branch can still run its old
-publication logic. Enforcing this against repository writers requires a publisher
-outside branch-controlled workflow code.
+Download the published manifest in a Marin worktree, run
+`config/update-external.py --promote-gpu-release <manifest>`, and run Marin's
+Snowball parity test. Open a Marin PR with the resulting exact wheel pins and
+test evidence. Merging that PR approves adoption. See Marin's
+[GPU refresh guide](https://github.com/marin-community/marin/blob/main/.agents/skills/refresh-fork/docs/vllm.md).
 
 ## TPU wheel pairs
 
@@ -253,7 +135,7 @@ and artifact against the candidate, and reuses the same candidate bytes without
 allocating another TPU.
 
 The GPU and TPU lanes are dispatched separately. Advancing tpu-inference does
-not rebuild a GPU wheel, and promoting a GPU candidate does not rebuild the TPU
+not rebuild a GPU wheel, and publishing a GPU release does not rebuild the TPU
 pair.
 
 ```bash
