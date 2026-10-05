@@ -22,7 +22,7 @@ def local_objects(directory: Path) -> dict[str, int]:
 def remote_objects(bucket: str, prefix: str) -> dict[str, int]:
     result = subprocess.run(
         [
-            "gcloud", "storage", "objects", "list", f"gs://{bucket}",
+            "gcloud", "storage", "objects", "list", f"gs://{bucket}/{prefix}**",
             "--format=json(name,size)", "--quiet",
         ],
         check=True, capture_output=True, text=True, timeout=120,
