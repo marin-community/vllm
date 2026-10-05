@@ -20,20 +20,22 @@ def digest(path: Path) -> str:
 
 def compile_case(
     case: str, command: list[str], expected: str, *,
-    environment: dict[str, str], compiled: Path,
+    environment: dict[str, str], compiled: Path, output_arguments: list[str],
 ) -> dict:
     run(["sccache", "--zero-stats"], environment)
     started = time.monotonic()
-    run(["sccache", *command, "-o", str(compiled)], environment)
+    run(["sccache", *command, *output_arguments], environment)
     stats = json.loads(subprocess.check_output(
         ["sccache", "--show-stats", "--stats-format=json"], env=environment,
     ))["stats"]
     hits = sum(stats["cache_hits"]["counts"].values())
     misses = sum(stats["cache_misses"]["counts"].values())
-    assert (hits, misses) == ((1, 0) if expected == "hit" else (0, 1)), stats
+    assert (hits, misses) == ((1, 0) if expected == "hit" else (0, 1)), (
+        case, command, stats,
+    )
     cached = digest(compiled)
     # Compile independently at the same output path and compare bytes.
-    run([*command, "-o", str(compiled)], environment)
+    run([*command, *output_arguments], environment)
     independent = digest(compiled)
     assert cached == independent, (case, cached, independent)
     return {
@@ -62,7 +64,10 @@ def probe(expect: str, output: Path) -> None:
         # Keep intermediate names stable for this byte-parity fixture. The
         # production recipe's compiler flags remain unchanged.
         "cuda": ["nvcc", "--objdir-as-tempdir", "-O2", "-c", str(cuda)],
-        "rust": ["rustc", "--crate-name=cache_probe", "--crate-type=rlib", str(rust)],
+        "rust": [
+            "rustc", "--crate-name=cache_probe", "--crate-type=rlib",
+            "--emit=dep-info,link", str(rust),
+        ],
     }
     records = []
     for language, base in compilers.items():
@@ -73,8 +78,13 @@ def probe(expect: str, output: Path) -> None:
         )
         suffix = "rlib" if language == "rust" else "o"
         compiled = Path(f"objects/{language}.{suffix}")
+        output_arguments = ["-o", str(compiled)]
+        if language == "rust":
+            compiled = Path("objects/libcache_probe.rlib")
+            output_arguments = ["--out-dir=objects"]
         compile_one = partial(
             compile_case, environment=environment, compiled=compiled,
+            output_arguments=output_arguments,
         )
         cases = [compile_one("fresh-builder", base, expect)]
         cases.append(compile_one("repeat", base, "hit"))
