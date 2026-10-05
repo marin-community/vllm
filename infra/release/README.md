@@ -34,8 +34,10 @@ The generated file records the PyPI, CUDA 13.2, CPU Torch, and FlashInfer
 indexes. uv selects compatible wheels for the builder architecture from those
 indexes.
 
-Keep `fsspec==2026.6.0` aligned with the trainer's dataset-compatible runtime.
-Datasets 5.0.1 caps that dependency at 2026.6.0; vLLM allows the same version.
+The serving-only closure uses `fsspec==2026.6.0`, within Datasets 5.0.1's cap.
+The combined trainer profile separately selects Fsspec/S3fs 2026.4.0 and GCSfs
+2026.6.0. Agreement on the GPU core does not make these I/O closures identical;
+record the actual installed profile for each qualification or comparison.
 
 Use uv 0.11.21 and regenerate the file from the repository root with:
 
@@ -72,6 +74,15 @@ suffixes and executable layouts after their source timestamps matched. These
 settings apply to the frontend through its Cargo environment. The Python
 parser extension uses the upstream release profile. Verify complete wheel
 archives from independent builds before claiming reproducibility.
+
+CUDA compilation uses NVCC's `--objdir-as-tempdir` option. Uncached builds
+otherwise embed process-specific `tmpxft` filenames in ELF symbols, including
+FlashAttention's fetched targets. The directory-level CMake option reaches
+those targets even though they redefine the extension helper. Object paths
+remain separate for each target and source, and NVCC removes its intermediate
+files after compilation. A repeated local NVCC 13.2.86 compile with CCCL headers
+produced identical object bytes with this option; complete native wheel
+reproduction is still required. See the [NVCC option documentation](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-compiler-driver-nvcc/index.html#objdir-as-tempdir-objtemp).
 
 The toolkit extras pin the compiler and headers used by
 runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the

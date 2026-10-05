@@ -189,6 +189,12 @@ endif()
 if (NOT HIP_FOUND AND NOT PYTORCH_FOUND_HIP AND CUDA_FOUND)
   set(VLLM_GPU_LANG "CUDA")
 
+  # Keep NVCC's embedded intermediate filenames stable across compiler processes.
+  # A directory option also reaches FlashAttention's separately defined targets.
+  if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--objdir-as-tempdir>)
+  endif()
+
   if (NOT TORCH_NIGHTLY_BUILD AND NOT Torch_VERSION VERSION_EQUAL ${TORCH_SUPPORTED_VERSION_CUDA})
     message(WARNING "Pytorch version ${TORCH_SUPPORTED_VERSION_CUDA} "
       "expected for CUDA build, saw ${Torch_VERSION} instead.")
