@@ -293,8 +293,9 @@ jobs:
       - name: Export compiler objects from the builder
         continue-on-error: true
         run: |
-          docker buildx build --no-cache \
+          docker buildx build \
             --build-arg CACHE_EXPORT_IMAGE="${{ matrix.build_base_image }}" \
+            --build-arg CACHE_EXPORT_NONCE="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --output type=local,dest=compile-cache \
             -f infra/release/export-compile-cache.Dockerfile infra/release
 
@@ -410,7 +411,7 @@ jobs:
       - name: Exercise compiler correctness and invalidation
         run: |
           set -o pipefail
-          docker buildx build --no-cache \
+          docker buildx build \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
             --build-arg PROBE_EXPECT="${{ inputs.probe_expect }}" \
             --output type=local,dest=artifacts \
@@ -418,8 +419,9 @@ jobs:
             --progress plain 2>&1 | tee artifacts/probe.log
       - name: Export probe objects
         run: |
-          docker buildx build --no-cache \
+          docker buildx build \
             --build-arg CACHE_EXPORT_IMAGE="${{ matrix.build_base_image }}" \
+            --build-arg CACHE_EXPORT_NONCE="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --output type=local,dest=compile-cache \
             -f infra/release/export-compile-cache.Dockerfile infra/release
           test -n "$(find compile-cache/cuda -type f -print -quit)"

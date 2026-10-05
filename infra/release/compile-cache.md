@@ -26,9 +26,10 @@ and create permissions. It grants no replacement or deletion permission.
 The runner obtains a short-lived federated token immediately before each
 transfer. The token exists only in those steps' environment. Auth creates no
 credential file, and BuildKit receives no cloud credentials. A cache failure is
-reported and normal compilation continues. Cache export uses `--no-cache` so
-it reads current mounts rather than an earlier exported layer. The legacy main
-GitHub CUDA snapshot is read as a bootstrap; its contents and retention are
+reported and normal compilation continues. Cache export changes a nonce argument
+on each run so it reads current mounts rather than an earlier exported layer.
+Do not use `--no-cache`: BuildKit clears the cache mounts when it is set. The
+legacy main GitHub CUDA snapshot is read as a bootstrap; its contents and retention are
 unchanged.
 
 `cache-restore.json` and `cache-save.json` report per-stage elapsed seconds,
