@@ -329,33 +329,60 @@ ENV CARGO_BUILD_JOBS=4
 # BuildKit can run this stage in parallel with csrc-build. Keep Rust on a
 # separate local sccache daemon while sharing the same remote cache backend.
 ENV SCCACHE_SERVER_PORT=4227
+ENV SCCACHE_DIR=/root/.cache/sccache-rust
 
 # Build with a stable version so this target snapshot is keyed only by Rust
 # inputs. The child stage below relinks the crates that embed the exact version.
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache-rust,sharing=locked \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
-    if [ "$USE_SCCACHE" = "1" ]; then \
+    BUILD_STARTED=$(date +%s) \
+    && if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -z "${SCCACHE_BUCKET}" ]; then \
             unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
         elif [ -n "${SCCACHE_ENDPOINT}" ]; then \
             export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; \
         fi; \
         export RUSTC_WRAPPER=sccache; \
-        sccache --show-stats; \
+        sccache --zero-stats; \
     fi \
     && SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+docker.cache" bash build_rust.sh \
     && if [ "$USE_SCCACHE" = "1" ]; then \
-        sccache --show-stats; \
-    fi
+        sccache --show-stats > /tmp/rust-stable-cache.txt; \
+        sccache --stop-server; \
+    fi \
+    && echo "compile-stage rust-stable seconds=$(( $(date +%s) - BUILD_STARTED ))" > /tmp/rust-stable-time.txt
+
+RUN cat /tmp/rust-stable-time.txt \
+    && if [ "$USE_SCCACHE" = "1" ]; then cat /tmp/rust-stable-cache.txt; fi
 
 # Relink with the exact Git-derived package version.
 FROM rust-build-cache AS rust-build
 
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache-rust,sharing=locked \
     --mount=type=bind,source=.git,target=.git \
-    SETUPTOOLS_SCM_PRETEND_METADATA="{dirty=false}" bash build_rust.sh
+    BUILD_STARTED=$(date +%s) \
+    && if [ "$USE_SCCACHE" = "1" ]; then \
+        if [ -z "${SCCACHE_BUCKET}" ]; then \
+            unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
+        elif [ -n "${SCCACHE_ENDPOINT}" ]; then \
+            export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; \
+        fi; \
+        export RUSTC_WRAPPER=sccache; \
+        sccache --zero-stats; \
+    fi \
+    && SETUPTOOLS_SCM_PRETEND_METADATA="{dirty=false}" bash build_rust.sh \
+    && if [ "$USE_SCCACHE" = "1" ]; then \
+        sccache --show-stats > /tmp/rust-version-cache.txt; \
+        sccache --stop-server; \
+    fi \
+    && echo "compile-stage rust-version seconds=$(( $(date +%s) - BUILD_STARTED ))" > /tmp/rust-version-time.txt
+
+RUN cat /tmp/rust-version-time.txt \
+    && if [ "$USE_SCCACHE" = "1" ]; then cat /tmp/rust-version-cache.txt; fi
 #################### RUST BUILD IMAGE ####################
 
 #################### CSRC BUILD IMAGE ####################
@@ -447,7 +474,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
-    if [ "$USE_SCCACHE" = "1" ]; then \
+    BUILD_STARTED=$(date +%s) \
+    && if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -z "${SCCACHE_BUCKET}" ]; then \
             unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
         elif [ -n "${SCCACHE_ENDPOINT}" ]; then \
@@ -464,12 +492,15 @@ RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
         && sccache --zero-stats \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
         && sccache --show-stats > /tmp/sccache-stats.txt \
+        && sccache --stop-server \
         && du -sh /root/.cache/sccache > /tmp/sccache-size.txt; \
-    fi
+    fi \
+    && echo "compile-stage cuda seconds=$(( $(date +%s) - BUILD_STARTED ))" > /tmp/cuda-time.txt
 
 # Keep the summary outside the verbose compile step so BuildKit's per-step log
 # limit cannot clip the cache evidence.
 RUN if [ "$USE_SCCACHE" = "1" ]; then \
+        cat /tmp/cuda-time.txt; \
         echo "Final sccache statistics:"; \
         cat /tmp/sccache-stats.txt; \
         echo "Final sccache size:"; \
