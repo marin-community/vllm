@@ -359,12 +359,21 @@ jobs:
             --output "artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json"
           mv "${WHEELS[0]}" artifacts/
 
+      - name: Install the inspected qualification wheel
+        if: startsWith(inputs.gpu_mode, 'qualify-')
+        run: |
+          set -o pipefail
+          uv venv --python 3.12 wheel-install
+          uv pip install --python wheel-install/bin/python --no-deps artifacts/*.whl
+          uv pip show --python wheel-install/bin/python marin-vllm | tee artifacts/install.txt
+
       - uses: actions/upload-artifact@v4
         with:
           name: marin-vllm-gpu-candidate-${{ matrix.architecture }}
           path: |
             artifacts/*.whl
             artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json
+            artifacts/install.txt
           if-no-files-found: error
           retention-days: 14
 
