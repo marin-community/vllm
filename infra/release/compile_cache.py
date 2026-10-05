@@ -25,7 +25,7 @@ def remote_objects(bucket: str, prefix: str) -> dict[str, int]:
             "gcloud", "storage", "objects", "list", f"gs://{bucket}/{prefix}**",
             "--format=json(name,size)", "--quiet",
         ],
-        check=True, capture_output=True, text=True, timeout=120,
+        check=True, stdout=subprocess.PIPE, text=True, timeout=120,
     )
     return {
         item["name"][len(prefix):]: int(item["size"])
@@ -65,14 +65,17 @@ def transfer(
                     (cloud, str(local)) if operation == "restore"
                     else (str(local), cloud)
                 )
-                subprocess.run(
-                    [
-                        "gcloud", "storage", "rsync", source, destination,
-                        "--recursive", "--no-clobber", "--quiet",
-                    ],
-                    check=True, timeout=TRANSFER_TIMEOUT,
-                    stdout=subprocess.DEVNULL,
-                )
+                # An empty object prefix is a normal cold cache. gcloud rsync
+                # treats a nonexistent source prefix as an error.
+                if operation != "restore" or remote:
+                    subprocess.run(
+                        [
+                            "gcloud", "storage", "rsync", source, destination,
+                            "--recursive", "--no-clobber", "--quiet",
+                        ],
+                        check=True, timeout=TRANSFER_TIMEOUT,
+                        stdout=subprocess.DEVNULL,
+                    )
                 after = local_objects(local)
                 # Restore counts files actually added locally. Save counts the
                 # planned new payload; concurrent identical writers may win a
