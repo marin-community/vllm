@@ -74,6 +74,16 @@ Mimalloc's verbose build banner uses those C macros. A local sccache 0.8.1 probe
 also emitted wall-clock C macros despite a frozen epoch in the build environment.
 The header makes expansion explicit while preserving existing C/C++ flags.
 
+Rust is pinned to 1.99.0, released before the dependency cutoff, with LLVM
+23.1.1. Independent Rust 1.95.0/LLVM 22.1.2 builds differed in sixteen SIMD
+F32 image-resize functions despite identical timestamps and symbol tables.
+A small caller reproduced those differences in three uncached builds. The
+same caller built with 1.99.0 produced three identical binaries and preserved
+all 480 resized values byte for byte. Its LLVM source includes the ordered
+loop-vectorizer address-definition iteration from the
+[upstream nondeterminism fix](https://github.com/llvm/llvm-project/pull/200833).
+Complete wheel reproduction remains the release gate.
+
 The frontend executable's release build uses
 `CARGO_PROFILE_RELEASE_LTO=off` and `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`.
 Identical-source ThinLTO builds produced different promoted LLVM symbol
