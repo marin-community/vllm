@@ -65,7 +65,7 @@ on:
         type: string
 
 concurrency:
-  group: marin-vllm-${{ inputs.lane || 'gpu' }}-candidate-${{ github.sha }}
+  group: marin-vllm-${{ inputs.lane || 'gpu' }}-candidate-${{ inputs.gpu_mode || 'publish' }}-${{ github.sha }}
   cancel-in-progress: false
 
 permissions:
