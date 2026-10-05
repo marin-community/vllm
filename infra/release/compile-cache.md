@@ -88,10 +88,11 @@ To stop reuse without changing ABI, select a new `namespace` in the config.
 Only the cache owner should delete old task data. A new namespace forces a cold
 build and does not repair an invalid compiler/toolchain input.
 
-## Serving refresh handoff
+## October 5 serving refresh handoff
 
-This change starts from main `39e62869693c46402b1a95fde4fc55ca1aab9ae1`.
-The inspected serving recipe is `172b6f9773734e726d4004d84fa96b55746ef9d5`.
+The cache work uses main `39e62869693c46402b1a95fde4fc55ca1aab9ae1` as its
+build baseline. The serving recipe inspected on October 5 is
+`172b6f9773734e726d4004d84fa96b55746ef9d5`.
 Apply the workflow's GCS transfer/auth and explicit mount export, the config and
 `compile_cache.py`, and the Dockerfile's Rust compiler mount/wrapper and timing
 blocks. The probes and this guide are optional operating tools; the existing

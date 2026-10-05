@@ -43,6 +43,8 @@ def transfer(
     Records payload bytes and elapsed transport time. A failed transfer raises
     after recording its status; workflow cache steps are explicitly best effort.
     """
+    if operation not in ("restore", "save"):
+        raise ValueError(f"Unsupported cache operation: {operation}")
     records = []
     try:
         for stage in STAGES:

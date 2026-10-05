@@ -79,12 +79,12 @@ def probe(expect: str, variant: str, output: Path) -> None:
             "/root/.cache/sccache-rust" if language == "rust"
             else "/root/.cache/sccache"
         )
-        suffix = "rlib" if language == "rust" else "o"
-        compiled = Path(f"objects/{language}.{suffix}")
-        output_arguments = ["-o", str(compiled)]
         if language == "rust":
             compiled = Path("objects/libcache_probe.rlib")
             output_arguments = ["--out-dir=objects"]
+        else:
+            compiled = Path(f"objects/{language}.o")
+            output_arguments = ["-o", str(compiled)]
         compile_one = partial(
             compile_case, environment=environment, compiled=compiled,
             output_arguments=output_arguments,

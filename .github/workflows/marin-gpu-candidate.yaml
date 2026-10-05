@@ -427,8 +427,10 @@ jobs:
       - name: Exercise compiler correctness and invalidation
         run: |
           set -o pipefail
+          RUST_TOOLCHAIN=$(.venv/bin/python -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           docker buildx build \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
+            --build-arg RUST_TOOLCHAIN="$RUST_TOOLCHAIN" \
             --build-arg PROBE_EXPECT="${{ inputs.probe_expect }}" \
             --build-arg PROBE_VARIANT="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --output type=local,dest=artifacts \
