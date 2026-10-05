@@ -1,6 +1,5 @@
 {
   "bucket": "yonromai-vllm-compile-cache",
   "workload_identity_provider": "projects/588871761953/locations/global/workloadIdentityPools/vllm-cache-github/providers/candidate",
-  "namespace": "v1",
-  "retention_days": 14
+  "namespace": "v1"
 }

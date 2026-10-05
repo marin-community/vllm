@@ -16,6 +16,7 @@ on:
       - ".github/workflows/marin-gpu-release.yaml"
       - "infra/nightly/specs/qwen3-0.6b-tpu.json"
       - "infra/release/README.md"
+      - "infra/release/compile-cache.md"
       - "infra/release/gpu_validation.py"
       - "infra/release/tpu_config.json"
       - "infra/release/tpu_release.py"

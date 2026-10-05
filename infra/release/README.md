@@ -87,6 +87,11 @@ fragment as a 14-day workflow artifact. Record both wheel hashes before using
 them in a consumer qualification. These branch builds cannot enter the GPU
 release lane; publication still requires a source commit on `main`.
 
+The [compiler cache guide](compile-cache.md) covers shared CUDA/Rust objects,
+cache evidence, eviction and recovery. Qualifications also record an isolated
+wheel installation without dependencies; accelerator runtime checks stay in
+the GPU validation lane below.
+
 GPU publication runs must use the repository's default branch, which this fork
 expects to be `main`. A candidate from a prior `main` commit remains valid after
 `main` advances. To build immediately after a merge, dispatch from `main`:
