@@ -1050,6 +1050,32 @@ def _causal_depthwise_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("metadata", [None, {}, {"attention.layer": object()}])
+def test_hero_short_conv_profiles_without_layer_metadata(metadata):
+    module = GrugMoeShortConv(
+        dim=2,
+        kernel_size=4,
+        params_dtype=torch.float32,
+        cache_config=None,
+        prefix="hero.sconv.profile",
+    ).cuda()
+    module.weight.data.copy_(
+        torch.tensor(
+            [[2.0, -3.0], [5.0, 7.0], [11.0, 13.0], [17.0, 19.0]], device="cuda"
+        )
+    )
+    history = torch.arange(12, dtype=torch.float32, device="cuda").reshape(2, 3, 2)
+    module.kv_cache = (history.clone(),)
+    inputs = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device="cuda")
+    with set_forward_context(metadata, get_current_vllm_config(), num_tokens=2):
+        actual = module(inputs)
+    torch.testing.assert_close(
+        actual, torch.tensor([[2.0, -6.0], [6.0, -12.0]], device="cuda"), rtol=0, atol=0
+    )
+    torch.testing.assert_close(module.kv_cache[0], history, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
     prefix = "hero.sconv.history"
     module = GrugMoeShortConv(
