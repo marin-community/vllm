@@ -72,13 +72,15 @@ build frequency from actual usage; retention alone does not cap traffic cost.
 
 Dispatch the existing candidate workflow with `gpu_mode=probe-x86_64` or
 `probe-aarch64` and `probe_expect=miss` for an empty probe namespace. After the
-first success, dispatch from a second trusted branch with `probe_expect=hit`.
+first success, dispatch from a second trusted branch with `probe_expect=hit`
+and the same `probe_namespace`. Choose a new namespace for a new cold/warm pair.
 The probe uses the configured native builder, NVCC, Rust 1.95 and sccache 0.8.1.
 Its NVCC fixture uses stable object intermediates for byte comparison; this
 does not change production flags or establish production reproducibility.
 It compares cached objects with independent compiler output and checks misses
 after source/header, compiler and flag changes, then hits after reverting.
-Probe data lives separately under `probe-01a10d2b/` and expires with the bucket.
+Each run uses fresh input variants for its expected misses, so further warm
+probes remain valid. Probe data lives in its chosen namespace and expires with the bucket.
 The probe stops on backend failure; production wheel builds continue.
 
 For manual inspection, use `gcloud storage du --summarize` on the owned bucket.

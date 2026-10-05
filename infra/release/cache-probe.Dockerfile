@@ -13,9 +13,10 @@ WORKDIR /probe
 RUN /opt/python/cp312-cp312/bin/python3.12 -m venv .venv
 COPY compiler_probe.py compiler_probe.py
 ARG PROBE_EXPECT=miss
+ARG PROBE_VARIANT
 RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=cache,target=/root/.cache/sccache-rust,sharing=locked \
-    .venv/bin/python compiler_probe.py --expect "$PROBE_EXPECT" --output /results/probe.json
+    .venv/bin/python compiler_probe.py --expect "$PROBE_EXPECT" --variant "$PROBE_VARIANT" --output /results/probe.json
 
 FROM scratch
 COPY --from=probe /results/ /

@@ -45,7 +45,10 @@ def compile_case(
     }
 
 
-def probe(expect: str, output: Path) -> None:
+def probe(expect: str, variant: str, output: Path) -> None:
+    # Stable base inputs prove restore hits. Each run's mutations are new so
+    # repeated warm probes can continue proving selective misses.
+    changed_value = 8 + int.from_bytes(hashlib.sha256(variant.encode()).digest()[:3])
     source = Path("source")
     source.mkdir()
     Path("objects").mkdir()
@@ -89,30 +92,30 @@ def probe(expect: str, output: Path) -> None:
         cases = [compile_one("fresh-builder", base, expect)]
         cases.append(compile_one("repeat", base, "hit"))
         if language in ("cpp", "cuda"):
-            header.write_text(f"#define VALUE {8 if expect == 'miss' else 9}\n")
+            header.write_text(f"#define VALUE {changed_value}\n")
             cases.append(compile_one("header-change", base, "miss"))
             header.write_text("#define VALUE 7\n")
             native_source = cpp if language == "cpp" else cuda
             original = native_source.read_text()
-            extra_value = 8 if expect == "miss" else 9
             native_source.write_text(
-                original + f"int extra_value() {{ return {extra_value}; }}\n"
+                original + f"int extra_value() {{ return {changed_value}; }}\n"
             )
             cases.append(compile_one("source-change", base, "miss"))
             native_source.write_text(original)
         else:
-            value = 8 if expect == "miss" else 9
-            rust.write_text(f"pub fn value() -> u32 {{ {value} }}\n")
+            rust.write_text(f"pub fn value() -> u32 {{ {changed_value} }}\n")
             cases.append(compile_one("source-change", base, "miss"))
             rust.write_text("pub fn value() -> u32 { 7 }\n")
-        changed_flag = [*base, "-g", "-O3"] if expect == "hit" else [*base, "-g"]
+        changed_flag = [*base, "-g", f"-DPROBE_VARIANT={changed_value}"]
         if language == "rust":
-            changed_flag = [*base, "-C", f"opt-level={2 if expect == 'miss' else 3}"]
+            changed_flag = [
+                *base, "-C", "opt-level=2", "-C", f"metadata=probe_{changed_value}",
+            ]
         cases.append(compile_one("flag-change", changed_flag, "miss"))
         if language == "cpp":
-            changed_compiler = ["clang++", *base[1:]]
-            if expect == "hit":
-                changed_compiler.append("-O3")
+            changed_compiler = [
+                "clang++", *base[1:], f"-DPROBE_VARIANT={changed_value}",
+            ]
             cases.append(compile_one("compiler-change", changed_compiler, "miss"))
         cases.append(compile_one("return-to-original", base, "hit"))
         records.extend({"language": language, **case} for case in cases)
@@ -120,6 +123,7 @@ def probe(expect: str, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps({
         "architecture": os.uname().machine,
+        "variant": variant,
         "toolchains": {name: subprocess.check_output(
             [command[0], "--version"], text=True,
         ) for name, command in compilers.items()},
@@ -130,9 +134,10 @@ def probe(expect: str, output: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expect", choices=("hit", "miss"), required=True)
+    parser.add_argument("--variant", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    probe(args.expect, args.output)
+    probe(args.expect, args.variant, args.output)
 
 
 if __name__ == "__main__":

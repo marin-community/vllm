@@ -53,6 +53,10 @@ on:
         default: miss
         type: choice
         options: [miss, hit]
+      probe_namespace:
+        description: "Separate cache namespace for a cold/warm compiler probe pair"
+        default: compiler-probe
+        type: string
       tpu_inference_commit:
         description: "Exact tpu-inference package source for the TPU lane"
         required: true
@@ -368,6 +372,8 @@ jobs:
     name: Probe ${{ matrix.architecture }} compiler cache
     needs: prepare
     if: startsWith(inputs.gpu_mode, 'probe-')
+    env:
+      PROBE_NAMESPACE: ${{ inputs.probe_namespace }}
     permissions:
       contents: read
       id-token: write
@@ -397,7 +403,7 @@ jobs:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-auth.outputs.auth_token }}
         run: |
           .venv/bin/python infra/release/compile_cache.py restore \
-            --config infra/release/compile-cache.json --namespace probe-01a10d2b \
+            --config infra/release/compile-cache.json --namespace "$PROBE_NAMESPACE" \
             --architecture "${{ matrix.architecture }}" \
             --directory compile-cache --output artifacts/cache-restore.json
       - uses: reproducible-containers/buildkit-cache-dance@v3.1.2
@@ -414,6 +420,7 @@ jobs:
           docker buildx build \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
             --build-arg PROBE_EXPECT="${{ inputs.probe_expect }}" \
+            --build-arg PROBE_VARIANT="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --output type=local,dest=artifacts \
             -f infra/release/cache-probe.Dockerfile infra/release \
             --progress plain 2>&1 | tee artifacts/probe.log
@@ -437,7 +444,7 @@ jobs:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-save-auth.outputs.auth_token }}
         run: |
           .venv/bin/python infra/release/compile_cache.py save \
-            --config infra/release/compile-cache.json --namespace probe-01a10d2b \
+            --config infra/release/compile-cache.json --namespace "$PROBE_NAMESPACE" \
             --architecture "${{ matrix.architecture }}" \
             --directory compile-cache --output artifacts/cache-save.json
       - uses: actions/upload-artifact@v4
