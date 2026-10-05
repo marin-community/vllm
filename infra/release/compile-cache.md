@@ -134,7 +134,7 @@ Port these files onto the serving recipe:
 | File | Changes to apply |
 | --- | --- |
 | `.github/workflows/marin-gpu-candidate.yaml` | GCS transfer/auth, explicit mount injection/export, evidence upload and qualification install |
-| `Dockerfile` | Rust cache mounts/wrappers and per-stage timing/statistics |
+| `docker/Dockerfile` | Rust cache mounts/wrappers and per-stage timing/statistics |
 | `infra/release/compile-cache.json`, `compile_cache.py`, `export-compile-cache.Dockerfile` | Shared-storage configuration, runner transfer and mount exporter |
 
 Optional operating tools are `infra/release/cache-probe.Dockerfile`,
