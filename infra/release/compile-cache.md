@@ -29,8 +29,8 @@ credential file, and BuildKit receives no cloud credentials. A cache failure is
 reported and normal compilation continues. Cache export changes a nonce argument
 on each run so it reads current mounts rather than an earlier exported layer.
 Do not use `--no-cache`: BuildKit clears the cache mounts when it is set. The
-legacy main GitHub CUDA snapshot is read as a bootstrap; its contents and retention are
-unchanged.
+legacy main GitHub CUDA snapshot is read as a bootstrap; its contents and
+retention are unchanged.
 
 `cache-restore.json` and `cache-save.json` report per-stage elapsed seconds,
 object counts and payload bytes. Restore bytes count objects actually added
@@ -55,18 +55,49 @@ another branch's variants. Bulk transfers keep credentials outside the builder
 and avoid a compiler daemon holding an expired token during a long build.
 Direct sccache GCS access would transfer only requested objects but requires
 credential refresh throughout compilation. Selective build-layer caching could
-skip unchanged Rust stages, but transporting the dependency/toolchain layers is
-much larger than compiler objects. Upstream uses warm builders and ECR caches;
+also skip dependency setup: the first ARM qualification spent 46m 26s preparing
+195 Python packages, including source builds of TileLang and z3-solver. Those
+layers include the dependency environment rather than just compiler objects.
+This cache does not persist that environment. Upstream uses warm builders and ECR caches;
 this fork uses disposable hosted runners. See
 [upstream's builder](https://github.com/vllm-project/vllm/blob/main/.buildkite/image_build/image_build.sh).
 
-Use the measured cache volume and restored bytes to budget at the current
-[GCS prices](https://cloud.google.com/storage/pricing): roughly $0.02 per
-GiB-month for Standard storage in us-central1, plus request and network charges.
-For example, 5 GiB retained and 50 monthly 1 GiB downloads at $0.12/GiB cost
-about $6.10/month before requests. GitHub runner placement can change transfer
-pricing. This is a planning example, not measured workload consumption. Set
-build frequency from actual usage; retention alone does not cap traffic cost.
+The two seeded architecture collections total 1.20 GiB and 6,703 objects.
+They uploaded in 31.875s on x86 and 20.638s on ARM. At current
+[GCS prices](https://cloud.google.com/storage/pricing), baseline storage costs
+about $0.024/month. Fifty architecture builds/month, equally split and each
+downloading its full ~0.60 GiB collection, would cost about $3.60 in network
+and $0.067 in reads assuming one GET/object. Seeding costs about $0.034 in writes;
+list calls, retries, reseeding and new variants add requests. Rates used are
+$0.02/GiB-month, $0.12/GiB outbound, $0.005/1,000 Class A and $0.0004/1,000 Class B.
+These estimates precede shared free allowances and are not a billing measurement.
+Eligible us-central1 usage can share monthly free quotas of 5 GB-month storage,
+5,000 Class A, 50,000 Class B and 100 GB North America transfer.
+
+Track actual restored bytes and new-object growth. Ten complete incompatible
+collections would retain about 12 GiB before eviction and multiply bulk-download
+costs by ten. Normal source changes preserve compatible objects; no fixed growth
+rate is assumed. Age retention controls storage duration, not traffic cost.
+This public repository's standard runners have
+[no compute-minute charge](https://docs.github.com/en/billing/concepts/product-billing/github-actions);
+build savings reduce waiting and CPU work rather than a runner bill.
+
+## Qualification evidence
+
+The first full qualifiers used source `bd65b735982078ffff42619607bcaf6668863547`,
+the pinned images in `config.json`, Python 3.12, Torch 2.13.0+cu132, GCC 13.3.1,
+NVCC 13.2.78, Rust 1.95.0 and sccache 0.8.1. Build/export time excludes queue
+and transport. Stage times overlap; H/M denotes compiler hits/misses.
+
+| Architecture | Build/export | Rust stable (H/M) | Rust exact version (H/M) | CUDA (H/M) |
+| --- | --- | --- | --- | --- |
+| [x86_64](https://github.com/marin-community/vllm/actions/runs/37358780056) | 30m 02s | 15m 11s (0/1697) | 5m 09s (0/3) | 22m 54s (416/0) |
+| [aarch64](https://github.com/marin-community/vllm/actions/runs/37358607870) | 67m 07s | 11m 26s (0/1708) | 3m 08s (0/3) | 15m 08s (419/0) |
+
+Both wheels passed metadata/content inspection and isolated installation without
+dependencies. All 16 x86 and 17 ARM packaged native libraries have the expected
+ELF architecture. These CPU checks do not perform GPU runtime qualification.
+Warm qualification measurements remain pending; the first pair does not establish savings.
 
 ## Probes and recovery
 
@@ -80,7 +111,8 @@ does not change production flags or establish production reproducibility.
 It compares cached objects with independent compiler output and checks misses
 after source/header, compiler and flag changes, then hits after reverting.
 Each run uses fresh input variants for its expected misses, so further warm
-probes remain valid. Probe data lives in its chosen namespace and expires with the bucket.
+probes remain valid. Probe data lives in its chosen namespace and expires with
+the bucket.
 The probe stops on backend failure; production wheel builds continue.
 
 For manual inspection, use `gcloud storage du --summarize` on the owned bucket.
