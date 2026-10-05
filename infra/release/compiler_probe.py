@@ -59,7 +59,9 @@ def probe(expect: str, output: Path) -> None:
     rust.write_text("pub fn value() -> u32 { 7 }\n")
     compilers = {
         "cpp": ["g++", "-O2", "-c", str(cpp)],
-        "cuda": ["nvcc", "-O2", "-c", str(cuda)],
+        # Keep intermediate names stable for this byte-parity fixture. The
+        # production recipe's compiler flags remain unchanged.
+        "cuda": ["nvcc", "--objdir-as-tempdir", "-O2", "-c", str(cuda)],
         "rust": ["rustc", "--crate-name=cache_probe", "--crate-type=rlib", str(rust)],
     }
     records = []

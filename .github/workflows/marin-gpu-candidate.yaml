@@ -266,6 +266,7 @@ jobs:
 
       - name: Build and export the CUDA 13.2 wheel
         run: |
+          set -o pipefail
           mkdir -p artifacts
           BUILD_STARTED=$(date +%s)
           # Credentials stay on the runner. BuildKit sees local compiler objects.
@@ -408,6 +409,7 @@ jobs:
             }
       - name: Exercise compiler correctness and invalidation
         run: |
+          set -o pipefail
           docker buildx build --no-cache \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
             --build-arg PROBE_EXPECT="${{ inputs.probe_expect }}" \

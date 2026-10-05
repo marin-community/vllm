@@ -73,6 +73,8 @@ Dispatch the existing candidate workflow with `gpu_mode=probe-x86_64` or
 `probe-aarch64` and `probe_expect=miss` for an empty probe namespace. After the
 first success, dispatch from a second trusted branch with `probe_expect=hit`.
 The probe uses the configured native builder, NVCC, Rust 1.95 and sccache 0.8.1.
+Its NVCC fixture uses stable object intermediates for byte comparison; this
+does not change production flags or establish production reproducibility.
 It compares cached objects with independent compiler output and checks misses
 after source/header, compiler and flag changes, then hits after reverting.
 Probe data lives separately under `probe-01a10d2b/` and expires with the bucket.
