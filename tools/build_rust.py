@@ -39,6 +39,14 @@ def rust_extensions(*, optional: bool = False) -> list[RustExtension]:
             features=["native-tls-vendored"],
             binding=Binding.Exec,
             optional=optional,
+            # Identical ThinLTO builds changed promoted LLVM symbol suffixes
+            # and executable layout. Use one release codegen unit and disable
+            # LTO for the frontend; preserve the inherited version/source epoch.
+            env={
+                **os.environ,
+                "CARGO_PROFILE_RELEASE_LTO": "off",
+                "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1",
+            },
         ),
         RustExtension(
             target="vllm._rust_tool_parser",

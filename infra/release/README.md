@@ -65,6 +65,14 @@ builds vendored C dependencies so OpenSSL build information and C date/time
 macros also use the frozen source time. The tagger forwards it into its helper
 container so the regenerated RECORD entry also has a stable timestamp.
 
+The frontend executable's release build uses
+`CARGO_PROFILE_RELEASE_LTO=off` and `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`.
+Identical-source ThinLTO builds produced different promoted LLVM symbol
+suffixes and executable layouts after their source timestamps matched. These
+settings apply to the frontend through its Cargo environment. The Python
+parser extension uses the upstream release profile. Verify complete wheel
+archives from independent builds before claiming reproducibility.
+
 The toolkit extras pin the compiler and headers used by
 runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the
 available CUDA 13.0 TorchAudio wheel rejects Torch cu132, while audio
