@@ -129,9 +129,11 @@ the bucket.
 The probe stops on backend failure; production wheel builds continue.
 
 For manual inspection, use `gcloud storage du --summarize` on the owned bucket.
-To stop reuse without changing ABI, select a new `namespace` in the config.
-Only the cache owner should delete old task data. A new namespace forces a cold
-build and does not repair an invalid compiler/toolchain input.
+To bypass shared GCS objects without changing ABI, select an unused `namespace`
+in the config. The legacy main CUDA bootstrap still loads. A fully cold
+qualification also omits the workflow's `Read the legacy CUDA cache` step.
+Only the cache owner should delete old task data. A new namespace does not
+repair an invalid compiler/toolchain input.
 
 ## October 5 serving refresh handoff
 
