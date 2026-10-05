@@ -162,6 +162,14 @@ def _constraints_filename(architecture: str) -> str:
     )
 
 
+def _constraints_url(architecture: str, fork_commit: str) -> str:
+    repository = SOURCE_REPOSITORY.removeprefix("https://github.com/")
+    return (
+        f"https://raw.githubusercontent.com/{repository}/"
+        f"{fork_commit}/infra/release/{_constraints_filename(architecture)}"
+    )
+
+
 def inspect_wheel(
     wheel: Path,
     *,
@@ -255,10 +263,7 @@ def inspect_wheel(
         "platform": {
             "architecture": architecture,
             "constraints": {
-                "url": (
-                    f"https://raw.githubusercontent.com/{SOURCE_REPOSITORY}/"
-                    f"{fork_commit}/infra/release/{_constraints_filename(architecture)}"
-                ),
+                "url": _constraints_url(architecture, fork_commit),
                 "sha256": sha256_file(
                     Path(__file__).with_name(_constraints_filename(architecture))
                 ),
@@ -549,9 +554,8 @@ def _validate_manifest_common(
         expected_platform = config["platforms"][architecture]
         constraints = platform.get("constraints")
         if constraints is not None:
-            expected_constraints_url = (
-                f"https://raw.githubusercontent.com/{SOURCE_REPOSITORY}/"
-                f"{source['fork_commit']}/infra/release/{_constraints_filename(architecture)}"
+            expected_constraints_url = _constraints_url(
+                architecture, source["fork_commit"]
             )
             if constraints.get("url") != expected_constraints_url:
                 raise ReleaseError(f"{architecture} constraints are not source-pinned")

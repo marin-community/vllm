@@ -487,6 +487,38 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
 
 
 @pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
+def test_inspection_emits_downloadable_source_constraints(tmp_path, architecture):
+    record = fragment(tmp_path, architecture)
+    filename = (
+        "gpu-constraints-aarch64.txt"
+        if architecture == "aarch64"
+        else "gpu-constraints.txt"
+    )
+
+    assert record["platform"]["constraints"] == {
+        "url": (
+            "https://raw.githubusercontent.com/marin-community/vllm/"
+            f"{FORK_COMMIT}/infra/release/{filename}"
+        ),
+        "sha256": sha256_file(CONFIG_PATH.with_name(filename)),
+    }
+
+
+@pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
+def test_candidate_rejects_embedded_repository_url(tmp_path, architecture):
+    manifest = candidate(tmp_path)
+    record = next(
+        item for item in manifest["platforms"] if item["architecture"] == architecture
+    )
+    record["constraints"]["url"] = record["constraints"]["url"].replace(
+        "raw.githubusercontent.com/", "raw.githubusercontent.com/https://github.com/"
+    )
+
+    with pytest.raises(ReleaseError, match="constraints are not source-pinned"):
+        validate_candidate(manifest, load_json(CONFIG_PATH))
+
+
+@pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
 def test_candidate_rejects_constraints_from_another_source(tmp_path, architecture):
     manifest = candidate(tmp_path)
     record = next(
