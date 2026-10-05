@@ -758,14 +758,16 @@ class GrugMoeShortConv(MambaBase, nn.Module):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
-        if attn_metadata_raw is None:
-            # Profiling only needs the right shape. The lag-zero path is also
-            # the exact result for the zero history used by identity init.
+        attn_metadata = None
+        if attn_metadata_raw is not None:
+            assert isinstance(attn_metadata_raw, dict)
+            attn_metadata = attn_metadata_raw.get(self.prefix)
+        if attn_metadata is None:
+            # V2 profiling supplies attention metadata but omits Mamba groups;
+            # V1 supplies no metadata. Both use the shape-only lag-zero path.
             output.copy_(hidden_states * self.weight[0])
             return
 
-        assert isinstance(attn_metadata_raw, dict)
-        attn_metadata = attn_metadata_raw[self.prefix]
         assert isinstance(attn_metadata, ShortConvAttentionMetadata)
         conv_state = (
             self.kv_cache[0]

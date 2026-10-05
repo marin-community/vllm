@@ -1072,6 +1072,21 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
     )
     request_b = torch.tensor([[10.0, 4.0], [20.0, 8.0]], device="cuda")
     prefill = torch.vstack((request_a, request_b))
+    for profiling_metadata in (None, {}):
+        # V1 omits all metadata; V2's profiling pass omits Mamba groups from
+        # its dictionary. Neither pass may consume or mutate request history.
+        with set_forward_context(
+            profiling_metadata,
+            get_current_vllm_config(),
+            num_tokens=prefill.shape[0],
+        ):
+            profiling_output = module(prefill)
+        torch.testing.assert_close(
+            profiling_output, prefill * weight[0], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            module.kv_cache[0], torch.zeros_like(module.kv_cache[0]), rtol=0, atol=0
+        )
     prefill_metadata = ShortConvAttentionMetadata(
         num_prefills=2,
         num_prefill_tokens=5,
