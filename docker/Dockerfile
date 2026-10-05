@@ -336,6 +336,7 @@ COPY rust rust
 COPY rust-toolchain.toml rust-toolchain.toml
 COPY tools/build_rust.py tools/build_rust.py
 COPY build_rust.sh build_rust.sh
+COPY infra/release/freeze_c_build_time.py /opt/marin-freeze-c-build-time.py
 
 # Cap cargo parallelism to avoid exhausting the CI host's open-file limit
 # (rustc spawns enough concurrent processes to hit RLIMIT_NOFILE otherwise).
@@ -351,7 +352,10 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     if [ -n "${MARIN_SOURCE_DATE_EPOCH}" ]; then \
-        export SOURCE_DATE_EPOCH="${MARIN_SOURCE_DATE_EPOCH}"; \
+        export SOURCE_DATE_EPOCH="${MARIN_SOURCE_DATE_EPOCH}" \
+        && python3 /opt/marin-freeze-c-build-time.py > /opt/marin-c-build-time.h \
+        && export CFLAGS="${CFLAGS:-} -include /opt/marin-c-build-time.h" \
+        && export CXXFLAGS="${CXXFLAGS:-} -include /opt/marin-c-build-time.h"; \
     fi \
     && \
     if [ "$USE_SCCACHE" = "1" ]; then \
@@ -375,7 +379,10 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=bind,source=.git,target=.git \
     if [ -n "${MARIN_SOURCE_DATE_EPOCH}" ]; then \
-        export SOURCE_DATE_EPOCH="${MARIN_SOURCE_DATE_EPOCH}"; \
+        export SOURCE_DATE_EPOCH="${MARIN_SOURCE_DATE_EPOCH}" \
+        && python3 /opt/marin-freeze-c-build-time.py > /opt/marin-c-build-time.h \
+        && export CFLAGS="${CFLAGS:-} -include /opt/marin-c-build-time.h" \
+        && export CXXFLAGS="${CXXFLAGS:-} -include /opt/marin-c-build-time.h"; \
     fi \
     && \
     SETUPTOOLS_SCM_PRETEND_METADATA="{dirty=false}" bash build_rust.sh

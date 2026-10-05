@@ -67,6 +67,13 @@ builds vendored C dependencies so OpenSSL build information and C date/time
 macros also use the frozen source time. The tagger forwards it into its helper
 container so the regenerated RECORD entry also has a stable timestamp.
 
+Both Rust build stages additionally include a generated C header that freezes
+`__DATE__` and `__TIME__` to that timestamp. The executable retained a changing
+clock-time string after the OpenSSL date and LLVM symbol layout stabilized;
+Mimalloc's verbose build banner uses those C macros. A local sccache 0.8.1 probe
+also emitted wall-clock C macros despite a frozen epoch in the build environment.
+The header makes expansion explicit while preserving existing C/C++ flags.
+
 The frontend executable's release build uses
 `CARGO_PROFILE_RELEASE_LTO=off` and `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`.
 Identical-source ThinLTO builds produced different promoted LLVM symbol
