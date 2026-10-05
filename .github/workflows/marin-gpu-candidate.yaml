@@ -1,13 +1,13 @@
-name: Marin vLLM Candidate
+name: Marin vLLM Build and Release
 
-# Marin fork only. GPU candidates follow main. The manual TPU lane packages the
-# two exact source commits supplied by the caller.
+# GPU wheels build and qualify on main, then publish once.
+# The manual TPU lane packages the two supplied commits.
 
 on:
   push:
     branches: [main]
-    # These paths do not alter packaged wheel bytes. Candidate-workflow changes
-    # remain testable through workflow_dispatch.
+    # These paths do not alter packaged wheel bytes. Dispatch on main to
+    # exercise changes to release automation.
     paths-ignore:
       - ".agents/**"
       - "AGENTS.md"
@@ -25,22 +25,13 @@ on:
   workflow_dispatch:
     inputs:
       lane:
-        description: "Candidate lane"
+        description: "Build lane"
         required: true
         default: gpu
         type: choice
         options:
           - gpu
           - tpu
-      gpu_mode:
-        description: "GPU candidate mode"
-        required: true
-        default: publish
-        type: choice
-        options:
-          - publish
-          - qualify-x86_64
-          - qualify-aarch64
       vllm_commit:
         description: "Exact vLLM package source for the TPU lane"
         required: true
@@ -58,7 +49,7 @@ on:
         type: string
 
 concurrency:
-  group: marin-vllm-${{ inputs.lane || 'gpu' }}-candidate-${{ github.sha }}
+  group: marin-vllm-${{ inputs.lane || 'gpu' }}-build-${{ github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -71,67 +62,63 @@ env:
 
 jobs:
   prepare:
-    name: Resolve build matrix
+    name: Resolve main build
     if: github.event_name == 'push' || inputs.lane == 'gpu'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
       GH_TOKEN: ${{ github.token }}
     outputs:
+      build: ${{ steps.source.outputs.build }}
       matrix: ${{ steps.matrix.outputs.matrix }}
-      candidate_tag: ${{ steps.source.outputs.candidate_tag }}
+      validation_matrix: ${{ steps.matrix.outputs.validation_matrix }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
       created_at: ${{ steps.source.outputs.created_at }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select the main commit and release tag
+        id: source
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "GPU builds must run from main." >&2
+            exit 1
+          fi
+          CREATED_AT=$(git show -s --format=%cI "$GITHUB_SHA")
+          RELEASE_DATE=$(date -u -d "$CREATED_AT" +%Y%m%d)
+          RELEASE_TAG="marin-vllm-gpu-${RELEASE_DATE}-${GITHUB_SHA:0:12}"
+          BUILD=true
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists."
+            BUILD=false
+          fi
+          {
+            echo "build=${BUILD}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "created_at=${CREATED_AT}"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: astral-sh/setup-uv@v6
+        if: steps.source.outputs.build == 'true'
         with:
           version: ${{ env.UV_VERSION }}
 
-      - name: Create the metadata environment
-        run: uv venv --python 3.12
-
-      # Branch qualifications produce short-lived build artifacts only. The
-      # publish job still verifies main lineage before creating a release.
-      - name: Require a main-line GPU source for publication
-        if: github.event_name == 'push' || inputs.gpu_mode == 'publish'
-        run: |
-          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
-            --repository "$GITHUB_REPOSITORY" \
-            --workflow-ref "$GITHUB_REF" \
-            --source-commit "$GITHUB_SHA"
-
-      - name: Read the release platforms
+      - name: Read build and validation platforms
         id: matrix
-        env:
-          GPU_MODE: ${{ inputs.gpu_mode || 'publish' }}
+        if: steps.source.outputs.build == 'true'
         run: |
+          uv venv --python 3.12
           MATRIX=$(.venv/bin/python infra/release/gpu_release.py build-matrix --config "$RELEASE_CONFIG")
-          if [[ "$GPU_MODE" != publish ]]; then
-            ARCHITECTURE=${GPU_MODE#qualify-}
-            MATRIX=$(jq -c --arg architecture "$ARCHITECTURE" \
-              '{include: [.include[] | select(.architecture == $architecture)]}' \
-              <<< "$MATRIX")
-            if [[ $(jq '.include | length' <<< "$MATRIX") -ne 1 ]]; then
-              echo "Unknown GPU candidate mode: $GPU_MODE" >&2
-              exit 1
-            fi
-          fi
-          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve the immutable candidate identity
-        id: source
-        run: |
-          SHORT_SHA=$(git rev-parse --short=12 "$GITHUB_SHA")
-          CREATED_AT=$(git show -s --format=%cI "$GITHUB_SHA")
+          VALIDATION_MATRIX=$(.venv/bin/python infra/release/gpu_release.py validation-matrix --config "$RELEASE_CONFIG")
           {
-            echo "candidate_tag=marin-vllm-gpu-candidate-${SHORT_SHA}"
-            echo "created_at=${CREATED_AT}"
+            echo "matrix=${MATRIX}"
+            echo "validation_matrix=${VALIDATION_MATRIX}"
           } >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.architecture }} wheel
     needs: prepare
+    if: needs.prepare.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -271,24 +258,19 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: marin-vllm-gpu-candidate-${{ matrix.architecture }}
+          name: marin-vllm-gpu-build-${{ matrix.architecture }}
           path: |
             artifacts/*.whl
             artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json
           if-no-files-found: error
           retention-days: 14
+          overwrite: true
 
-  publish:
-    name: Publish immutable candidate
+  assemble:
+    name: Assemble build metadata
     needs: [prepare, build]
-    if: github.event_name == 'push' || inputs.gpu_mode == 'publish'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -301,81 +283,289 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: marin-vllm-gpu-candidate-*
-          path: candidate
+          pattern: marin-vllm-gpu-build-*
+          path: build
           merge-multiple: true
 
-      - name: Assemble the candidate manifest
+      - name: Assemble the release manifest
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          CREATED_AT: ${{ needs.prepare.outputs.created_at }}
         run: |
           FRAGMENT_ARGS=()
           while IFS= read -r fragment; do
             FRAGMENT_ARGS+=(--fragment "$fragment")
-          done < <(find candidate -maxdepth 1 -name '*-fragment.json' -print | sort)
-          .venv/bin/python infra/release/gpu_release.py assemble-candidate \
+          done < <(find build -maxdepth 1 -name '*-fragment.json' -print | sort)
+          .venv/bin/python infra/release/gpu_release.py assemble-manifest \
             --config "$RELEASE_CONFIG" \
             "${FRAGMENT_ARGS[@]}" \
             --repository "$GITHUB_REPOSITORY" \
-            --candidate-tag "$CANDIDATE_TAG" \
-            --created-at "${{ needs.prepare.outputs.created_at }}" \
-            --output candidate/marin-vllm-gpu-manifest.json
+            --release-tag "$RELEASE_TAG" \
+            --created-at "$CREATED_AT" \
+            --output build/marin-vllm-gpu-manifest.json
           .venv/bin/python infra/release/gpu_release.py verify-assets \
-            --manifest candidate/marin-vllm-gpu-manifest.json \
-            --directory candidate \
+            --manifest build/marin-vllm-gpu-manifest.json \
+            --directory build \
             --config "$RELEASE_CONFIG"
-          .venv/bin/python infra/release/gpu_release.py release-notes \
-            --manifest candidate/marin-vllm-gpu-manifest.json \
-            --output candidate-notes.md
 
-      - name: Check for an existing immutable candidate
-        id: existing
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marin-vllm-gpu-manifest
+          path: build/marin-vllm-gpu-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  validate:
+    name: Validate ${{ matrix.hardware }} wheel
+    needs: [prepare, assemble]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.validation_matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      JOB_USER: vllm-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: marin-vllm-gpu-manifest
+          path: build
+
+      - name: Materialize this commit's validation sources
         run: |
-          if gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            mkdir existing
-            gh release download "$CANDIDATE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --dir existing
-            .venv/bin/python infra/release/gpu_release.py verify-assets \
-              --manifest existing/marin-vllm-gpu-manifest.json \
-              --directory existing \
-              --config "$RELEASE_CONFIG"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+          mkdir validation-source
+          set -o pipefail
+          git archive "$GITHUB_SHA" -- \
+            . ':(exclude)vllm' ':(exclude)docs' | \
+            tar -x -C validation-source
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Create the metadata environment
+        run: uv venv --python 3.12
+
+      - name: Trim the Iris bundle
+        # The installed wheel and validation-source/ provide the code under test.
+        # Keep the uploaded source bundle below Iris's 25MB cap.
+        run: git rm -r --quiet docs vllm tests csrc rust benchmarks examples
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: hai-gcp-models
+          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
+          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: hai-gcp-models
+
+      - name: Install the Iris client
+        run: |
+          uv tool install --prerelease allow "marin-core>=0.2.46.dev202607131620"
+          echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
+
+      - name: Locate this run's wheel artifact
+        env:
+          ARTIFACT_NAME: marin-vllm-gpu-build-${{ matrix.architecture }}
+        run: |
+          WHEEL_ARTIFACT_URL=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name == \"$ARTIFACT_NAME\").archive_download_url")
+          test -n "$WHEEL_ARTIFACT_URL"
+          echo "WHEEL_ARTIFACT_URL=$WHEEL_ARTIFACT_URL" >> "$GITHUB_ENV"
+
+      - name: Validate the built wheel on ${{ matrix.hardware }}
+        id: iris
+        continue-on-error: true
+        env:
+          JOB_NAME: vllm-release-${{ matrix.hardware }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          MODEL: Qwen/Qwen3-0.6B
+        run: |
+          TASK_IMAGE=$(jq -r '.validation_task_image' "$RELEASE_CONFIG")
+          JOB_NAME=$(echo "$JOB_NAME" | cut -c1-63 | tr '[:upper:]' '[:lower:]')
+          echo "JOB_NAME=${JOB_NAME}" >> "$GITHUB_ENV"
+          set -o pipefail
+          iris --cluster marin job run \
+            --target-cluster "${{ matrix.target_cluster }}" \
+            --priority production \
+            --job-name "$JOB_NAME" \
+            --user "$JOB_USER" \
+            --task-image "$TASK_IMAGE" \
+            --gpu "${{ matrix.gpu_resource }}" --enable-extra-resources \
+            --cpu "${{ matrix.cpu }}" \
+            --memory "${{ matrix.memory }}" \
+            --disk 200GB \
+            --env-vars GH_TOKEN "$GH_TOKEN" \
+            --no-sync \
+            --max-retries 0 \
+            --timeout 2400 \
+            -- uv run --no-project --python 3.12 python \
+              infra/release/gpu_validation.py validate \
+              --config "$RELEASE_CONFIG" \
+              --manifest build/marin-vllm-gpu-manifest.json \
+              --wheel-artifact-url "$WHEEL_ARTIFACT_URL" \
+              --architecture "${{ matrix.architecture }}" \
+              --hardware "${{ matrix.hardware }}" \
+              --task-image "$TASK_IMAGE" \
+              --model "$MODEL" \
+              --validation-source-root validation-source 2>&1 | tee validation.log
+
+      - name: Cancel any Iris job left behind
+        if: always()
+        run: |
+          if [[ -n "${JOB_NAME:-}" ]]; then
+            iris --cluster marin job cancel --exact "/$JOB_USER/$JOB_NAME" || true
           fi
 
-      - name: Publish candidate assets once
-        if: steps.existing.outputs.exists != 'true'
+      - name: Wait for the federated validation record
+        if: steps.iris.outcome == 'success'
+        env:
+          FORWARDED_LOG_POLL_ATTEMPTS: 60
+          FORWARDED_LOG_POLL_INTERVAL: 15
         run: |
-          SOURCE_COMMIT=$(jq -r '.source.fork_commit' candidate/marin-vllm-gpu-manifest.json)
-          if [[ "$SOURCE_COMMIT" != "$GITHUB_SHA" ]]; then
-            echo "Candidate source $SOURCE_COMMIT does not match workflow commit $GITHUB_SHA" >&2
+          validation_record_ready() {
+            .venv/bin/python infra/release/gpu_release.py extract-validation \
+              --log "$1" --output validation-probe.json &&
+              .venv/bin/python infra/release/gpu_release.py validate-result \
+                --result validation-probe.json \
+                --manifest build/marin-vllm-gpu-manifest.json \
+                --config "$RELEASE_CONFIG" >/dev/null 2>&1
+          }
+          if validation_record_ready validation.log; then
+            exit 0
+          fi
+          for attempt in $(seq 1 "$FORWARDED_LOG_POLL_ATTEMPTS"); do
+            sleep "$FORWARDED_LOG_POLL_INTERVAL"
+            iris --cluster marin job logs "/$JOB_USER/$JOB_NAME" > forwarded-validation.log 2>&1
+            if validation_record_ready forwarded-validation.log; then
+              cat forwarded-validation.log >> validation.log
+              exit 0
+            fi
+            echo "Validation record has not reached the Marin Finelog hub (attempt ${attempt}/${FORWARDED_LOG_POLL_ATTEMPTS})."
+          done
+          cat forwarded-validation.log >> validation.log
+          echo "Timed out waiting for the federated validation record." >&2
+          exit 1
+
+      - name: Extract the validation record
+        if: always()
+        run: |
+          HARDWARE=$(echo "${{ matrix.hardware }}" | tr '[:upper:]' '[:lower:]')
+          .venv/bin/python infra/release/gpu_release.py extract-validation \
+            --log validation.log \
+            --output "marin-vllm-validation-${HARDWARE}.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marin-vllm-validation-${{ matrix.hardware }}
+          path: |
+            marin-vllm-validation-*.json
+            validation.log
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+      - name: Enforce validation result
+        if: always()
+        run: |
+          if [[ "${{ steps.iris.outcome }}" != "success" ]]; then
+            echo "Iris validation command failed." >&2
             exit 1
           fi
-          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
-            --repository "$GITHUB_REPOSITORY" \
-            --workflow-ref "$GITHUB_REF" \
-            --source-commit "$SOURCE_COMMIT" \
-            --candidate-tag "$CANDIDATE_TAG"
-          gh release create "$CANDIDATE_TAG" \
+          HARDWARE=$(echo "${{ matrix.hardware }}" | tr '[:upper:]' '[:lower:]')
+          .venv/bin/python infra/release/gpu_release.py validate-result \
+            --result "marin-vllm-validation-${HARDWARE}.json" \
+            --manifest build/marin-vllm-gpu-manifest.json \
+            --config "$RELEASE_CONFIG"
+
+  publish:
+    name: Publish qualified wheels
+    needs: [prepare, assemble, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Create the metadata environment
+        run: uv venv --python 3.12
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: marin-vllm-gpu-manifest
+          path: build
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: marin-vllm-gpu-build-*
+          path: release-assets
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: marin-vllm-validation-*
+          path: validations
+          merge-multiple: true
+
+      - name: Attach this run's qualification results
+        run: |
+          VALIDATION_ARGS=()
+          while IFS= read -r result; do
+            VALIDATION_ARGS+=(--validation "$result")
+            cp "$result" release-assets/
+          done < <(find validations -name 'marin-vllm-validation-*.json' -print | sort)
+          .venv/bin/python infra/release/gpu_release.py finalize-release \
+            --manifest build/marin-vllm-gpu-manifest.json \
+            "${VALIDATION_ARGS[@]}" \
+            --config "$RELEASE_CONFIG" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --output release-assets/marin-vllm-gpu-manifest.json
+          .venv/bin/python infra/release/gpu_release.py verify-release \
+            --manifest release-assets/marin-vllm-gpu-manifest.json \
+            --directory release-assets \
+            --config "$RELEASE_CONFIG"
+          .venv/bin/python infra/release/gpu_release.py release-notes \
+            --manifest release-assets/marin-vllm-gpu-manifest.json \
+            --output release-notes.md
+
+      - name: Publish release assets once
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "Marin vLLM GPU candidate $(git rev-parse --short=12 "$GITHUB_SHA")" \
-            --notes-file candidate-notes.md \
-            --prerelease \
-            candidate/*.whl \
-            candidate/marin-vllm-gpu-manifest.json
-
-      - name: Verify published candidate assets
-        if: steps.existing.outputs.exists != 'true'
-        run: |
-          mkdir published
-          gh release download "$CANDIDATE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --dir published
-          .venv/bin/python infra/release/gpu_release.py verify-assets \
-            --manifest published/marin-vllm-gpu-manifest.json \
-            --directory published \
-            --config "$RELEASE_CONFIG"
+            --title "Marin vLLM GPU ${RELEASE_TAG#marin-vllm-gpu-}" \
+            --latest \
+            --notes-file release-notes.md \
+            release-assets/*.whl \
+            release-assets/marin-vllm-gpu-manifest.json \
+            release-assets/marin-vllm-validation-*.json
 
   publish-tpu:
     name: Build and publish exact TPU wheel pair
