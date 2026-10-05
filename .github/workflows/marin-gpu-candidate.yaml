@@ -365,7 +365,7 @@ jobs:
           set -o pipefail
           uv venv --python 3.12 wheel-install
           uv pip install --python wheel-install/bin/python --no-deps artifacts/*.whl
-          uv pip show --python wheel-install/bin/python marin-vllm | tee artifacts/install.txt
+          uv pip show --python wheel-install/bin/python vllm | tee artifacts/install.txt
 
       - uses: actions/upload-artifact@v4
         with:
