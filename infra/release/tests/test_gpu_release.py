@@ -3,6 +3,7 @@
 
 import base64
 import copy
+import hashlib
 import json
 import os
 import subprocess
@@ -157,6 +158,7 @@ def write_wheel(
         archive.writestr(f"{dist_info}/METADATA", metadata)
         archive.writestr(f"{dist_info}/WHEEL", wheel_metadata)
         archive.writestr("vllm/_C_stable_libtorch.cpython-312-test.so", b"compiled")
+        archive.writestr("vllm/vllm-rs", b"\x7fELFrust-frontend")
         if include_cumem:
             archive.writestr("vllm/cumem_allocator.cpython-312-test.so", b"compiled")
         archive.writestr(
@@ -484,6 +486,17 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
     wheel_path = tmp_path / wheel["filename"]
     assert wheel["sha256"] == sha256_file(wheel_path)
     assert wheel["size_bytes"] == wheel_path.stat().st_size
+    native = {
+        item["path"]: item for item in record["platform"]["native_artifacts"]
+    }
+    assert set(native) == {
+        "vllm/_C_stable_libtorch.cpython-312-test.so",
+        "vllm/cumem_allocator.cpython-312-test.so",
+        "vllm/vllm-rs",
+    }
+    executable = b"\x7fELFrust-frontend"
+    assert native["vllm/vllm-rs"]["sha256"] == hashlib.sha256(executable).hexdigest()
+    assert native["vllm/vllm-rs"]["size_bytes"] == len(executable)
 
 
 @pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])

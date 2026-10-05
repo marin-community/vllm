@@ -215,6 +215,7 @@ jobs:
             echo "upstream_base=${UPSTREAM_BASE}"
             echo "base_image_digest=${{ matrix.build_base_image }}"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "source_date_epoch=$(git show -s --format=%ct HEAD)"
           } >> "$GITHUB_OUTPUT"
 
       # Persist compiler outputs, not the multi-GB base layers. sccache hashes the
@@ -252,6 +253,7 @@ jobs:
             --build-arg UV_CONSTRAINT=/opt/marin-gpu-constraints.txt \
             --build-arg MARIN_GPU_CONSTRAINT_FILE="${{ matrix.constraints_file }}" \
             --build-arg MARIN_FIXED_CUDA_COMPILER=true \
+            --build-arg MARIN_SOURCE_DATE_EPOCH="${{ steps.provenance.outputs.source_date_epoch }}" \
             --build-arg CUDA_VERSION="${{ matrix.cuda_version }}" \
             --build-arg PYTHON_VERSION="${{ matrix.python_version }}" \
             --build-arg torch_cuda_arch_list="${{ matrix.sm_targets }}" \

@@ -130,14 +130,16 @@ def _packaged_contents(wheel: Path) -> dict[str, str]:
 
 
 def _native_artifacts(wheel: Path) -> list[dict[str, Any]]:
-    """Hash every native member, including the serving FA2 and FA3 extensions."""
+    """Hash shared objects and ELF executables, including the Rust frontend."""
     artifacts = []
     with zipfile.ZipFile(wheel) as archive:
         for member in archive.infolist():
-            if not member.filename.endswith(".so"):
-                continue
             digest = hashlib.sha256()
             with archive.open(member) as stream:
+                prefix = stream.read(4)
+                if not member.filename.endswith(".so") and prefix != b"\x7fELF":
+                    continue
+                digest.update(prefix)
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
             artifacts.append(
@@ -146,7 +148,9 @@ def _native_artifacts(wheel: Path) -> list[dict[str, Any]]:
                     "sha256": digest.hexdigest(),
                     "size_bytes": member.file_size,
                     "producer_evidence": (
-                        "compiler inputs in build.provenance.compiler; "
+                        "CUDA inputs in build.provenance.compiler; "
+                        "Rust inputs in source-pinned rust-toolchain.toml and "
+                        "rust/Cargo.lock; complete compiler commands in workflow logs; "
                         "runtime producer inspection is separate"
                     ),
                 }

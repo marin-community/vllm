@@ -59,9 +59,11 @@ uses the maintained cuSPARSELt 0.8.1 wheel tag repair because the vendor's ARM
 wheel declares the unsupported `manylinux2014_sbsa` tag. The repair changes
 WHEEL and RECORD metadata; its native bytes are unchanged.
 
-Wheel packaging and platform tagging use the package source's Git timestamp
-as `SOURCE_DATE_EPOCH`. The tagger forwards it into its helper container so
-the regenerated RECORD entry also has a stable timestamp.
+Rust dependency compilation, wheel packaging and platform tagging use the
+package source's Git timestamp as `SOURCE_DATE_EPOCH`. Set it before Cargo
+builds vendored C dependencies so OpenSSL build information and C date/time
+macros also use the frozen source time. The tagger forwards it into its helper
+container so the regenerated RECORD entry also has a stable timestamp.
 
 The toolkit extras pin the compiler and headers used by
 runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the
@@ -73,8 +75,10 @@ preprocessing uses Torch's tensor operators.
 overlays those owned files into its full CUDA prefix before native compilation.
 `compiler_provenance.py` verifies the compiler and assembler versions, hashes
 every installed component file, and compiles an SM90/SM100 fatbin probe. The
-candidate manifest embeds that record and hashes every packaged shared library,
-including the native FA2 and FA3 attention modules.
+candidate manifest embeds that record and hashes packaged shared libraries and
+ELF executables, including FA2, FA3 and the Rust frontend. Rust compiler inputs
+come from the source-pinned toolchain and Cargo lock; CUDA compiler provenance
+does not describe the Rust compiler.
 
 Wheel archives use their source commit's `SOURCE_DATE_EPOCH`. This removes
 wall-clock ZIP timestamps from repeated builds. Native byte reproducibility

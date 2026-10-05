@@ -317,6 +317,7 @@ ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 FROM base AS rust-build-cache
 ARG USE_SCCACHE
 ARG SCCACHE_ENDPOINT
+ARG MARIN_SOURCE_DATE_EPOCH
 
 # Install native tools needed only for Rust builds.
 RUN dnf install -y --setopt=install_weak_deps=False make perl-core \
@@ -349,6 +350,10 @@ ENV SCCACHE_SERVER_PORT=4227
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
+    if [ -n "${MARIN_SOURCE_DATE_EPOCH}" ]; then \
+        export SOURCE_DATE_EPOCH="${MARIN_SOURCE_DATE_EPOCH}"; \
+    fi \
+    && \
     if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -z "${SCCACHE_BUCKET}" ]; then \
             unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
@@ -369,6 +374,10 @@ FROM rust-build-cache AS rust-build
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=bind,source=.git,target=.git \
+    if [ -n "${MARIN_SOURCE_DATE_EPOCH}" ]; then \
+        export SOURCE_DATE_EPOCH="${MARIN_SOURCE_DATE_EPOCH}"; \
+    fi \
+    && \
     SETUPTOOLS_SCM_PRETEND_METADATA="{dirty=false}" bash build_rust.sh
 #################### RUST BUILD IMAGE ####################
 
