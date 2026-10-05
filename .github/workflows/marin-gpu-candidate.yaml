@@ -422,6 +422,8 @@ jobs:
             --build-arg CACHE_EXPORT_IMAGE="${{ matrix.build_base_image }}" \
             --output type=local,dest=compile-cache \
             -f infra/release/export-compile-cache.Dockerfile infra/release
+          test -n "$(find compile-cache/cuda -type f -print -quit)"
+          test -n "$(find compile-cache/rust -type f -print -quit)"
       - uses: google-github-actions/auth@v3
         id: cache-save-auth
         with:
