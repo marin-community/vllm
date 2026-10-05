@@ -85,7 +85,7 @@ build savings reduce waiting and CPU work rather than a runner bill.
 ## Qualification evidence
 
 The first full qualifiers used source `bd65b735982078ffff42619607bcaf6668863547`,
-the pinned images in `config.json`, Python 3.12, Torch 2.13.0+cu132, GCC 13.3.1,
+the pinned images in `config.json`, Python 3.12.14, Torch 2.13.0+cu132, GCC 13.3.1,
 NVCC 13.2.78, Rust 1.95.0 and sccache 0.8.1. Build/export time excludes queue
 and transport. Stage times overlap; H/M denotes compiler hits/misses.
 
@@ -125,10 +125,22 @@ build and does not repair an invalid compiler/toolchain input.
 The cache work uses main `39e62869693c46402b1a95fde4fc55ca1aab9ae1` as its
 build baseline. The serving recipe inspected on October 5 is
 `172b6f9773734e726d4004d84fa96b55746ef9d5`.
-Apply the workflow's GCS transfer/auth and explicit mount export, the config and
-`compile_cache.py`, and the Dockerfile's Rust compiler mount/wrapper and timing
-blocks. The probes and this guide are optional operating tools; the existing
-release test gains the new nonpublishing probe modes.
+Full cache qualifications use `bd65b735982078ffff42619607bcaf6668863547`.
+The deployed storage/auth configuration is infra
+`42d75777be3eb4db961dc274f1dd57cdeb9c7cd9`, under `cloud/vllm-cache`.
+
+Port these files onto the serving recipe:
+
+| File | Changes to apply |
+| --- | --- |
+| `.github/workflows/marin-gpu-candidate.yaml` | GCS transfer/auth, explicit mount injection/export, evidence upload and qualification install |
+| `Dockerfile` | Rust cache mounts/wrappers and per-stage timing/statistics |
+| `infra/release/compile-cache.json`, `compile_cache.py`, `export-compile-cache.Dockerfile` | Shared-storage configuration, runner transfer and mount exporter |
+
+Optional operating tools are `infra/release/cache-probe.Dockerfile`,
+`compiler_probe.py` and this guide. `infra/release/tests/test_gpu_release.py`
+accepts the new nonpublishing probe modes; `test_compile_cache.py` covers empty
+storage and failed access at the runner subprocess boundary.
 
 Keep the serving recipe's fixed CUDA compiler provenance, source date handling,
 Rust C date header, dependency constraints and stable CUDA object intermediates.
