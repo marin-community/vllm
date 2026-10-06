@@ -11,9 +11,20 @@ inputs. Returning to an older compatible input can reuse its objects.
 The independent infrastructure root is
 [`yonromai/infra/cloud/vllm-cache`](https://github.com/yonromai/infra/tree/vllm-cache-storage-01a10d2b/cloud/vllm-cache).
 It declares Standard storage in us-central1, private access, object age deletion
-after 14 days, and no soft deletion or versioning. Lifecycle deletion is
-asynchronous. Reads do not refresh object age, so even hot objects eventually
-expire and compile again. Loss of this disposable storage needs only a rebuild.
+after 21 days, and no soft deletion or versioning. The client restores the
+current and previous UTC Monday weekly prefixes. It saves only objects used or
+created during compilation into the current week. Hot objects carry forward;
+unused variants leave the restore window and expire. Lifecycle deletion is
+asynchronous. Loss of this disposable storage needs only a rebuild.
+
+The workflow records a nanosecond timestamp after cache injection and before
+compilation. sccache 0.8.1 updates an object's modification time on a hit;
+new objects have a new modification time. Export preserves those times, and
+save selects only files changed since that timestamp. Restored but unused
+variants are not carried forward. Weekly use keeps objects available across
+rotation; a gap beyond the two-week restore window can require compilation.
+The `v2` namespace starts a new collection rather than reading the older flat
+`v1` paths.
 
 ## Access and transport
 
@@ -22,6 +33,9 @@ from the candidate workflow on branches. Main pushes and manual branch builds
 can authenticate; PR and tag events cannot. Repository writers control branch
 workflows and are trusted cache producers. The bucket grants object read/list
 and create permissions. It grants no replacement or deletion permission.
+Main builds consume objects produced by those trusted branch writers. Immutable
+objects do not protect against a malicious producer creating a poisoned key;
+this shared namespace requires trusting all admitted repository writers.
 
 The runner obtains a short-lived federated token immediately before each
 transfer. The token exists only in those steps' environment. Auth creates no
@@ -49,7 +63,7 @@ The October 5 inventory had 28 entries totaling 4.60 GiB, mostly snapshots of
 the same native outputs. See
 [GitHub's cache scope](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache).
 
-GCS stores each sccache object once per architecture/stage namespace. New
+GCS stores each sccache object once per weekly architecture/stage prefix. New
 variants accumulate until age eviction, and branch concurrency cannot discard
 another branch's variants. Bulk transfers keep credentials outside the builder
 and avoid a compiler daemon holding an expired token during a long build.
@@ -62,20 +76,25 @@ This cache does not persist that environment. Upstream uses warm builders and EC
 this fork uses disposable hosted runners. See
 [upstream's builder](https://github.com/vllm-project/vllm/blob/main/.buildkite/image_build/image_build.sh).
 
-The two seeded architecture collections total 1.20 GiB and 6,703 objects.
-They uploaded in 31.875s on x86 and 20.638s on ARM. At current
-[GCS prices](https://cloud.google.com/storage/pricing), baseline storage costs
-about $0.024/month. Fifty architecture builds/month, equally split and each
+The measured flat-prefix seed collections total 1.20 GiB and 6,703 objects.
+They uploaded in 31.875s on x86 and 20.638s on ARM. Weekly retention of a fully
+used collection holds roughly three copies, or 3.6 GiB, with up to four copies
+near a lifecycle boundary before asynchronous deletion. At current
+[GCS prices](https://cloud.google.com/storage/pricing), three copies cost
+about $0.072/month. Fifty architecture builds/month, equally split and each
 downloading its full ~0.60 GiB collection, would cost about $3.60 in network
-and $0.067 in reads assuming one GET/object. Seeding costs about $0.034 in writes;
-list calls, retries, reseeding and new variants add requests. Rates used are
+and $0.067 in reads assuming one GET/object. The two weekly restores use
+no-clobber and do not download duplicate keys twice. Seeding costs about $0.034
+in writes per full collection; weekly renewal adds about $0.15/month for both
+architectures at this volume. Listing both weeks, retries and new variants add
+requests. Rates used are
 $0.02/GiB-month, $0.12/GiB outbound, $0.005/1,000 Class A and $0.0004/1,000 Class B.
 These estimates precede shared free allowances and are not a billing measurement.
 Eligible us-central1 usage can share monthly free quotas of 5 GB-month storage,
 5,000 Class A, 50,000 Class B and 100 GB North America transfer.
 
 Track actual restored bytes and new-object growth. Ten complete incompatible
-collections would retain about 12 GiB before eviction and multiply bulk-download
+collections would retain about 36 GiB across three weekly copies and multiply bulk-download
 costs by ten. Normal source changes preserve compatible objects; no fixed growth
 rate is assumed. Age retention controls storage duration, not traffic cost.
 This public repository's standard runners have
@@ -89,6 +108,9 @@ The first qualifiers and sibling-branch warm repeats used source
 the pinned images in `config.json`, Python 3.12.14, Torch 2.13.0+cu132, GCC 13.3.1,
 NVCC 13.2.78, Rust 1.95.0 and sccache 0.8.1. Build/export time excludes queue
 and transport. Stage times overlap; H/M denotes compiler hits/misses.
+These full-wheel measurements used the original flat `v1` transport. The
+weekly renewal changes transport and eviction; compiler inputs and the native
+build recipe remain the same. Separate compiler probes validate that transport.
 
 | Architecture | Build/export | Rust stable (H/M) | Rust exact version (H/M) | CUDA (H/M) |
 | --- | --- | --- | --- | --- |
@@ -101,11 +123,18 @@ Every listed wheel passed metadata/content inspection and isolated installation
 without dependencies. All 16 x86 and 17 ARM packaged native libraries have the
 expected ELF architecture. Each repeat's native libraries are byte identical
 to its first wheel. These CPU checks do not perform GPU runtime qualification.
+The packaged `vllm/vllm-rs` executable differs between first and warm wheels on
+both architectures. The existing recipe retains changing native build
+timestamps and linker/compiler variability; executable reproducibility is
+not established by the shared-library comparison.
 
 The x86 pair saved 2m 43s (9.0%) in build/export and 8m 36s (57%) in the stable
 Rust stage. ARM saved 2m 02s (3.0%) and 7m 48s (68%). ARM Python dependency
 preparation still took 44m 39s outside this cache. There is one pair per
 architecture, with overlapping stages and variable setup/link time.
+Warm x86 CUDA still spends about 19 minutes checking individual cached targets,
+building DeepGEMM for several interpreters and linking. Skipping unchanged
+native stages would address that remaining work.
 
 | Warm transfer | Rust restored | Restore total | New objects / bytes | Save total |
 | --- | --- | --- | --- | --- |
@@ -174,6 +203,10 @@ CUDA object intermediates.
 Those change legitimate cache inputs and must retain their own compatibility
 checks. Merge the Rust setup shell blocks so its CFLAGS/CXXFLAGS are established
 before starting sccache/build_rust, and retain its provenance export stage.
+Expect the first integrated build to miss after its CUDA flag/source and Rust
+compiler changes. The dated x86 cold CUDA observation was about five hours;
+cold ARM is unmeasured. The repaired native timestamps derive from each commit,
+so their associated objects still legitimately miss after a commit change.
 Do not replace its Dockerfile with this older base recipe. Integrate and validate
 on that owner's branch after these cache tests; do not publish or promote as
 part of the cache handoff.

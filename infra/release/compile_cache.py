@@ -3,8 +3,11 @@
 import argparse
 import json
 import logging
+import os
 import subprocess
+import tempfile
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 STAGES = ("cuda", "rust")
@@ -36,7 +39,8 @@ def remote_objects(bucket: str, prefix: str) -> dict[str, int]:
 
 def transfer(
     operation: str, bucket: str, namespace: str, architecture: str,
-    directory: Path, output: Path,
+    directory: Path, output: Path, *, used_since_ns: int | None = None,
+    now: datetime | None = None,
 ) -> None:
     """Merge compiler objects without deleting or replacing remote variants.
 
@@ -45,39 +49,62 @@ def transfer(
     """
     if operation not in ("restore", "save"):
         raise ValueError(f"Unsupported cache operation: {operation}")
+    if operation == "save" and used_since_ns is None:
+        raise ValueError("Save requires the timestamp taken before compilation")
+    today = (now or datetime.now(UTC)).date()
+    week = today - timedelta(days=today.weekday())
+    weeks = [week] if operation == "save" else [week, week - timedelta(days=7)]
     records = []
     try:
         for stage in STAGES:
             started = time.monotonic()
             local = directory / stage
             local.mkdir(parents=True, exist_ok=True)
-            prefix = f"{namespace}/{architecture}/{stage}/"
             record = {
                 "stage": stage, "operation": operation,
                 "status": "failed", "payload_bytes": 0,
+                "weeks": [day.isoformat() for day in weeks],
             }
             records.append(record)
             try:
                 before = local_objects(local)
-                remote = remote_objects(bucket, prefix)
-                record["remote_objects"] = len(remote)
-                record["remote_bytes"] = sum(remote.values())
-                cloud = f"gs://{bucket}/{prefix}"
-                source, destination = (
-                    (cloud, str(local)) if operation == "restore"
-                    else (str(local), cloud)
-                )
-                # An empty object prefix is a normal cold cache. gcloud rsync
-                # treats a nonexistent source prefix as an error.
-                if operation != "restore" or remote:
-                    subprocess.run(
-                        [
-                            "gcloud", "storage", "rsync", source, destination,
-                            "--recursive", "--no-clobber", "--quiet",
-                        ],
-                        check=True, timeout=TRANSFER_TIMEOUT,
-                        stdout=subprocess.DEVNULL,
-                    )
+                selected = {
+                    key: size for key, size in before.items()
+                    if used_since_ns is not None
+                    and (local / key).stat().st_mtime_ns >= used_since_ns
+                }
+                record["remote_objects"] = record["remote_bytes"] = 0
+                with tempfile.TemporaryDirectory(dir=directory.parent) as temporary:
+                    upload = Path(temporary)
+                    if operation == "save":
+                        for key in selected:
+                            destination = upload / key
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                            os.link(local / key, destination)
+                    for day in weeks:
+                        prefix = (
+                            f"{namespace}/{day.isoformat()}/{architecture}/{stage}/"
+                        )
+                        remote = remote_objects(bucket, prefix)
+                        record["remote_objects"] += len(remote)
+                        record["remote_bytes"] += sum(remote.values())
+                        cloud = f"gs://{bucket}/{prefix}"
+                        source, destination = (
+                            (cloud, str(local)) if operation == "restore"
+                            else (str(upload), cloud)
+                        )
+                        # Missing prefixes are normal; never rsync an empty source.
+                        if (operation == "restore" and remote) or (
+                            operation == "save" and selected
+                        ):
+                            subprocess.run(
+                                [
+                                    "gcloud", "storage", "rsync", source, destination,
+                                    "--recursive", "--no-clobber", "--quiet",
+                                ],
+                                check=True, timeout=TRANSFER_TIMEOUT,
+                                stdout=subprocess.DEVNULL,
+                            )
                 after = local_objects(local)
                 # Restore counts files actually added locally. Save counts the
                 # planned new payload; concurrent identical writers may win a
@@ -86,7 +113,7 @@ def transfer(
                     {key: size for key, size in after.items() if key not in before}
                     if operation == "restore"
                     else {
-                        key: size for key, size in before.items() if key not in remote
+                        key: size for key, size in selected.items() if key not in remote
                     }
                 )
                 record.update(
@@ -112,6 +139,10 @@ def main() -> None:
     )
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--used-since-ns", type=int,
+        help="Timestamp taken after cache injection and before compilation",
+    )
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
     namespace = args.namespace or config["namespace"]
@@ -122,7 +153,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     transfer(
         args.operation, config["bucket"], namespace, args.architecture,
-        args.directory, args.output,
+        args.directory, args.output, used_since_ns=args.used_since_ns,
     )
 
 

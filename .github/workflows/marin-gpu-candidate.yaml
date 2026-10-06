@@ -17,6 +17,8 @@ on:
       - "infra/nightly/specs/qwen3-0.6b-tpu.json"
       - "infra/release/README.md"
       - "infra/release/compile-cache.md"
+      - "infra/release/cache-probe.Dockerfile"
+      - "infra/release/compiler_probe.py"
       - "infra/release/gpu_validation.py"
       - "infra/release/tpu_config.json"
       - "infra/release/tpu_release.py"
@@ -274,6 +276,7 @@ jobs:
           set -o pipefail
           mkdir -p artifacts
           BUILD_STARTED=$(date +%s)
+          .venv/bin/python -c 'import time; print(time.time_ns())' > artifacts/cache-started-ns.txt
           # Credentials stay on the runner. BuildKit sees local compiler objects.
           docker buildx build \
             --target marin-wheel-export \
@@ -322,7 +325,8 @@ jobs:
           .venv/bin/python infra/release/compile_cache.py save \
             --config infra/release/compile-cache.json \
             --architecture "${{ matrix.architecture }}" \
-            --directory compile-cache --output artifacts/cache-save.json
+            --directory compile-cache --output artifacts/cache-save.json \
+            --used-since-ns "$(cat artifacts/cache-started-ns.txt)"
 
       - name: Upload build and cache evidence
         if: always()
@@ -427,6 +431,8 @@ jobs:
       - name: Exercise compiler correctness and invalidation
         run: |
           set -o pipefail
+          mkdir -p artifacts
+          .venv/bin/python -c 'import time; print(time.time_ns())' > artifacts/cache-started-ns.txt
           RUST_TOOLCHAIN=$(.venv/bin/python -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           docker buildx build \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
@@ -458,7 +464,8 @@ jobs:
           .venv/bin/python infra/release/compile_cache.py save \
             --config infra/release/compile-cache.json --namespace "$PROBE_NAMESPACE" \
             --architecture "${{ matrix.architecture }}" \
-            --directory compile-cache --output artifacts/cache-save.json
+            --directory compile-cache --output artifacts/cache-save.json \
+            --used-since-ns "$(cat artifacts/cache-started-ns.txt)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
