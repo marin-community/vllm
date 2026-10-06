@@ -49,8 +49,9 @@ retention are unchanged.
 `cache-restore.json` and `cache-save.json` report per-stage elapsed seconds,
 object counts and payload bytes. Restore bytes count objects actually added
 locally. Save bytes are an upper bound on new payload; an identical concurrent
-writer may win the upload race. Neither count includes HTTP overhead. Native
-steps print `compile-stage <stage> seconds=<seconds>` and sccache hit/miss
+writer may win the upload race. Neither count includes HTTP overhead. Remote
+counts sum both listed weeks, including duplicate keys. Native steps print
+`compile-stage <stage> seconds=<seconds>` and sccache hit/miss
 statistics in separate steps to avoid BuildKit's long-step log limit. The
 workflow retains the full build log and total build/export time for 14 days.
 
@@ -94,7 +95,8 @@ Eligible us-central1 usage can share monthly free quotas of 5 GB-month storage,
 5,000 Class A, 50,000 Class B and 100 GB North America transfer.
 
 Track actual restored bytes and new-object growth. Ten complete incompatible
-collections would retain about 36 GiB across three weekly copies and multiply bulk-download
+collections used every week would retain about 36 GiB across three weekly copies
+and multiply bulk-download
 costs by ten. Normal source changes preserve compatible objects; no fixed growth
 rate is assumed. Age retention controls storage duration, not traffic cost.
 This public repository's standard runners have
@@ -165,6 +167,17 @@ probes remain valid. Probe data lives in its chosen namespace and expires with
 the bucket.
 The probe stops on backend failure; production wheel builds continue.
 
+The weekly transport at `0366340cd1b34ad85bc7222e106aab3c01a76f0b` passed
+[x86 cold](https://github.com/marin-community/vllm/actions/runs/37417792694),
+[x86 sibling-branch warm](https://github.com/marin-community/vllm/actions/runs/37421016991),
+[ARM cold](https://github.com/marin-community/vllm/actions/runs/37417796258) and
+[ARM sibling-branch warm](https://github.com/marin-community/vllm/actions/runs/37418137370).
+Each passed all 18 independent output comparisons. Warm probes restored both
+collections and hit the original C++, CUDA and Rust inputs. Cold/warm exports
+uploaded used/new objects through the timestamp filter. A real GCS rotation
+check with an injected three-week clock retained used objects and omitted
+unused variants in the next restore window; it did not delete remote data.
+
 For manual inspection, use `gcloud storage du --summarize` on the owned bucket.
 To bypass shared GCS objects without changing ABI, select an unused `namespace`
 in the config. The legacy main CUDA bootstrap still loads. A fully cold
@@ -181,8 +194,9 @@ workflow match the earlier inspected `172b6f9773734e726d4004d84fa96b55746ef9d5`;
 the later revision pins Rust to `1.99.0` with LLVM `23.1.1` as part of the
 reproducibility repair documented in its release guide.
 Full cache qualifications use `bd65b735982078ffff42619607bcaf6668863547`.
+The weekly transport is tested separately from the full-wheel recipe.
 The deployed storage/auth configuration is infra
-`42d75777be3eb4db961dc274f1dd57cdeb9c7cd9`, under `cloud/vllm-cache`.
+`2a03198e177489acc82fc90d68275455e9100fd9`, under `cloud/vllm-cache`.
 
 Port these files onto the serving recipe:
 
@@ -195,7 +209,9 @@ Port these files onto the serving recipe:
 Optional operating tools are `infra/release/cache-probe.Dockerfile`,
 `compiler_probe.py` and this guide. `infra/release/tests/test_gpu_release.py`
 accepts the new nonpublishing probe modes; `test_compile_cache.py` covers empty
-storage and failed access at the runner subprocess boundary.
+storage, failed access and weekly used-object renewal at the runner subprocess
+boundary. Keep the pre-compilation timestamp and preservation of file times
+when porting injection/export steps.
 
 Keep the serving recipe's `1.99.0` Rust pin, fixed CUDA compiler provenance,
 source date handling, Rust C date header, dependency constraints and stable
