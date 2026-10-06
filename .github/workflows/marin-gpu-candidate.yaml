@@ -18,11 +18,12 @@ jobs:
           project_id: hai-gcp-models
           workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
           service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
+          token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
       - name: Test existing bucket permissions without reading or writing objects
         env:
-          AUTH_TOKEN: ${{ steps.auth.outputs.auth_token }}
+          AUTH_TOKEN: ${{ steps.auth.outputs.access_token }}
           BUCKET_NAMES: '["artifacts.hai-gcp-models.appspot.com", "aw-proxy-evals", "codalab-stanford", "codalab-test", "crfm-helm-archive", "crfm-helm-dev", "crfm-helm-public", "cs324", "data-values", "data-values-europe-west4-b", "data-values-us-central-1", "eg-asset-bot-bucket", "gcf-sources-748532799086-us-central1", "gcf-v2-sources-748532799086-us-central1", "gcf-v2-uploads-748532799086-us-central1", "gcf-v2-uploads-748532799086.us-central1.cloudfunctions.appspot.com", "gcsfuse_mount", "hai-gcp-models-litellm-backups", "hai-gcp-models_cloudbuild", "hf_dataset_transfer_bucket", "levanter-checkpoints", "levanter-data", "levanter-empty", "levanter-eu", "marin-artifact-registry", "marin-asia-northeast-1", "marin-ckpt-eu-w4", "marin-ckpt-us-c2", "marin-ckpt-us-w4", "marin-data", "marin-dna-us-central1", "marin-dna-us-central2", "marin-dna-us-east5", "marin-eu-west4", "marin-eval-metadata", "marin-iac-state", "marin-marina", "marin-models-eu", "marin-models-us", "marin-public", "marin-us-central1", "marin-us-central2", "marin-us-east1", "marin-us-east5", "marin-us-west1", "marin-us-west4", "marin-usage-logs", "marin-usage-logs-acl", "marin-vlm", "marin-vlm-eu", "model_spec", "pubmed-mosaic", "pubmedgpt", "relbench-tgb-pr1-public-20260219-203451-3946", "run-sources-hai-gcp-models-us-central1", "tracem"]'
         run: |
           .venv/bin/python - <<'PYTHON'
@@ -40,7 +41,7 @@ jobs:
                   row={'bucket':bucket,'status':error.code}
               result.append(row)
               print(json.dumps(row))
-          Path('permissions.json').write_text(json.dumps({'identity':'github-iris@hai-gcp-models.iam.gserviceaccount.com','method':'read-only testIamPermissions under actual GitHub WIF','buckets':result},indent=2)+'\n')
+          Path('permissions.json').write_text(json.dumps({'identity':'github-iris@hai-gcp-models.iam.gserviceaccount.com','token':'explicit impersonated OAuth access_token','method':'read-only testIamPermissions under actual GitHub WIF','buckets':result},indent=2)+'\n')
           PYTHON
       - uses: actions/upload-artifact@v4
         with:
