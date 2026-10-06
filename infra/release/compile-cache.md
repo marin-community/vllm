@@ -84,7 +84,7 @@ build savings reduce waiting and CPU work rather than a runner bill.
 
 ## Qualification evidence
 
-The first qualifiers and sibling-branch warm repeat used source
+The first qualifiers and sibling-branch warm repeats used source
 `bd65b735982078ffff42619607bcaf6668863547`,
 the pinned images in `config.json`, Python 3.12.14, Torch 2.13.0+cu132, GCC 13.3.1,
 NVCC 13.2.78, Rust 1.95.0 and sccache 0.8.1. Build/export time excludes queue
@@ -93,24 +93,32 @@ and transport. Stage times overlap; H/M denotes compiler hits/misses.
 | Architecture | Build/export | Rust stable (H/M) | Rust exact version (H/M) | CUDA (H/M) |
 | --- | --- | --- | --- | --- |
 | [x86_64 first](https://github.com/marin-community/vllm/actions/runs/37358780056) | 30m 02s | 15m 11s (0/1697) | 5m 09s (0/3) | 22m 54s (416/0) |
+| [x86_64 warm](https://github.com/marin-community/vllm/actions/runs/37399551819) | 27m 19s | 6m 35s (1693/4) | 4m 48s (3/0) | 19m 15s (416/0) |
 | [aarch64 first](https://github.com/marin-community/vllm/actions/runs/37358607870) | 67m 07s | 11m 26s (0/1708) | 3m 08s (0/3) | 15m 08s (419/0) |
 | [aarch64 warm](https://github.com/marin-community/vllm/actions/runs/37367578359) | 65m 05s | 3m 38s (1704/4) | 3m 23s (3/0) | 13m 35s (419/0) |
 
 Every listed wheel passed metadata/content inspection and isolated installation
 without dependencies. All 16 x86 and 17 ARM packaged native libraries have the
-expected ELF architecture; the ARM repeat's 17 native libraries are byte
-identical to its first wheel. These CPU checks do not perform GPU runtime qualification.
+expected ELF architecture. Each repeat's native libraries are byte identical
+to its first wheel. These CPU checks do not perform GPU runtime qualification.
 
-The ARM pair saved 2m 02s (3.0%) in build/export and 7m 48s (68%) in the stable
-Rust stage. Python dependency preparation still took 44m 39s outside this
-cache. This is one pair, with overlapping stages and variable setup/link time.
-The repeat restored 468,607,421 Rust payload bytes in 10.360s; CUDA was already
-present from the legacy bootstrap, so its GCS read added zero payload in 3.245s.
-Saving took 9.297s and added four objects totaling 5,840,673 bytes. The four
-misses are OpenSSL's changing build timestamp and mimalloc's C build date/time,
+The x86 pair saved 2m 43s (9.0%) in build/export and 8m 36s (57%) in the stable
+Rust stage. ARM saved 2m 02s (3.0%) and 7m 48s (68%). ARM Python dependency
+preparation still took 44m 39s outside this cache. There is one pair per
+architecture, with overlapping stages and variable setup/link time.
+
+| Warm transfer | Rust restored | Restore total | New objects / bytes | Save total |
+| --- | --- | --- | --- | --- |
+| x86_64 | 471,385,374 bytes | 17.990s | 4 / 5,371,846 | 14.825s |
+| aarch64 | 468,607,421 bytes | 13.605s | 4 / 5,840,673 | 9.297s |
+
+Rust restore alone took 14.129s on x86 and 10.360s on ARM. CUDA was already
+present from the legacy bootstrap, so its GCS read added zero payload. The
+cross-branch compiler probes separately demonstrate CUDA GCS transport.
+Each architecture's four misses are OpenSSL's changing build timestamp and mimalloc's C build date/time,
 plus their two Rust sys-crate archives, which embed those native objects.
 The existing recipe retains those inputs; source-date repairs belong to the
-serving refresh. Matched x86 warm measurements remain pending.
+serving refresh.
 
 ## Probes and recovery
 
@@ -138,8 +146,11 @@ repair an invalid compiler/toolchain input.
 ## October 5 serving refresh handoff
 
 The cache work uses main `39e62869693c46402b1a95fde4fc55ca1aab9ae1` as its
-build baseline. The serving recipe inspected on October 5 is
-`172b6f9773734e726d4004d84fa96b55746ef9d5`.
+build baseline. The serving recipe inspected for this handoff is
+`2a45d43b04fcfc1658eb3433a29d9a6cd1995fcb`. Its Dockerfile and candidate
+workflow match the earlier inspected `172b6f9773734e726d4004d84fa96b55746ef9d5`;
+the later revision pins Rust to `1.99.0` with LLVM `23.1.1` as part of the
+reproducibility repair documented in its release guide.
 Full cache qualifications use `bd65b735982078ffff42619607bcaf6668863547`.
 The deployed storage/auth configuration is infra
 `42d75777be3eb4db961dc274f1dd57cdeb9c7cd9`, under `cloud/vllm-cache`.
@@ -157,8 +168,9 @@ Optional operating tools are `infra/release/cache-probe.Dockerfile`,
 accepts the new nonpublishing probe modes; `test_compile_cache.py` covers empty
 storage and failed access at the runner subprocess boundary.
 
-Keep the serving recipe's fixed CUDA compiler provenance, source date handling,
-Rust C date header, dependency constraints and stable CUDA object intermediates.
+Keep the serving recipe's `1.99.0` Rust pin, fixed CUDA compiler provenance,
+source date handling, Rust C date header, dependency constraints and stable
+CUDA object intermediates.
 Those change legitimate cache inputs and must retain their own compatibility
 checks. Merge the Rust setup shell blocks so its CFLAGS/CXXFLAGS are established
 before starting sccache/build_rust, and retain its provenance export stage.
