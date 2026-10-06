@@ -33,8 +33,10 @@ builds pass.
 runtime dependencies for CPython 3.12 on manylinux 2.28. Each architecture's
 release Docker build and wheel validation consume its file. Their direct inputs
 live in `gpu-constraints.in`,
-including one `torchaudio==2.11.0+cpu` constraint and the Transformers and
-Tokenizers versions qualified by the selected upstream CUDA test environment.
+including one `torchaudio==2.11.0+cpu` constraint and the agreed GPU targets,
+Transformers 5.18.0 and Tokenizers 0.23.2. The selected stable source's CUDA test
+environment pins Transformers 5.16.1; release gates qualify the target
+environment separately.
 The generated file records the PyPI, CUDA 13.2, CPU Torch, and FlashInfer
 indexes. uv selects compatible wheels for the builder architecture from those
 indexes.
@@ -43,6 +45,12 @@ The serving-only closure uses `fsspec==2026.6.0`, within Datasets 5.0.1's cap.
 The combined trainer profile separately selects Fsspec/S3fs 2026.4.0 and GCSfs
 2026.6.0. Agreement on the GPU core does not make these I/O closures identical;
 record the actual installed profile for each qualification or comparison.
+
+Pixtral carries the upstream Transformers 5.17 axial RoPE port from
+[`ec4a3a537068`](https://github.com/vllm-project/vllm/commit/ec4a3a537068db40afbc9374a67da719c8c9b964).
+Transformers 5.18 removed the rotary class and flattened position helper used by
+the selected vLLM release, breaking Llava model inspection in the scheduler
+suite. Drop this port when the selected stable release includes it.
 
 Use uv 0.11.21 and regenerate the file from the repository root with:
 
