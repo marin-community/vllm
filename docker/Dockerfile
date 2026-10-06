@@ -362,27 +362,8 @@ FROM rust-build-cache AS rust-build
 
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
-    --mount=type=cache,target=/root/.cache/sccache-rust,sharing=locked \
     --mount=type=bind,source=.git,target=.git \
-    BUILD_STARTED=$(date +%s) \
-    && if [ "$USE_SCCACHE" = "1" ]; then \
-        if [ -z "${SCCACHE_BUCKET}" ]; then \
-            unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
-        elif [ -n "${SCCACHE_ENDPOINT}" ]; then \
-            export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; \
-        fi; \
-        export RUSTC_WRAPPER=sccache; \
-        sccache --zero-stats; \
-    fi \
-    && SETUPTOOLS_SCM_PRETEND_METADATA="{dirty=false}" bash build_rust.sh \
-    && if [ "$USE_SCCACHE" = "1" ]; then \
-        sccache --show-stats > /tmp/rust-version-cache.txt; \
-        sccache --stop-server; \
-    fi \
-    && echo "compile-stage rust-version seconds=$(( $(date +%s) - BUILD_STARTED ))" > /tmp/rust-version-time.txt
-
-RUN cat /tmp/rust-version-time.txt \
-    && if [ "$USE_SCCACHE" = "1" ]; then cat /tmp/rust-version-cache.txt; fi
+    SETUPTOOLS_SCM_PRETEND_METADATA="{dirty=false}" bash build_rust.sh
 #################### RUST BUILD IMAGE ####################
 
 #################### CSRC BUILD IMAGE ####################

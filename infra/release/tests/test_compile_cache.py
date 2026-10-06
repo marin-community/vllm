@@ -78,6 +78,8 @@ if sys.argv[2:4]==["objects","list"]:
     files=prefix.rglob("*") if prefix.exists() else []
     print(json.dumps([{"name":str(p.relative_to(root)),"size":p.stat().st_size}
                       for p in files if p.is_file()]))
+elif sys.argv[2]=="rm":
+    shutil.rmtree(path(sys.argv[3]))
 else:
     source,destination=sys.argv[3:5]
     source=path(source) if source.startswith("gs://") else Path(source)
@@ -124,3 +126,23 @@ def test_weekly_rotation_preserves_used_objects_and_drops_unused_variants(
              tmp_path / "next.json", now=datetime(2026, 10, 19, tzinfo=UTC))
     assert (fresh / "cuda/hot").read_bytes() == b"compatible compiler output"
     assert not (fresh / "cuda/unused").exists()
+
+
+def test_save_prunes_expired_cache_without_deleting_other_architectures_or_data(
+    tmp_path, gcloud_objects,
+):
+    paths = (
+        "test/2026-08-31/x86_64/cuda/old",
+        "test/2026-08-31/aarch64/cuda/other-architecture",
+        "test/2026-10-05/x86_64/cuda/recent",
+        "other/2026-08-31/x86_64/cuda/unrelated-data",
+    )
+    for name in paths:
+        path = gcloud_objects / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"preserve unless this architecture's cache is expired")
+    transfer("save", "cache", "test", "x86_64", tmp_path / "local",
+             tmp_path / "save.json", used_since_ns=0,
+             now=datetime(2026, 10, 12, tzinfo=UTC))
+    assert not (gcloud_objects / paths[0]).exists()
+    assert all((gcloud_objects / name).exists() for name in paths[1:])

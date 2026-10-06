@@ -16,9 +16,6 @@ on:
       - ".github/workflows/marin-gpu-release.yaml"
       - "infra/nightly/specs/qwen3-0.6b-tpu.json"
       - "infra/release/README.md"
-      - "infra/release/compile-cache.md"
-      - "infra/release/cache-probe.Dockerfile"
-      - "infra/release/compiler_probe.py"
       - "infra/release/gpu_validation.py"
       - "infra/release/tpu_config.json"
       - "infra/release/tpu_release.py"
@@ -44,21 +41,10 @@ on:
           - publish
           - qualify-x86_64
           - qualify-aarch64
-          - probe-x86_64
-          - probe-aarch64
       vllm_commit:
         description: "Exact vLLM package source for the TPU lane"
         required: true
         default: 4c1c798a7b6072aab4f435b0fe0eb9e3ae9e5e19
-        type: string
-      probe_expect:
-        description: "Compiler probe starts cold or restores another branch's objects"
-        default: miss
-        type: choice
-        options: [miss, hit]
-      probe_namespace:
-        description: "Separate cache namespace for a cold/warm compiler probe pair"
-        default: compiler-probe
         type: string
       tpu_inference_commit:
         description: "Exact tpu-inference package source for the TPU lane"
@@ -72,7 +58,7 @@ on:
         type: string
 
 concurrency:
-  group: marin-vllm-${{ inputs.lane || 'gpu' }}-candidate-${{ inputs.gpu_mode || 'publish' }}-${{ github.sha }}
+  group: marin-vllm-${{ inputs.lane || 'gpu' }}-candidate-${{ github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -94,6 +80,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       cache_provider: ${{ steps.matrix.outputs.cache_provider }}
+      cache_service_account: ${{ steps.matrix.outputs.cache_service_account }}
       candidate_tag: ${{ steps.source.outputs.candidate_tag }}
       created_at: ${{ steps.source.outputs.created_at }}
     steps:
@@ -123,7 +110,7 @@ jobs:
         run: |
           MATRIX=$(.venv/bin/python infra/release/gpu_release.py build-matrix --config "$RELEASE_CONFIG")
           if [[ "$GPU_MODE" != publish ]]; then
-            ARCHITECTURE=${GPU_MODE#*-}
+            ARCHITECTURE=${GPU_MODE#qualify-}
             MATRIX=$(jq -c --arg architecture "$ARCHITECTURE" \
               '{include: [.include[] | select(.architecture == $architecture)]}' \
               <<< "$MATRIX")
@@ -134,6 +121,7 @@ jobs:
           fi
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
           echo "cache_provider=$(jq -r '.workload_identity_provider' infra/release/compile-cache.json)" >> "$GITHUB_OUTPUT"
+          echo "cache_service_account=$(jq -r '.service_account' infra/release/compile-cache.json)" >> "$GITHUB_OUTPUT"
 
       - name: Resolve the immutable candidate identity
         id: source
@@ -148,7 +136,6 @@ jobs:
   build:
     name: Build ${{ matrix.architecture }} wheel
     needs: prepare
-    if: ${{ !startsWith(inputs.gpu_mode, 'probe-') }}
     permissions:
       contents: read
       id-token: write
@@ -244,6 +231,8 @@ jobs:
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ needs.prepare.outputs.cache_provider }}
+          service_account: ${{ needs.prepare.outputs.cache_service_account }}
+          token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
 
@@ -253,7 +242,7 @@ jobs:
       - name: Restore shared compiler objects
         continue-on-error: true
         env:
-          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-auth.outputs.auth_token }}
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-auth.outputs.access_token }}
         run: |
           .venv/bin/python infra/release/compile_cache.py restore \
             --config infra/release/compile-cache.json \
@@ -307,20 +296,22 @@ jobs:
             --output type=local,dest=compile-cache \
             -f infra/release/export-compile-cache.Dockerfile infra/release
 
-      # Obtain a fresh five-minute federated token after the long compile.
+      # Refresh the build account's access token after the long compile.
       - name: Authenticate compiler cache writes
         id: cache-save-auth
         continue-on-error: true
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ needs.prepare.outputs.cache_provider }}
+          service_account: ${{ needs.prepare.outputs.cache_service_account }}
+          token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
 
       - name: Save new compiler objects
         continue-on-error: true
         env:
-          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-save-auth.outputs.auth_token }}
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-save-auth.outputs.access_token }}
         run: |
           .venv/bin/python infra/release/compile_cache.py save \
             --config infra/release/compile-cache.json \
@@ -364,113 +355,13 @@ jobs:
             --output "artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json"
           mv "${WHEELS[0]}" artifacts/
 
-      - name: Install the inspected qualification wheel
-        if: startsWith(inputs.gpu_mode, 'qualify-')
-        run: |
-          set -o pipefail
-          uv venv --python 3.12 wheel-install
-          uv pip install --python wheel-install/bin/python --no-deps artifacts/*.whl
-          uv pip show --python wheel-install/bin/python vllm | tee artifacts/install.txt
-
       - uses: actions/upload-artifact@v4
         with:
           name: marin-vllm-gpu-candidate-${{ matrix.architecture }}
           path: |
             artifacts/*.whl
             artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json
-            artifacts/install.txt
           if-no-files-found: error
-          retention-days: 14
-
-  cache-probe:
-    name: Probe ${{ matrix.architecture }} compiler cache
-    needs: prepare
-    if: startsWith(inputs.gpu_mode, 'probe-')
-    env:
-      PROBE_NAMESPACE: ${{ inputs.probe_namespace }}
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: ${{ env.UV_VERSION }}
-      - run: uv venv --python 3.12
-      - uses: docker/setup-buildx-action@v3
-      - uses: google-github-actions/setup-gcloud@v3
-      - uses: google-github-actions/auth@v3
-        id: cache-auth
-        with:
-          workload_identity_provider: ${{ needs.prepare.outputs.cache_provider }}
-          create_credentials_file: false
-          export_environment_variables: false
-      - name: Restore probe objects
-        env:
-          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-auth.outputs.auth_token }}
-        run: |
-          .venv/bin/python infra/release/compile_cache.py restore \
-            --config infra/release/compile-cache.json --namespace "$PROBE_NAMESPACE" \
-            --architecture "${{ matrix.architecture }}" \
-            --directory compile-cache --output artifacts/cache-restore.json
-      - uses: reproducible-containers/buildkit-cache-dance@v3.1.2
-        with:
-          skip-extraction: true
-          cache-map: |
-            {
-              "compile-cache/cuda": "/root/.cache/sccache",
-              "compile-cache/rust": "/root/.cache/sccache-rust"
-            }
-      - name: Exercise compiler correctness and invalidation
-        run: |
-          set -o pipefail
-          mkdir -p artifacts
-          .venv/bin/python -c 'import time; print(time.time_ns())' > artifacts/cache-started-ns.txt
-          RUST_TOOLCHAIN=$(.venv/bin/python -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
-          docker buildx build \
-            --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
-            --build-arg RUST_TOOLCHAIN="$RUST_TOOLCHAIN" \
-            --build-arg PROBE_EXPECT="${{ inputs.probe_expect }}" \
-            --build-arg PROBE_VARIANT="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            --output type=local,dest=artifacts \
-            -f infra/release/cache-probe.Dockerfile infra/release \
-            --progress plain 2>&1 | tee artifacts/probe.log
-      - name: Export probe objects
-        run: |
-          docker buildx build \
-            --build-arg CACHE_EXPORT_IMAGE="${{ matrix.build_base_image }}" \
-            --build-arg CACHE_EXPORT_NONCE="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            --output type=local,dest=compile-cache \
-            -f infra/release/export-compile-cache.Dockerfile infra/release
-          test -n "$(find compile-cache/cuda -type f -print -quit)"
-          test -n "$(find compile-cache/rust -type f -print -quit)"
-      - uses: google-github-actions/auth@v3
-        id: cache-save-auth
-        with:
-          workload_identity_provider: ${{ needs.prepare.outputs.cache_provider }}
-          create_credentials_file: false
-          export_environment_variables: false
-      - name: Save probe objects
-        env:
-          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-save-auth.outputs.auth_token }}
-        run: |
-          .venv/bin/python infra/release/compile_cache.py save \
-            --config infra/release/compile-cache.json --namespace "$PROBE_NAMESPACE" \
-            --architecture "${{ matrix.architecture }}" \
-            --directory compile-cache --output artifacts/cache-save.json \
-            --used-since-ns "$(cat artifacts/cache-started-ns.txt)"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: compiler-probe-${{ matrix.architecture }}
-          path: artifacts/
           retention-days: 14
 
   publish:

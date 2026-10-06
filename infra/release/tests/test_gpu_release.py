@@ -96,8 +96,6 @@ def test_candidate_gpu_modes_keep_single_architecture_builds_nonpublishing():
         "publish",
         "qualify-x86_64",
         "qualify-aarch64",
-        "probe-x86_64",
-        "probe-aarch64",
     ]
     assert publish["if"] == (
         "github.event_name == 'push' || inputs.gpu_mode == 'publish'"

@@ -7,11 +7,12 @@ import os
 import subprocess
 import tempfile
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 STAGES = ("cuda", "rust")
 TRANSFER_TIMEOUT = 900
+CACHE_RETENTION_DAYS = 21
 
 
 def local_objects(directory: Path) -> dict[str, int]:
@@ -124,6 +125,26 @@ def transfer(
             finally:
                 record["seconds"] = round(time.monotonic() - started, 3)
                 logging.info("Compile cache: %s", json.dumps(record, sort_keys=True))
+        if operation == "save":
+            # Existing shared buckets have other owners. Prune only this
+            # namespace/architecture, after the entire week is 21 days old.
+            cutoff = today - timedelta(days=CACHE_RETENTION_DAYS)
+            expired = {
+                parts[0] for key in remote_objects(bucket, f"{namespace}/")
+                if len(parts := key.split("/", 2)) == 3
+                and parts[1] == architecture
+                and date.fromisoformat(parts[0]) + timedelta(days=7) <= cutoff
+            }
+            for day in sorted(expired):
+                subprocess.run(
+                    [
+                        "gcloud", "storage", "rm",
+                        f"gs://{bucket}/{namespace}/{day}/{architecture}/**",
+                        "--recursive", "--quiet",
+                    ],
+                    check=True, timeout=TRANSFER_TIMEOUT,
+                    stdout=subprocess.DEVNULL,
+                )
     finally:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(records, indent=2) + "\n")
@@ -134,9 +155,6 @@ def main() -> None:
     parser.add_argument("operation", choices=("restore", "save"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--architecture", choices=("x86_64", "aarch64"), required=True)
-    parser.add_argument(
-        "--namespace", help="Owned test namespace; normally config namespace"
-    )
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -145,14 +163,9 @@ def main() -> None:
     )
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
-    namespace = args.namespace or config["namespace"]
-    if not namespace or any(
-        char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in namespace
-    ):
-        raise ValueError("Namespace allows only lowercase letters, digits or hyphens")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     transfer(
-        args.operation, config["bucket"], namespace, args.architecture,
+        args.operation, config["bucket"], config["namespace"], args.architecture,
         args.directory, args.output, used_since_ns=args.used_since_ns,
     )
 
