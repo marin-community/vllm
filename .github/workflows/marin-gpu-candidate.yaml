@@ -1,64 +1,44 @@
-name: Check existing Marin compiler cache transport
+name: Check Marin registry cache on fresh native builders
 on: workflow_dispatch
 permissions:
   contents: read
-  id-token: write
+  packages: write
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-24.04
+          - architecture: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.11.21"
-      - run: uv venv --python 3.12
-      - uses: google-github-actions/setup-gcloud@v3
-      - uses: google-github-actions/auth@v3
-        id: auth
-        with:
-          project_id: hai-gcp-models
-          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
-          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
-          token_format: access_token
-          create_credentials_file: false
-          export_environment_variables: false
-      - name: Verify cache round trip and expiry in an isolated test prefix
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Export and import layers on two fresh builders
         env:
-          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          CACHE_REF: ghcr.io/marin-community/vllm-build-cache:smoke-${{ matrix.architecture }}
         run: |
-          .venv/bin/python - <<'PYTHON'
-          import json,os,subprocess,sys
-          from datetime import UTC,datetime
-          from pathlib import Path
-          sys.path.insert(0,'infra/release')
-          from compile_cache import transfer,remote_objects
-          bucket='marin-public'
-          namespace='build-cache/vllm/access-check-'+os.environ['GITHUB_RUN_ID']
-          assert not remote_objects(bucket,namespace+'/')
-          seed=Path('cache-seed')
-          for stage in ('cuda','rust'):
-              p=seed/stage/'transport-test'
-              p.parent.mkdir(parents=True)
-              p.write_bytes(b'compiler-cache-transport-test')
-          old=datetime(2026,8,31,tzinfo=UTC)
-          current=datetime(2026,10,5,tzinfo=UTC)
-          transfer('save',bucket,namespace,'x86_64',seed,Path('old-save.json'),used_since_ns=0,now=old)
-          fresh=Path('cache-fresh')
-          transfer('restore',bucket,namespace,'x86_64',fresh,Path('restore.json'),now=old)
-          assert all((fresh/stage/'transport-test').read_bytes()==(seed/stage/'transport-test').read_bytes() for stage in ('cuda','rust'))
-          transfer('save',bucket,namespace,'x86_64',fresh,Path('new-save.json'),used_since_ns=0,now=current)
-          assert not remote_objects(bucket,namespace+'/2026-08-31/')
-          assert len(remote_objects(bucket,namespace+'/2026-10-05/'))==2
-          subprocess.run(['gcloud','storage','rm','gs://'+bucket+'/'+namespace+'/**','--recursive','--quiet'],check=True)
-          assert not remote_objects(bucket,namespace+'/')
-          Path('result.json').write_text(json.dumps({'status':'passed','bucket':bucket,'namespace':namespace,'source':'591c0d2d65c7210c9b04905e300ba862461dd04c','identity':'github-iris@hai-gcp-models.iam.gserviceaccount.com','clock':'injected weeks; actual GCS I/O','roundtrip':'both caches byte-identical','expiry':'old weekly prefix removed; current prefix preserved','cleanup':'all test objects removed'},indent=2)+'\n')
-          PYTHON
+          set -o pipefail
+          mkdir -p context evidence first second
+          printf '%s\n' 'FROM busybox AS build' 'RUN echo stable-cache-input > /marker' 'FROM scratch' 'COPY --from=build /marker /marker' > context/Dockerfile
+          docker buildx build --cache-to type=registry,ref="$CACHE_REF",mode=max,compression=zstd,compression-level=3,oci-mediatypes=true,image-manifest=true,ignore-error=true --output type=local,dest=first context --progress plain 2>&1 | tee evidence/first.log
+          docker buildx imagetools inspect "$CACHE_REF" --raw > evidence/manifest.json
+          docker buildx create --driver docker-container --name "fresh-$GITHUB_RUN_ID" --use
+          docker buildx build --cache-from type=registry,ref="$CACHE_REF" --output type=local,dest=second context --progress plain 2>&1 | tee evidence/second.log
+          cmp first/marker second/marker
+          rg CACHED evidence/second.log
+          docker buildx rm "fresh-$GITHUB_RUN_ID"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: marin-compiler-cache-roundtrip
-          path: '*.json'
+          name: registry-smoke-${{ matrix.architecture }}
+          path: evidence/
           retention-days: 14
