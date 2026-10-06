@@ -45,7 +45,7 @@ on:
         description: "Controlled layer-cache benchmark"
         default: seed
         type: choice
-        options: [seed, off, warm]
+        options: [seed, "off", warm]
       vllm_commit:
         description: "Exact vLLM package source for the TPU lane"
         required: true
@@ -63,13 +63,14 @@ on:
         type: string
 
 concurrency:
-  group: cache-benchmark-${{ inputs.gpu_mode }}-${{ inputs.registry_mode }}-${{ github.sha }}
+  group: cache-benchmark-${{ inputs.gpu_mode }}-${{ inputs.registry_mode }}-${{ env.BENCHMARK_SHA }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
+  BENCHMARK_SHA: 401e94da9d4d6b5f9df0b1b9b045382abef21b2d
   RELEASE_CONFIG: infra/release/config.json
   TPU_RELEASE_CONFIG: infra/release/tpu_config.json
   UV_VERSION: "0.11.21"
@@ -90,6 +91,8 @@ jobs:
       created_at: ${{ steps.source.outputs.created_at }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BENCHMARK_SHA }}
 
       - uses: astral-sh/setup-uv@v6
         with:
@@ -106,7 +109,7 @@ jobs:
           .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-ref "$GITHUB_REF" \
-            --source-commit "$GITHUB_SHA"
+            --source-commit "$BENCHMARK_SHA"
 
       - name: Read the release platforms
         id: matrix
@@ -131,8 +134,8 @@ jobs:
       - name: Resolve the immutable candidate identity
         id: source
         run: |
-          SHORT_SHA=$(git rev-parse --short=12 "$GITHUB_SHA")
-          CREATED_AT=$(git show -s --format=%cI "$GITHUB_SHA")
+          SHORT_SHA=$(git rev-parse --short=12 "$BENCHMARK_SHA")
+          CREATED_AT=$(git show -s --format=%cI "$BENCHMARK_SHA")
           {
             echo "candidate_tag=marin-vllm-gpu-candidate-${SHORT_SHA}"
             echo "created_at=${CREATED_AT}"
@@ -156,6 +159,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.BENCHMARK_SHA }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -210,17 +214,17 @@ jobs:
           git remote add upstream https://github.com/vllm-project/vllm.git 2>/dev/null || \
             git remote set-url upstream https://github.com/vllm-project/vllm.git
           git fetch --quiet --no-tags upstream main
-          UPSTREAM_BASE=$(git merge-base upstream/main "$GITHUB_SHA")
+          UPSTREAM_BASE=$(git merge-base upstream/main "$BENCHMARK_SHA")
 
           VERSION_DATE=$(date -u -d "${{ needs.prepare.outputs.created_at }}" +%Y%m%d)
-          VERSION_TAG="v0.0.0.dev${VERSION_DATE}+marin.$(git rev-parse --short=12 "$GITHUB_SHA")"
+          VERSION_TAG="v0.0.0.dev${VERSION_DATE}+marin.$(git rev-parse --short=12 "$BENCHMARK_SHA")"
           while read -r tag; do
             [[ -z "$tag" ]] || git tag --delete "$tag"
-          done < <(git tag --points-at "$GITHUB_SHA")
-          git tag "$VERSION_TAG" "$GITHUB_SHA"
+          done < <(git tag --points-at "$BENCHMARK_SHA")
+          git tag "$VERSION_TAG" "$BENCHMARK_SHA"
 
           printf '%s\n' \
-            "Source: $GITHUB_SHA" \
+            "Source: $BENCHMARK_SHA" \
             "Upstream base: $UPSTREAM_BASE" \
             "Build base: ${{ matrix.build_base_image }}" \
             "CUDA: ${{ matrix.cuda_version }}; SM targets: ${{ matrix.sm_targets }}" \
@@ -239,7 +243,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: sccache-cache
-          key: marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-${{ github.sha }}
+          key: marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-${{ env.BENCHMARK_SHA }}
           restore-keys: |
             marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-
 
@@ -393,7 +397,7 @@ jobs:
             --config "$RELEASE_CONFIG" \
             --wheel "${WHEELS[0]}" \
             --architecture "${{ matrix.architecture }}" \
-            --fork-commit "$GITHUB_SHA" \
+            --fork-commit "$BENCHMARK_SHA" \
             --upstream-base "${{ steps.provenance.outputs.upstream_base }}" \
             --built-at "${{ steps.provenance.outputs.built_at }}" \
             --base-image "${{ matrix.build_base_image }}" \
@@ -479,8 +483,8 @@ jobs:
         if: steps.existing.outputs.exists != 'true'
         run: |
           SOURCE_COMMIT=$(jq -r '.source.fork_commit' candidate/marin-vllm-gpu-manifest.json)
-          if [[ "$SOURCE_COMMIT" != "$GITHUB_SHA" ]]; then
-            echo "Candidate source $SOURCE_COMMIT does not match workflow commit $GITHUB_SHA" >&2
+          if [[ "$SOURCE_COMMIT" != "$BENCHMARK_SHA" ]]; then
+            echo "Candidate source $SOURCE_COMMIT does not match workflow commit $BENCHMARK_SHA" >&2
             exit 1
           fi
           .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
@@ -490,8 +494,8 @@ jobs:
             --candidate-tag "$CANDIDATE_TAG"
           gh release create "$CANDIDATE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Marin vLLM GPU candidate $(git rev-parse --short=12 "$GITHUB_SHA")" \
+            --target "$BENCHMARK_SHA" \
+            --title "Marin vLLM GPU candidate $(git rev-parse --short=12 "$BENCHMARK_SHA")" \
             --notes-file candidate-notes.md \
             --prerelease \
             candidate/*.whl \
@@ -618,7 +622,7 @@ jobs:
       - name: Assemble and verify pair manifest
         id: manifest
         run: |
-          CREATED_AT=$(git show -s --format=%cI "$GITHUB_SHA")
+          CREATED_AT=$(git show -s --format=%cI "$BENCHMARK_SHA")
           WHEEL_ARGS=()
           while IFS= read -r wheel; do
             WHEEL_ARGS+=(--wheel "$wheel")
@@ -629,7 +633,7 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --vllm-commit "${{ steps.pair.outputs.vllm_commit }}" \
             --tpu-inference-commit "${{ steps.pair.outputs.tpu_commit }}" \
-            --workflow-commit "$GITHUB_SHA" \
+            --workflow-commit "$BENCHMARK_SHA" \
             --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --created-at "$CREATED_AT" \
             --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
@@ -658,7 +662,7 @@ jobs:
           fi
           gh release create "$CANDIDATE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --target "$BENCHMARK_SHA" \
             --title "Marin vLLM TPU candidate ${CANDIDATE_TAG#marin-vllm-tpu-candidate-}" \
             --notes-file candidate-notes.md \
             --prerelease \
