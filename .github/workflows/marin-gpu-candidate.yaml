@@ -63,7 +63,7 @@ on:
         type: string
 
 concurrency:
-  group: cache-benchmark-${{ inputs.gpu_mode }}-${{ inputs.registry_mode }}-${{ env.BENCHMARK_SHA }}
+  group: cache-benchmark-${{ inputs.gpu_mode }}-${{ inputs.registry_mode }}-401e94da9
   cancel-in-progress: false
 
 permissions:
