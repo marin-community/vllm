@@ -305,14 +305,16 @@ __device__ void compute_dynamic_per_token_scales(
   if constexpr (group_size > 0) {
     __shared__ float s_max_vals[1024];
 
-    int64_t const num_groups = hidden_size / group_size;
-    int64_t const threads_per_group = blockDim.x / num_groups;
-    int64_t const thread_in_group = threadIdx.x % threads_per_group;
-    int64_t const group_offset =
+    // Local indices fit in int32; tensor offsets remain int64. This keeps
+    // CUDA 13.2 code generation stable for the group reduction loops.
+    int32_t const num_groups = hidden_size / group_size;
+    int32_t const threads_per_group = blockDim.x / num_groups;
+    int32_t const thread_in_group = threadIdx.x % threads_per_group;
+    int32_t const group_offset =
         threadIdx.x / threads_per_group * (group_size >> 2);
-    int64_t const thread_offset = group_offset + thread_in_group;
-    int64_t const thread_end = min(group_offset + (group_size >> 2),
-                                   static_cast<int64_t>(hidden_size >> 2));
+    int32_t const thread_offset = group_offset + thread_in_group;
+    int32_t const thread_end = min(group_offset + (group_size >> 2),
+                                   static_cast<int32_t>(hidden_size >> 2));
     vec_input =
         reinterpret_cast<vec4_t<scalar_t> const*>(&input[input_token_offset]);
     vec_weight = reinterpret_cast<vec4_t<scalar_t> const*>(weight);
@@ -352,15 +354,15 @@ __device__ void compute_dynamic_per_token_scales(
     s_max_vals[threadIdx.x] = block_absmax_val_maybe;
     __syncthreads();
 
-    int64_t const warp_size = WARP_SIZE;
-    int64_t const num_warps = blockDim.x / warp_size;
-    int64_t const warp_id = threadIdx.x / warp_size;
-    int64_t const thread_in_warp = threadIdx.x % warp_size;
-    int64_t const groups_per_warp = (num_groups + num_warps - 1) / num_warps;
+    int32_t const warp_size = WARP_SIZE;
+    int32_t const num_warps = blockDim.x / warp_size;
+    int32_t const warp_id = threadIdx.x / warp_size;
+    int32_t const thread_in_warp = threadIdx.x % warp_size;
+    int32_t const groups_per_warp = (num_groups + num_warps - 1) / num_warps;
     for (auto i = 0; i < groups_per_warp; ++i) {
-      int64_t const group_id = i * num_warps + warp_id;
+      int32_t const group_id = i * num_warps + warp_id;
       if (group_id < num_groups) {
-        int64_t const warp_start = group_id * threads_per_group;
+        int32_t const warp_start = group_id * threads_per_group;
         float warp_max = 0.0f;
         for (auto j = thread_in_warp; j < threads_per_group; j += warp_size) {
           warp_max = fmaxf(warp_max, s_max_vals[warp_start + j]);
@@ -390,7 +392,7 @@ __device__ void compute_dynamic_per_token_scales(
         all_token_scales[(threadIdx.x / threads_per_group) * scale_rows +
                          blockIdx.x] = scale;
       } else {
-        all_token_scales[blockIdx.x * num_groups +
+        all_token_scales[static_cast<int64_t>(blockIdx.x) * num_groups +
                          threadIdx.x / threads_per_group] = scale;
       }
     }

@@ -113,6 +113,16 @@ with source seeds. Complete native wheel reproduction is still required. See
 the [temporary directory option](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-compiler-driver-nvcc/index.html#objdir-as-tempdir-objtemp)
 and [random seed option](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-compiler-driver-nvcc/index.html#frandom-seed-frandom-seed).
 
+The per-block RMS quantization kernel uses 32-bit local group and thread indices
+while retaining 64-bit global tensor offsets. Native ARM CICC 13.2.86 produced
+four PTX variants across six uncached runs with the original 64-bit local
+indices, even with identical preprocessed input and source seeds. All six
+runs with bounded 32-bit indices matched both PTX and complete CUDA objects.
+The compiler version and optimization settings remain unchanged. GPU numerical
+checks and independent complete wheel comparisons remain required. Drop this
+port when upstream carries the bounded indices or the compiler produces stable
+code for the original loops.
+
 The toolkit extras pin the compiler and headers used by
 runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the
 available CUDA 13.0 TorchAudio wheel rejects Torch cu132, while audio
