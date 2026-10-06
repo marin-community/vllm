@@ -1,17 +1,21 @@
-name: Inspect existing Marin bucket access
+name: Check existing Marin compiler cache transport
 on: workflow_dispatch
 permissions:
   contents: read
   id-token: write
 jobs:
-  inspect:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           version: "0.11.21"
       - run: uv venv --python 3.12
+      - uses: google-github-actions/setup-gcloud@v3
       - uses: google-github-actions/auth@v3
         id: auth
         with:
@@ -21,30 +25,40 @@ jobs:
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
-      - name: Test existing bucket permissions without reading or writing objects
+      - name: Verify cache round trip and expiry in an isolated test prefix
         env:
-          AUTH_TOKEN: ${{ steps.auth.outputs.access_token }}
-          BUCKET_NAMES: '["artifacts.hai-gcp-models.appspot.com", "aw-proxy-evals", "codalab-stanford", "codalab-test", "crfm-helm-archive", "crfm-helm-dev", "crfm-helm-public", "cs324", "data-values", "data-values-europe-west4-b", "data-values-us-central-1", "eg-asset-bot-bucket", "gcf-sources-748532799086-us-central1", "gcf-v2-sources-748532799086-us-central1", "gcf-v2-uploads-748532799086-us-central1", "gcf-v2-uploads-748532799086.us-central1.cloudfunctions.appspot.com", "gcsfuse_mount", "hai-gcp-models-litellm-backups", "hai-gcp-models_cloudbuild", "hf_dataset_transfer_bucket", "levanter-checkpoints", "levanter-data", "levanter-empty", "levanter-eu", "marin-artifact-registry", "marin-asia-northeast-1", "marin-ckpt-eu-w4", "marin-ckpt-us-c2", "marin-ckpt-us-w4", "marin-data", "marin-dna-us-central1", "marin-dna-us-central2", "marin-dna-us-east5", "marin-eu-west4", "marin-eval-metadata", "marin-iac-state", "marin-marina", "marin-models-eu", "marin-models-us", "marin-public", "marin-us-central1", "marin-us-central2", "marin-us-east1", "marin-us-east5", "marin-us-west1", "marin-us-west4", "marin-usage-logs", "marin-usage-logs-acl", "marin-vlm", "marin-vlm-eu", "model_spec", "pubmed-mosaic", "pubmedgpt", "relbench-tgb-pr1-public-20260219-203451-3946", "run-sources-hai-gcp-models-us-central1", "tracem"]'
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
         run: |
           .venv/bin/python - <<'PYTHON'
-          import json,os,urllib.request,urllib.parse,urllib.error
+          import json,os,subprocess,sys
+          from datetime import UTC,datetime
           from pathlib import Path
-          permissions=['storage.objects.get','storage.objects.list','storage.objects.create','storage.objects.delete','storage.objects.update']
-          result=[]
-          for bucket in json.loads(os.environ['BUCKET_NAMES']):
-              url='https://storage.googleapis.com/storage/v1/b/'+urllib.parse.quote(bucket,safe='')+'/iam/testPermissions?'+urllib.parse.urlencode([('permissions',p) for p in permissions])
-              request=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['AUTH_TOKEN']})
-              try:
-                  with urllib.request.urlopen(request,timeout=20) as response: data=json.load(response)
-                  row={'bucket':bucket,'permissions':data.get('permissions',[])}
-              except urllib.error.HTTPError as error:
-                  row={'bucket':bucket,'status':error.code}
-              result.append(row)
-              print(json.dumps(row))
-          Path('permissions.json').write_text(json.dumps({'identity':'github-iris@hai-gcp-models.iam.gserviceaccount.com','token':'explicit impersonated OAuth access_token','method':'read-only testIamPermissions under actual GitHub WIF','buckets':result},indent=2)+'\n')
+          sys.path.insert(0,'infra/release')
+          from compile_cache import transfer,remote_objects
+          bucket='marin-public'
+          namespace='build-cache/vllm/access-check-'+os.environ['GITHUB_RUN_ID']
+          assert not remote_objects(bucket,namespace+'/')
+          seed=Path('cache-seed')
+          for stage in ('cuda','rust'):
+              p=seed/stage/'transport-test'
+              p.parent.mkdir(parents=True)
+              p.write_bytes(b'compiler-cache-transport-test')
+          old=datetime(2026,8,31,tzinfo=UTC)
+          current=datetime(2026,10,5,tzinfo=UTC)
+          transfer('save',bucket,namespace,'x86_64',seed,Path('old-save.json'),used_since_ns=0,now=old)
+          fresh=Path('cache-fresh')
+          transfer('restore',bucket,namespace,'x86_64',fresh,Path('restore.json'),now=old)
+          assert all((fresh/stage/'transport-test').read_bytes()==(seed/stage/'transport-test').read_bytes() for stage in ('cuda','rust'))
+          transfer('save',bucket,namespace,'x86_64',fresh,Path('new-save.json'),used_since_ns=0,now=current)
+          assert not remote_objects(bucket,namespace+'/2026-08-31/')
+          assert len(remote_objects(bucket,namespace+'/2026-10-05/'))==2
+          subprocess.run(['gcloud','storage','rm','gs://'+bucket+'/'+namespace+'/**','--recursive','--quiet'],check=True)
+          assert not remote_objects(bucket,namespace+'/')
+          Path('result.json').write_text(json.dumps({'status':'passed','bucket':bucket,'namespace':namespace,'source':'591c0d2d65c7210c9b04905e300ba862461dd04c','identity':'github-iris@hai-gcp-models.iam.gserviceaccount.com','clock':'injected weeks; actual GCS I/O','roundtrip':'both caches byte-identical','expiry':'old weekly prefix removed; current prefix preserved','cleanup':'all test objects removed'},indent=2)+'\n')
           PYTHON
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: marin-build-bucket-permissions
-          path: permissions.json
+          name: marin-compiler-cache-roundtrip
+          path: '*.json'
           retention-days: 14
