@@ -100,6 +100,9 @@ idle data is collected on the next save, without changing bucket policies.
 Per-stage hit/miss counts, elapsed time and transfer bytes appear in build
 artifacts. Detailed measurements and the serving handoff are in
 [the cache design](https://echo.oa.dev/wiki/613).
+Unchanged build layers use `ghcr.io/marin-community/vllm-build-cache:<architecture>`
+with Iris's registry-cache settings. Missing imports and failed exports do not
+fail the wheel build; GCS compiler objects support steps that must compile again.
 
 GPU publication runs must use the repository's default branch, which this fork
 expects to be `main`. A candidate from a prior `main` commit remains valid after
