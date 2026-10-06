@@ -24,6 +24,11 @@ The x86_64 wheel targets SM90 on H100, and the aarch64 wheel targets SM100 on
 GB200. Every configured validation gate must pass. Compilation uses two jobs
 with one NVCC thread each and an 800 MiB wheel limit.
 
+The candidate workflow's `qualify` mode builds both architectures and uploads
+workflow artifacts. `qualify-x86_64` and `qualify-aarch64` select one architecture.
+The `stage` mode publishes an immutable candidate from `main-next` after both
+builds pass.
+
 `gpu-constraints.txt` and `gpu-constraints-aarch64.txt` pin the Python build and
 runtime dependencies for CPython 3.12 on manylinux 2.28. Each architecture's
 release Docker build and wheel validation consume its file. Their direct inputs
@@ -98,8 +103,15 @@ FlashAttention's fetched targets. The directory-level CMake option reaches
 those targets even though they redefine the extension helper. Object paths
 remain separate for each target and source, and NVCC removes its intermediate
 files after compilation. A repeated local NVCC 13.2.86 compile with CCCL headers
-produced identical object bytes with this option; complete native wheel
-reproduction is still required. See the [NVCC option documentation](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-compiler-driver-nvcc/index.html#objdir-as-tempdir-objtemp).
+produced identical object bytes with this option when its kernel had a fixed
+external name. Template-only translation units still embedded process IDs in
+internal symbols. The CUDA compile rule also passes `--frandom-seed=<SOURCE>`
+to give each source a distinct, stable seed, including fetched targets that
+redefine the extension helper. A CMake/Ninja/sccache probe reproduced the
+unseeded differences and matched both targets across three forced cold builds
+with source seeds. Complete native wheel reproduction is still required. See
+the [temporary directory option](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-compiler-driver-nvcc/index.html#objdir-as-tempdir-objtemp)
+and [random seed option](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-compiler-driver-nvcc/index.html#frandom-seed-frandom-seed).
 
 The toolkit extras pin the compiler and headers used by
 runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the

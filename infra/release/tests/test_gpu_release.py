@@ -85,7 +85,7 @@ def test_candidate_build_ignores_release_only_changes():
     }
 
 
-def test_candidate_gpu_modes_keep_single_architecture_builds_nonpublishing():
+def test_candidate_gpu_modes_keep_qualifying_builds_nonpublishing():
     workflow = yaml.load(
         GPU_CANDIDATE_WORKFLOW_PATH.read_text(), Loader=yaml.BaseLoader
     )
@@ -98,11 +98,13 @@ def test_candidate_gpu_modes_keep_single_architecture_builds_nonpublishing():
     assert gpu_mode["options"] == [
         "publish",
         "stage",
+        "qualify",
         "qualify-x86_64",
         "qualify-aarch64",
     ]
     publish_condition = " ".join(publish["if"].split())
     assert "inputs.gpu_mode == 'stage'" in publish_condition
+    assert "inputs.gpu_mode == 'qualify'" not in publish_condition
     assert "inputs.gpu_mode == 'qualify-x86_64'" not in publish_condition
     assert "inputs.gpu_mode == 'qualify-aarch64'" not in publish_condition
 
