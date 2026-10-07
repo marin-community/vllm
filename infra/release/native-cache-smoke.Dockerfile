@@ -10,10 +10,11 @@ ARG CACHE_BUCKET=marin-public
 ENV SCCACHE_GCS_BUCKET=${CACHE_BUCKET} \
     SCCACHE_GCS_KEY_PREFIX=${CACHE_PREFIX} \
     SCCACHE_GCS_RW_MODE=READ_WRITE \
-    SCCACHE_GCS_KEY_PATH=/run/secrets/gcs \
+    SCCACHE_GCS_KEY_PATH=/run/secrets/gcs-credentials \
     SCCACHE_IGNORE_SERVER_IO_ERROR=1
-RUN --mount=type=secret,id=gcs \
-    mkdir -p /out \
+RUN --mount=type=secret,id=gcs-credentials,required=false \
+    if [ -n "${SCCACHE_GCS_KEY_PATH}" ] && [ ! -f "$SCCACHE_GCS_KEY_PATH" ]; then unset SCCACHE_GCS_BUCKET; fi \
+    && mkdir -p /out \
     && sccache --zero-stats \
     && sccache gcc -c probe.c -o /out/probe.o \
     && RUSTC_WRAPPER=sccache cargo build --release --offline --target-dir /out \

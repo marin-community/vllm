@@ -12,8 +12,6 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     env:
@@ -41,8 +39,10 @@ jobs:
           build() {
             DESTINATION=$1
             shift
+            CACHE_AUTH=()
+            if [[ -f "$GCS_CREDENTIALS" ]]; then CACHE_AUTH=(--secret "id=gcs-credentials,src=$GCS_CREDENTIALS"); fi
             docker buildx build --no-cache-filter compile \
-              --secret "id=gcs,src=$GCS_CREDENTIALS" \
+              "${CACHE_AUTH[@]}" \
               --build-arg "CACHE_PREFIX=$CACHE_PREFIX" \
               "$@" --output "type=local,dest=artifacts/$DESTINATION" \
               "$RUNNER_TEMP/native-cache"
@@ -55,6 +55,8 @@ jobs:
           printf 'int value(void) { return 2; }\n' > "$RUNNER_TEMP/native-cache/probe.c"
           build changed
           build outage --build-arg CACHE_BUCKET=marin-cache-does-not-exist-01a10d2b
+          GCS_CREDENTIALS=
+          build missing
           python - <<'PY'
           import json
           from pathlib import Path
@@ -69,6 +71,9 @@ jobs:
           assert count('changed','cache_hits') == count('changed','cache_misses') == 1
           assert Path('artifacts/outage/probe.o').is_file()
           assert Path('artifacts/outage/release/libprobe.rlib').is_file()
+          assert records['missing']['cache_location'].startswith('Local')
+          assert count('missing','cache_misses') == 2
+          assert records['missing']['stats']['compile_fails'] == 0
           PY
       - uses: actions/upload-artifact@v4
         if: always()
