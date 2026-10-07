@@ -37,6 +37,7 @@ jobs:
           cp infra/release/native-cache-smoke.Dockerfile "$RUNNER_TEMP/native-cache/Dockerfile"
           printf 'int value(void) { return 1; }\n' > "$RUNNER_TEMP/native-cache/probe.c"
           printf 'pub fn value() -> i32 { 1 }\n' > "$RUNNER_TEMP/native-cache/probe.rs"
+          printf '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[lib]\npath="probe.rs"\n' > "$RUNNER_TEMP/native-cache/Cargo.toml"
           build() {
             DESTINATION=$1
             shift
@@ -50,7 +51,7 @@ jobs:
           docker buildx create --driver docker-container --name fresh --use
           build warm
           cmp artifacts/first/probe.o artifacts/warm/probe.o
-          cmp artifacts/first/libprobe.rlib artifacts/warm/libprobe.rlib
+          cmp artifacts/first/release/libprobe.rlib artifacts/warm/release/libprobe.rlib
           printf 'int value(void) { return 2; }\n' > "$RUNNER_TEMP/native-cache/probe.c"
           build changed
           build outage --build-arg CACHE_BUCKET=marin-cache-does-not-exist-01a10d2b
@@ -67,7 +68,7 @@ jobs:
           assert count('warm','cache_hits') == 2
           assert count('changed','cache_hits') == count('changed','cache_misses') == 1
           assert Path('artifacts/outage/probe.o').is_file()
-          assert Path('artifacts/outage/libprobe.rlib').is_file()
+          assert Path('artifacts/outage/release/libprobe.rlib').is_file()
           PY
       - uses: actions/upload-artifact@v4
         if: always()

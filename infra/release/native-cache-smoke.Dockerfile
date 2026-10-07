@@ -3,7 +3,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc ca-certific
     && rm -rf /var/lib/apt/lists/*
 COPY sccache /usr/local/bin/sccache
 FROM base AS compile
-COPY probe.c probe.rs /src/
+COPY probe.c probe.rs Cargo.toml /src/
 WORKDIR /src
 ARG CACHE_PREFIX
 ARG CACHE_BUCKET=marin-public
@@ -16,7 +16,7 @@ RUN --mount=type=secret,id=gcs \
     mkdir -p /out \
     && sccache --zero-stats \
     && sccache gcc -c probe.c -o /out/probe.o \
-    && sccache rustc --crate-name probe --crate-type=rlib probe.rs --out-dir /out \
+    && RUSTC_WRAPPER=sccache cargo build --release --offline --target-dir /out \
     && sccache --show-stats --stats-format=json > /out/stats.json \
     && sccache --stop-server
 FROM scratch
