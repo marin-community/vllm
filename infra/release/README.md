@@ -87,27 +87,15 @@ fragment as a 14-day workflow artifact. Record both wheel hashes before using
 them in a consumer qualification. These branch builds cannot enter the GPU
 release lane; publication still requires a source commit on `main`.
 
-Compiler outputs use the upstream sccache engine. The candidate workflow
-restores CUDA/Rust objects before compilation and exports used/new objects
-afterward; compatible objects can be reused across trusted branches. Cloud
-credentials stay on the runner, and cache failures fall back to normal builds.
-The client restores the current and previous UTC weekly prefixes and renews
-only used/new objects. Cache configuration lives in `compile-cache.json`;
-objects use `gs://marin-public/build-cache/vllm/objects-v1/` and are public.
-The existing GitHub build identity provides access. Saves prune only their own
-architecture's weekly prefixes once the whole week is at least 21 days old;
-idle data is collected on the next save, without changing bucket policies.
-Per-stage hit/miss counts, elapsed time and transfer bytes appear in build
-artifacts. Detailed measurements and the serving handoff are in
-[the cache design](https://echo.oa.dev/wiki/613).
 Unchanged build layers use `ghcr.io/marin-community/vllm-build-cache:<architecture>`
-with Iris's registry-cache settings. Missing imports and failed exports do not
-fail the wheel build; GCS compiler objects support steps that must compile again.
-The workflow tries layers first. A compile-layer miss exits with code 42 before
-compilation; the workflow then loads compiler objects and retries with a readiness
-marker. Layer hits skip GCS transfers and cache mounting. Other builds keep the
-Dockerfile's default behavior. GCS transfers use `gcloud storage rsync`, which
-runs in parallel by default.
+with Marin/Iris's registry-cache settings. Compiler steps that must execute use
+sccache 0.8.1's native GCS backend at
+`gs://marin-public/build-cache/vllm/sccache-v1/<architecture>/`.
+The existing `github-iris` workload identity is mounted as a BuildKit secret;
+credentials are excluded from the build context and exported layers.
+Layer hits skip compiler-cache requests. Missing credentials or unavailable
+caches fall back to compilation. GCS expiry is handled separately by the cache
+retention workflow. [Design and measurements](https://echo.oa.dev/wiki/613).
 
 GPU publication runs must use the repository's default branch, which this fork
 expects to be `main`. A candidate from a prior `main` commit remains valid after

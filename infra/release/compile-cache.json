@@ -1,6 +1,0 @@
-{
-  "bucket": "marin-public",
-  "workload_identity_provider": "projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc",
-  "service_account": "github-iris@hai-gcp-models.iam.gserviceaccount.com",
-  "namespace": "build-cache/vllm/objects-v1"
-}
