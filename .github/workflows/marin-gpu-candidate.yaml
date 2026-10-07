@@ -239,7 +239,6 @@ jobs:
           docker buildx build \
             --target marin-wheel-export \
             --output type=local,dest=artifacts \
-            --cache-from type=registry,ref=ghcr.io/marin-community/vllm-build-cache:benchmark-01a10d2b-${{ matrix.architecture }} \
             --cache-from type=registry,ref="$BUILD_CACHE_REF" \
             --cache-to type=registry,ref="$BUILD_CACHE_REF",mode=max,compression=zstd,compression-level=3,oci-mediatypes=true,image-manifest=true,ignore-error=true \
             --build-arg BUILD_OS=manylinux \
