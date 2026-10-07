@@ -103,6 +103,11 @@ artifacts. Detailed measurements and the serving handoff are in
 Unchanged build layers use `ghcr.io/marin-community/vllm-build-cache:<architecture>`
 with Iris's registry-cache settings. Missing imports and failed exports do not
 fail the wheel build; GCS compiler objects support steps that must compile again.
+The workflow tries layers first. A compile-layer miss exits with code 42 before
+compilation; the workflow then loads compiler objects and retries with a readiness
+marker. Layer hits skip GCS transfers and cache mounting. Other builds keep the
+Dockerfile's default behavior. GCS transfers use `gcloud storage rsync`, which
+runs in parallel by default.
 
 GPU publication runs must use the repository's default branch, which this fork
 expects to be `main`. A candidate from a prior `main` commit remains valid after

@@ -214,68 +214,15 @@ jobs:
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } >> "$GITHUB_OUTPUT"
 
-      # Legacy main snapshots seed the shared object cache without modifying them.
-      # They can be removed after the first successful build of each architecture.
-      - name: Read the legacy CUDA cache
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: sccache-cache
-          key: marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-${{ github.sha }}
-          restore-keys: |
-            marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-
-
-      - name: Prepare compiler cache directories
-        run: |
-          mkdir -p compile-cache/rust artifacts
-          if [[ -d sccache-cache ]]; then
-            mv sccache-cache compile-cache/cuda
-          else
-            mkdir -p compile-cache/cuda
-          fi
-
-      - name: Authenticate compiler cache reads
-        id: cache-auth
-        continue-on-error: true
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: ${{ needs.prepare.outputs.cache_provider }}
-          service_account: ${{ needs.prepare.outputs.cache_service_account }}
-          token_format: access_token
-          create_credentials_file: false
-          export_environment_variables: false
-
-      - uses: google-github-actions/setup-gcloud@v3
-        continue-on-error: true
-
-      - name: Restore shared compiler objects
-        continue-on-error: true
-        env:
-          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-auth.outputs.access_token }}
-        run: |
-          .venv/bin/python infra/release/compile_cache.py restore \
-            --config infra/release/compile-cache.json \
-            --architecture "${{ matrix.architecture }}" \
-            --directory compile-cache --output artifacts/cache-restore.json
-
-      - name: Load the compile cache into the builder
-        continue-on-error: true
-        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
-        with:
-          skip-extraction: true
-          cache-map: |
-            {
-              "compile-cache/cuda": "/root/.cache/sccache",
-              "compile-cache/rust": "/root/.cache/sccache-rust"
-            }
-
-      - name: Build and export the CUDA 13.2 wheel
+      # Exit 42 from a compile step asks for compiler objects. Secret contents
+      # do not enter Docker cache keys, so the loaded build can hit on the next run.
+      - name: Build from cached layers
+        id: layers
         run: |
           set -o pipefail
           mkdir -p artifacts
-          BUILD_STARTED=$(date +%s)
-          .venv/bin/python -c 'import time; print(time.time_ns())' > artifacts/cache-started-ns.txt
-          # Credentials stay on the runner. BuildKit sees local compiler objects.
+          cat > "$RUNNER_TEMP/marin-build-wheel.sh" <<'BUILD'
+          set -euo pipefail
           docker buildx build \
             --target marin-wheel-export \
             --output type=local,dest=artifacts \
@@ -291,14 +238,99 @@ jobs:
             --build-arg VLLM_MAX_SIZE_MB="${{ matrix.max_wheel_size_mb }}" \
             --build-arg nvcc_threads="${{ matrix.nvcc_threads }}" \
             --build-arg USE_SCCACHE=1 \
+            --build-arg MARIN_CACHE_FIRST=1 \
             --build-arg SCCACHE_BUCKET_NAME= \
             --build-arg GIT_REPO_CHECK=1 \
             --build-arg RUN_WHEEL_CHECK=true \
             --progress plain \
-            -f docker/Dockerfile . 2>&1 | tee artifacts/build.log
-          echo "Build and export seconds=$(( $(date +%s) - BUILD_STARTED ))" | tee artifacts/build-time.txt
+            "$@" \
+            -f docker/Dockerfile .
+          BUILD
+          BUILD_STARTED=$(date +%s)
+          if bash "$RUNNER_TEMP/marin-build-wheel.sh" 2>&1 | tee artifacts/build.log; then
+            echo "compiler_cache_required=false" >> "$GITHUB_OUTPUT"
+          else
+            grep -q 'exit code: 42' artifacts/build.log || exit 1
+            echo "compiler_cache_required=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Build and export seconds=$(( $(date +%s) - BUILD_STARTED ))" > artifacts/build-time.txt
+
+      # Legacy main snapshots seed the shared object cache without modifying them.
+      # They can be removed after the first successful build of each architecture.
+      - name: Read the legacy CUDA cache
+        if: steps.layers.outputs.compiler_cache_required == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: sccache-cache
+          key: marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-${{ github.sha }}
+          restore-keys: |
+            marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-
+
+      - name: Prepare compiler cache directories
+        if: steps.layers.outputs.compiler_cache_required == 'true'
+        run: |
+          mkdir -p compile-cache/rust artifacts
+          if [[ -d sccache-cache ]]; then
+            mv sccache-cache compile-cache/cuda
+          else
+            mkdir -p compile-cache/cuda
+          fi
+
+      - name: Authenticate compiler cache reads
+        if: steps.layers.outputs.compiler_cache_required == 'true'
+        id: cache-auth
+        continue-on-error: true
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ needs.prepare.outputs.cache_provider }}
+          service_account: ${{ needs.prepare.outputs.cache_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - uses: google-github-actions/setup-gcloud@v3
+        if: steps.layers.outputs.compiler_cache_required == 'true'
+        continue-on-error: true
+
+      - name: Restore shared compiler objects
+        if: steps.layers.outputs.compiler_cache_required == 'true'
+        continue-on-error: true
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-auth.outputs.access_token }}
+        run: |
+          .venv/bin/python infra/release/compile_cache.py restore \
+            --config infra/release/compile-cache.json \
+            --architecture "${{ matrix.architecture }}" \
+            --directory compile-cache --output artifacts/cache-restore.json
+
+      - name: Load the compile cache into the builder
+        if: steps.layers.outputs.compiler_cache_required == 'true'
+        continue-on-error: true
+        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+        with:
+          skip-extraction: true
+          cache-map: |
+            {
+              "compile-cache/cuda": "/root/.cache/sccache",
+              "compile-cache/rust": "/root/.cache/sccache-rust"
+            }
+
+      - name: Build with shared compiler objects
+        if: steps.layers.outputs.compiler_cache_required == 'true'
+        run: |
+          set -o pipefail
+          .venv/bin/python -c 'import time; print(time.time_ns())' > artifacts/cache-started-ns.txt
+          touch "$RUNNER_TEMP/marin-compile-cache"
+          FIRST_SECONDS=$(cut -d= -f2 artifacts/build-time.txt)
+          BUILD_STARTED=$(date +%s)
+          bash "$RUNNER_TEMP/marin-build-wheel.sh" \
+            --secret id=marin-compile-cache,src="$RUNNER_TEMP/marin-compile-cache" \
+            2>&1 | tee -a artifacts/build.log
+          echo "Build and export seconds=$(( FIRST_SECONDS + $(date +%s) - BUILD_STARTED ))" | tee artifacts/build-time.txt
 
       - name: Export compiler objects from the builder
+        if: steps.layers.outputs.compiler_cache_required == 'true'
         continue-on-error: true
         run: |
           docker buildx build \
@@ -309,6 +341,7 @@ jobs:
 
       # Refresh the build account's access token after the long compile.
       - name: Authenticate compiler cache writes
+        if: steps.layers.outputs.compiler_cache_required == 'true'
         id: cache-save-auth
         continue-on-error: true
         uses: google-github-actions/auth@v3
@@ -320,6 +353,7 @@ jobs:
           export_environment_variables: false
 
       - name: Save new compiler objects
+        if: steps.layers.outputs.compiler_cache_required == 'true'
         continue-on-error: true
         env:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-save-auth.outputs.access_token }}
