@@ -341,7 +341,7 @@ ARG SCCACHE_IGNORE_SERVER_IO_ERROR
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
-    --mount=type=secret,id=gcs-credentials \
+    --mount=type=secret,id=gcs-credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -n "${SCCACHE_GCS_KEY_PATH}" ] && [ ! -f "$SCCACHE_GCS_KEY_PATH" ]; then \
             unset SCCACHE_GCS_BUCKET; \
@@ -464,7 +464,7 @@ ARG SCCACHE_IGNORE_SERVER_IO_ERROR
 RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
-    --mount=type=secret,id=gcs-credentials \
+    --mount=type=secret,id=gcs-credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -n "${SCCACHE_GCS_KEY_PATH}" ] && [ ! -f "$SCCACHE_GCS_KEY_PATH" ]; then \
             unset SCCACHE_GCS_BUCKET; \
