@@ -334,12 +334,13 @@ ENV SCCACHE_DIR=/root/.cache/sccache-rust
 # Build with a stable version so this target snapshot is keyed only by Rust
 # inputs. The child stage below relinks the crates that embed the exact version.
 ARG MARIN_CACHE_FIRST=0
+ARG MARIN_CACHE_MISS_CODE
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,target=/root/.cache/sccache-rust,sharing=locked \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     --mount=type=secret,id=marin-compile-cache \
-    if [ "$MARIN_CACHE_FIRST" = "1" ] && [ ! -f /run/secrets/marin-compile-cache ]; then exit 42; fi \
+    if [ "$MARIN_CACHE_FIRST" = "1" ] && [ ! -f /run/secrets/marin-compile-cache ]; then exit "$MARIN_CACHE_MISS_CODE"; fi \
     && BUILD_STARTED=$(date +%s) \
     && if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -z "${SCCACHE_BUCKET}" ]; then \
@@ -456,11 +457,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # if USE_SCCACHE is set, use sccache to speed up compilation
 # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)
 ARG MARIN_CACHE_FIRST=0
+ARG MARIN_CACHE_MISS_CODE
 RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     --mount=type=secret,id=marin-compile-cache \
-    if [ "$MARIN_CACHE_FIRST" = "1" ] && [ ! -f /run/secrets/marin-compile-cache ]; then exit 42; fi \
+    if [ "$MARIN_CACHE_FIRST" = "1" ] && [ ! -f /run/secrets/marin-compile-cache ]; then exit "$MARIN_CACHE_MISS_CODE"; fi \
     && BUILD_STARTED=$(date +%s) \
     && if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -z "${SCCACHE_BUCKET}" ]; then \

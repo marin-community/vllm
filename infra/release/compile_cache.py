@@ -52,6 +52,7 @@ def transfer(
         raise ValueError(f"Unsupported cache operation: {operation}")
     if operation == "save" and used_since_ns is None:
         raise ValueError("Save requires the timestamp taken before compilation")
+    namespace = namespace.strip("/")
     today = (now or datetime.now(UTC)).date()
     week = today - timedelta(days=today.weekday())
     weeks = [week] if operation == "save" else [week, week - timedelta(days=7)]

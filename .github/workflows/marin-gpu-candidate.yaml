@@ -148,6 +148,8 @@ jobs:
     env:
       DOCKER_BUILDKIT: "1"
       DOCKER_BUILD_SUMMARY: "false"
+      BUILD_CACHE_REF: ghcr.io/marin-community/vllm-build-cache:${{ matrix.architecture }}
+      COMPILE_CACHE_MISS_CODE: "42"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -226,8 +228,8 @@ jobs:
           docker buildx build \
             --target marin-wheel-export \
             --output type=local,dest=artifacts \
-            --cache-from type=registry,ref=ghcr.io/marin-community/vllm-build-cache:${{ matrix.architecture }} \
-            --cache-to type=registry,ref=ghcr.io/marin-community/vllm-build-cache:${{ matrix.architecture }},mode=max,compression=zstd,compression-level=3,oci-mediatypes=true,image-manifest=true,ignore-error=true \
+            --cache-from type=registry,ref="$BUILD_CACHE_REF" \
+            --cache-to type=registry,ref="$BUILD_CACHE_REF",mode=max,compression=zstd,compression-level=3,oci-mediatypes=true,image-manifest=true,ignore-error=true \
             --build-arg BUILD_OS=manylinux \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
             --build-arg UV_CONSTRAINT=/opt/marin-gpu-constraints.txt \
@@ -239,6 +241,7 @@ jobs:
             --build-arg nvcc_threads="${{ matrix.nvcc_threads }}" \
             --build-arg USE_SCCACHE=1 \
             --build-arg MARIN_CACHE_FIRST=1 \
+            --build-arg MARIN_CACHE_MISS_CODE="$COMPILE_CACHE_MISS_CODE" \
             --build-arg SCCACHE_BUCKET_NAME= \
             --build-arg GIT_REPO_CHECK=1 \
             --build-arg RUN_WHEEL_CHECK=true \
@@ -250,7 +253,7 @@ jobs:
           if bash "$RUNNER_TEMP/marin-build-wheel.sh" 2>&1 | tee artifacts/build.log; then
             echo "compiler_cache_required=false" >> "$GITHUB_OUTPUT"
           else
-            grep -q 'exit code: 42' artifacts/build.log || exit 1
+            grep -Fq "exit code: $COMPILE_CACHE_MISS_CODE" artifacts/build.log || exit 1
             echo "compiler_cache_required=true" >> "$GITHUB_OUTPUT"
           fi
           echo "Build and export seconds=$(( $(date +%s) - BUILD_STARTED ))" > artifacts/build-time.txt
