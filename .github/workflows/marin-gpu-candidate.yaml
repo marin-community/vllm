@@ -1,699 +1,139 @@
-name: Marin vLLM Candidate
-
-# Marin fork only. GPU candidates follow main. The manual TPU lane packages the
-# two exact source commits supplied by the caller.
+name: Marin vLLM Cache Investigation
 
 on:
-  push:
-    branches: [main]
-    # These paths do not alter packaged wheel bytes. Candidate-workflow changes
-    # remain testable through workflow_dispatch.
-    paths-ignore:
-      - ".agents/**"
-      - "AGENTS.md"
-      - ".github/workflows/marin-ci.yaml"
-      - ".github/workflows/marin-gpu-candidate.yaml"
-      - ".github/workflows/marin-gpu-release.yaml"
-      - "infra/nightly/specs/qwen3-0.6b-tpu.json"
-      - "infra/release/README.md"
-      - "infra/release/gpu_validation.py"
-      - "infra/release/tpu_config.json"
-      - "infra/release/tpu_release.py"
-      - "infra/release/tpu_validation.py"
-      - "infra/release/validation_common.py"
-      - "infra/release/tests/**"
   workflow_dispatch:
     inputs:
-      lane:
-        description: "Candidate lane"
-        required: true
-        default: gpu
+      cache_mode:
+        description: "Read-only inventory or native guard checks"
         type: choice
-        options:
-          - gpu
-          - tpu
-      gpu_mode:
-        description: "GPU candidate mode"
-        required: true
-        default: publish
-        type: choice
-        options:
-          - publish
-          - qualify-x86_64
-          - qualify-aarch64
-      registry_mode:
-        description: "Controlled layer-cache benchmark"
-        default: seed
-        type: choice
-        options: [seed, "off", warm]
-      vllm_commit:
-        description: "Exact vLLM package source for the TPU lane"
-        required: true
-        default: 4c1c798a7b6072aab4f435b0fe0eb9e3ae9e5e19
-        type: string
-      tpu_inference_commit:
-        description: "Exact tpu-inference package source for the TPU lane"
-        required: true
-        default: 29548fbab663b7ea946546ca7efaa473dab55ba5
-        type: string
-      exclude_newer:
-        description: "UTC dependency cutoff for the TPU pair"
-        required: true
-        default: "2026-09-13T03:00:00Z"
-        type: string
-
-concurrency:
-  group: cache-benchmark-${{ inputs.gpu_mode }}-${{ inputs.registry_mode }}-401e94da9
-  cancel-in-progress: false
+        default: inventory
+        options: [inventory, guard, both]
 
 permissions:
   contents: read
 
-env:
-  BENCHMARK_SHA: 401e94da9d4d6b5f9df0b1b9b045382abef21b2d
-  RELEASE_CONFIG: infra/release/config.json
-  TPU_RELEASE_CONFIG: infra/release/tpu_config.json
-  UV_VERSION: "0.11.21"
+concurrency:
+  group: cache-investigation-01a10d2b-${{ inputs.cache_mode }}
+  cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Resolve build matrix
-    if: github.event_name == 'push' || inputs.lane == 'gpu'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    env:
-      GH_TOKEN: ${{ github.token }}
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-      cache_provider: ${{ steps.matrix.outputs.cache_provider }}
-      cache_service_account: ${{ steps.matrix.outputs.cache_service_account }}
-      candidate_tag: ${{ steps.source.outputs.candidate_tag }}
-      created_at: ${{ steps.source.outputs.created_at }}
+  inventory:
+    if: inputs.cache_mode != 'guard'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.BENCHMARK_SHA }}
-
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
-          version: ${{ env.UV_VERSION }}
-
-      - name: Create the metadata environment
-        run: uv venv --python 3.12
-
-      # Branch qualifications produce short-lived build artifacts only. The
-      # publish job still verifies main lineage before creating a release.
-      - name: Require a main-line GPU source for publication
-        if: github.event_name == 'push' || inputs.gpu_mode == 'publish'
-        run: |
-          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
-            --repository "$GITHUB_REPOSITORY" \
-            --workflow-ref "$GITHUB_REF" \
-            --source-commit "$BENCHMARK_SHA"
-
-      - name: Read the release platforms
-        id: matrix
+          version: "0.11.21"
+      - run: uv venv --python 3.12
+      - name: Measure readable cache packages
         env:
-          GPU_MODE: ${{ inputs.gpu_mode || 'publish' }}
-        run: |
-          MATRIX=$(.venv/bin/python infra/release/gpu_release.py build-matrix --config "$RELEASE_CONFIG")
-          if [[ "$GPU_MODE" != publish ]]; then
-            ARCHITECTURE=${GPU_MODE#qualify-}
-            MATRIX=$(jq -c --arg architecture "$ARCHITECTURE" \
-              '{include: [.include[] | select(.architecture == $architecture)]}' \
-              <<< "$MATRIX")
-            if [[ $(jq '.include | length' <<< "$MATRIX") -ne 1 ]]; then
-              echo "Unknown GPU candidate mode: $GPU_MODE" >&2
-              exit 1
-            fi
-          fi
-          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
-          echo "cache_provider=$(jq -r '.workload_identity_provider' infra/release/compile-cache.json)" >> "$GITHUB_OUTPUT"
-          echo "cache_service_account=$(jq -r '.service_account' infra/release/compile-cache.json)" >> "$GITHUB_OUTPUT"
+          GH_TOKEN: ${{ github.token }}
+        run: .venv/bin/python infra/release/cache_inventory.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cache-inventory-01a10d2b
+          path: artifacts/cache-inventory.json
+          retention-days: 14
 
-      - name: Resolve the immutable candidate identity
-        id: source
-        run: |
-          SHORT_SHA=$(git rev-parse --short=12 "$BENCHMARK_SHA")
-          CREATED_AT=$(git show -s --format=%cI "$BENCHMARK_SHA")
-          {
-            echo "candidate_tag=marin-vllm-gpu-candidate-${SHORT_SHA}"
-            echo "created_at=${CREATED_AT}"
-          } >> "$GITHUB_OUTPUT"
-
-  build:
-    name: Build ${{ matrix.architecture }} wheel
-    needs: prepare
+  guard:
+    if: inputs.cache_mode != 'inventory'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     permissions:
       contents: read
-      id-token: write
       packages: write
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 480
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-24.04
+          - architecture: aarch64
+            runner: ubuntu-24.04-arm
     env:
-      DOCKER_BUILDKIT: "1"
-      DOCKER_BUILD_SUMMARY: "false"
+      CACHE_REF: ghcr.io/marin-community/vllm-build-cache:guard-01a10d2b-${{ matrix.architecture }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.BENCHMARK_SHA }}
-          fetch-depth: 0
           persist-credentials: false
-
-      - name: Reclaim runner disk and add swap
-        run: |
-          # The CUDA-13 compile peaks past the runner's ~16GB RAM and OOM-kills the
-          # runner agent mid-build. Free disk and back the memory spikes with a
-          # large swapfile so each matrix build fits its hosted runner.
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
-          sudo swapoff -a || true
-          sudo rm -f /mnt/swapfile /swapfile
-          sudo fallocate -l 32G /mnt/swapfile
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
-          df -h /
-          free -h
-
       - uses: docker/setup-buildx-action@v3
-
-      - name: Authenticate the shared build-layer cache
-        continue-on-error: true
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: ${{ env.UV_VERSION }}
-
-      - name: Create the metadata environment
-        run: uv venv --python 3.12
-
-      - name: Select isolated benchmark caches
+      - name: Exercise ordinary builds and stop before an uncached compile
         run: |
-          .venv/bin/python - <<'PYTHON'
-          import json,os
-          from pathlib import Path
-          config=json.loads(Path('infra/release/compile-cache.json').read_text())
-          config['namespace']='build-cache/vllm/registry-benchmark-01a10d2b'
-          path=Path(os.environ['RUNNER_TEMP'])/'compile-cache-benchmark.json'
-          path.write_text(json.dumps(config))
-          with open(os.environ['GITHUB_ENV'],'a') as output:
-              print('CACHE_CONFIG='+str(path),file=output)
-          PYTHON
-
-      - name: Resolve source and builder provenance
-        id: provenance
-        run: |
-          git remote add upstream https://github.com/vllm-project/vllm.git 2>/dev/null || \
-            git remote set-url upstream https://github.com/vllm-project/vllm.git
-          git fetch --quiet --no-tags upstream main
-          UPSTREAM_BASE=$(git merge-base upstream/main "$BENCHMARK_SHA")
-
-          VERSION_DATE=$(date -u -d "${{ needs.prepare.outputs.created_at }}" +%Y%m%d)
-          VERSION_TAG="v0.0.0.dev${VERSION_DATE}+marin.$(git rev-parse --short=12 "$BENCHMARK_SHA")"
-          while read -r tag; do
-            [[ -z "$tag" ]] || git tag --delete "$tag"
-          done < <(git tag --points-at "$BENCHMARK_SHA")
-          git tag "$VERSION_TAG" "$BENCHMARK_SHA"
-
-          printf '%s\n' \
-            "Source: $BENCHMARK_SHA" \
-            "Upstream base: $UPSTREAM_BASE" \
-            "Build base: ${{ matrix.build_base_image }}" \
-            "CUDA: ${{ matrix.cuda_version }}; SM targets: ${{ matrix.sm_targets }}" \
-            "MAX_JOBS: ${{ matrix.max_jobs }}; NVCC_THREADS: ${{ matrix.nvcc_threads }}"
-
-          {
-            echo "upstream_base=${UPSTREAM_BASE}"
-            echo "base_image_digest=${{ matrix.build_base_image }}"
-            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          } >> "$GITHUB_OUTPUT"
-
-      # Legacy main snapshots seed the shared object cache without modifying them.
-      # They can be removed after the first successful build of each architecture.
-      - name: Read the legacy CUDA cache
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: sccache-cache
-          key: marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-${{ env.BENCHMARK_SHA }}
-          restore-keys: |
-            marin-vllm-cu132-sccache-v1-${{ matrix.architecture }}-
-
-      - name: Prepare compiler cache directories
-        run: |
-          mkdir -p compile-cache/rust artifacts
-          if [[ -d sccache-cache ]]; then
-            mv sccache-cache compile-cache/cuda
-          else
-            mkdir -p compile-cache/cuda
-          fi
-
-      - name: Authenticate compiler cache reads
-        id: cache-auth
-        continue-on-error: true
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: ${{ needs.prepare.outputs.cache_provider }}
-          service_account: ${{ needs.prepare.outputs.cache_service_account }}
-          token_format: access_token
-          create_credentials_file: false
-          export_environment_variables: false
-
-      - uses: google-github-actions/setup-gcloud@v3
-        continue-on-error: true
-
-      - name: Restore shared compiler objects
-        continue-on-error: true
-        env:
-          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-auth.outputs.access_token }}
-        run: |
-          .venv/bin/python infra/release/compile_cache.py restore \
-            --config "$CACHE_CONFIG" \
-            --architecture "${{ matrix.architecture }}" \
-            --directory compile-cache --output artifacts/cache-restore.json
-
-      - name: Load the compile cache into the builder
-        continue-on-error: true
-        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+          mkdir -p probe compiler-cache artifacts
+          cat > probe/Dockerfile <<'DOCKERFILE'
+          FROM busybox AS build
+          ARG VARIANT=seed
+          ARG MARIN_CACHE_FIRST=0
+          RUN --mount=type=cache,target=/compiler-cache,sharing=locked \
+              --mount=type=secret,id=marin-compile-cache \
+              if [ "$MARIN_CACHE_FIRST" = "1" ] && [ ! -f /run/secrets/marin-compile-cache ]; then exit 42; fi \
+              && echo "$VARIANT" >> /compiler-cache/calls \
+              && if [ -f /compiler-cache/object ]; then cp /compiler-cache/object /result; else echo "compiled-$VARIANT" > /result; fi
+          FROM busybox AS inspect
+          ARG NONCE
+          RUN --mount=type=cache,target=/compiler-cache,sharing=locked \
+              test -n "$NONCE" && mkdir -p /export && cp -a /compiler-cache/. /export/
+          FROM scratch AS inspect-export
+          COPY --from=inspect /export/ /
+          FROM scratch AS wheel
+          COPY --from=build /result /result
+          DOCKERFILE
+          docker buildx build --target wheel --build-arg VARIANT=ordinary --output type=local,dest=ordinary probe 2>&1 | tee artifacts/ordinary.log
+          test "$(cat ordinary/result)" = compiled-ordinary
+          if docker buildx build --target wheel --build-arg MARIN_CACHE_FIRST=1 --output type=local,dest=cold probe > artifacts/cold.log 2>&1; then exit 1; fi
+          grep -q 'exit code: 42' artifacts/cold.log
+          docker buildx build --target inspect-export --build-arg NONCE=before --output type=local,dest=before probe
+          test "$(cat before/calls)" = ordinary
+          echo reused-compiler-output > compiler-cache/object
+      - uses: reproducible-containers/buildkit-cache-dance@v3.1.2
         with:
           skip-extraction: true
-          cache-map: |
-            {
-              "compile-cache/cuda": "/root/.cache/sccache",
-              "compile-cache/rust": "/root/.cache/sccache-rust"
-            }
-
-      - name: Build and export the CUDA 13.2 wheel
-        env:
-          REGISTRY_MODE: ${{ inputs.registry_mode }}
+          cache-map: '{"compiler-cache": "/compiler-cache"}'
+      - name: Compile with loaded files and export layers
         run: |
-          set -o pipefail
-          mkdir -p artifacts
-          BUILD_STARTED=$(date +%s)
-          .venv/bin/python -c 'import time; print(time.time_ns())' > artifacts/cache-started-ns.txt
-          # The baseline reads exactly the seed's GCS objects and does not save.
-          CACHE_REF=ghcr.io/marin-community/vllm-build-cache:benchmark-01a10d2b-${{ matrix.architecture }}
-          CACHE_FLAGS=()
-          if [[ "$REGISTRY_MODE" == warm ]]; then
-            CACHE_FLAGS+=(--cache-from "type=registry,ref=$CACHE_REF")
-          fi
-          if [[ "$REGISTRY_MODE" != off ]]; then
-            CACHE_FLAGS+=(--cache-to "type=registry,ref=$CACHE_REF,mode=max,compression=zstd,compression-level=3,oci-mediatypes=true,image-manifest=true,ignore-error=true")
-          fi
-          docker buildx build \
-            --target marin-wheel-export \
-            --output type=local,dest=artifacts \
-            "${CACHE_FLAGS[@]}" \
-            --build-arg BUILD_OS=manylinux \
-            --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
-            --build-arg UV_CONSTRAINT=/opt/marin-gpu-constraints.txt \
-            --build-arg CUDA_VERSION="${{ matrix.cuda_version }}" \
-            --build-arg PYTHON_VERSION="${{ matrix.python_version }}" \
-            --build-arg torch_cuda_arch_list="${{ matrix.sm_targets }}" \
-            --build-arg max_jobs="${{ matrix.max_jobs }}" \
-            --build-arg VLLM_MAX_SIZE_MB="${{ matrix.max_wheel_size_mb }}" \
-            --build-arg nvcc_threads="${{ matrix.nvcc_threads }}" \
-            --build-arg USE_SCCACHE=1 \
-            --build-arg SCCACHE_BUCKET_NAME= \
-            --build-arg GIT_REPO_CHECK=1 \
-            --build-arg RUN_WHEEL_CHECK=true \
-            --progress plain \
-            -f docker/Dockerfile . 2>&1 | tee artifacts/build.log
-          echo "Build and export seconds=$(( $(date +%s) - BUILD_STARTED ))" | tee artifacts/build-time.txt
-
-      - name: Record exported registry cache
-        if: inputs.registry_mode != 'off'
+          touch "$RUNNER_TEMP/marin-compile-cache"
+          docker buildx build --target wheel --build-arg MARIN_CACHE_FIRST=1 \
+            --secret id=marin-compile-cache,src="$RUNNER_TEMP/marin-compile-cache" \
+            --cache-to type=registry,ref="$CACHE_REF",mode=max,compression=zstd,compression-level=3,oci-mediatypes=true,image-manifest=true \
+            --output type=local,dest=loaded probe 2>&1 | tee artifacts/loaded.log
+          cmp compiler-cache/object loaded/result
+      - name: Reuse layers on a fresh builder without loading compiler files
         run: |
-          docker buildx imagetools inspect ghcr.io/marin-community/vllm-build-cache:benchmark-01a10d2b-${{ matrix.architecture }} --raw > artifacts/cache-registry-manifest.json
-
-      - name: Export compiler objects from the builder
-        if: inputs.registry_mode != 'off'
-        continue-on-error: true
-        run: |
-          docker buildx build \
-            --build-arg CACHE_EXPORT_IMAGE="${{ matrix.build_base_image }}" \
-            --build-arg CACHE_EXPORT_NONCE="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            --output type=local,dest=compile-cache \
-            -f infra/release/export-compile-cache.Dockerfile infra/release
-
-      # Refresh the build account's access token after the long compile.
-      - name: Authenticate compiler cache writes
-        if: inputs.registry_mode != 'off'
-        id: cache-save-auth
-        continue-on-error: true
-        uses: google-github-actions/auth@v3
+          docker buildx create --name guard-warm --driver docker-container --use
+          docker buildx build --target wheel --build-arg MARIN_CACHE_FIRST=1 \
+            --cache-from type=registry,ref="$CACHE_REF" \
+            --output type=local,dest=warm probe 2>&1 | tee artifacts/warm.log
+          cmp compiler-cache/object warm/result
+          docker buildx build --target inspect-export --build-arg NONCE=after --output type=local,dest=after probe
+          test ! -e after/calls
+          if docker buildx build --target wheel --build-arg MARIN_CACHE_FIRST=1 --build-arg VARIANT=changed \
+            --cache-from type=registry,ref="$CACHE_REF" --output type=local,dest=changed probe > artifacts/changed.log 2>&1; then exit 1; fi
+          grep -q 'exit code: 42' artifacts/changed.log
+      - uses: reproducible-containers/buildkit-cache-dance@v3.1.2
         with:
-          workload_identity_provider: ${{ needs.prepare.outputs.cache_provider }}
-          service_account: ${{ needs.prepare.outputs.cache_service_account }}
-          token_format: access_token
-          create_credentials_file: false
-          export_environment_variables: false
-
-      - name: Save new compiler objects
-        if: inputs.registry_mode != 'off'
-        continue-on-error: true
-        env:
-          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-save-auth.outputs.access_token }}
+          skip-extraction: true
+          cache-map: '{"compiler-cache": "/compiler-cache"}'
+      - name: Restore compiler files after an input change
         run: |
-          .venv/bin/python infra/release/compile_cache.py save \
-            --config "$CACHE_CONFIG" \
-            --architecture "${{ matrix.architecture }}" \
-            --directory compile-cache --output artifacts/cache-save.json \
-            --used-since-ns "$(cat artifacts/cache-started-ns.txt)"
-
-      - name: Upload build and cache evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: marin-vllm-build-evidence-${{ matrix.architecture }}
-          path: |
-            artifacts/build.log
-            artifacts/build-time.txt
-            artifacts/cache-*.json
-          retention-days: 14
-
-      - name: Tag the wheel
-        run: |
-          source .buildkite/scripts/lib/manylinux.sh
-          WHEELS=(artifacts/dist/*.whl)
-          if [[ ${#WHEELS[@]} -ne 1 ]]; then
-            echo "Expected one wheel, found ${#WHEELS[@]}" >&2
-            exit 1
-          fi
-          apply_manylinux_tag "${WHEELS[0]}"
-
-      - name: Inspect wheel metadata and contents
-        run: |
-          WHEELS=(artifacts/dist/*.whl)
-          .venv/bin/python infra/release/gpu_release.py inspect-wheel \
-            --config "$RELEASE_CONFIG" \
-            --wheel "${WHEELS[0]}" \
-            --architecture "${{ matrix.architecture }}" \
-            --fork-commit "$BENCHMARK_SHA" \
-            --upstream-base "${{ steps.provenance.outputs.upstream_base }}" \
-            --built-at "${{ steps.provenance.outputs.built_at }}" \
-            --base-image "${{ matrix.build_base_image }}" \
-            --base-image-digest "${{ steps.provenance.outputs.base_image_digest }}" \
-            --output "artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json"
-          mv "${WHEELS[0]}" artifacts/
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: marin-vllm-gpu-candidate-${{ matrix.architecture }}
-          path: |
-            artifacts/*.whl
-            artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json
-          if-no-files-found: error
-          retention-days: 14
-
-  publish:
-    name: Publish immutable candidate
-    needs: [prepare, build]
-    if: github.event_name == 'push' || inputs.gpu_mode == 'publish'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: ${{ env.UV_VERSION }}
-
-      - name: Create the metadata environment
-        run: uv venv --python 3.12
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: marin-vllm-gpu-candidate-*
-          path: candidate
-          merge-multiple: true
-
-      - name: Assemble the candidate manifest
-        run: |
-          FRAGMENT_ARGS=()
-          while IFS= read -r fragment; do
-            FRAGMENT_ARGS+=(--fragment "$fragment")
-          done < <(find candidate -maxdepth 1 -name '*-fragment.json' -print | sort)
-          .venv/bin/python infra/release/gpu_release.py assemble-candidate \
-            --config "$RELEASE_CONFIG" \
-            "${FRAGMENT_ARGS[@]}" \
-            --repository "$GITHUB_REPOSITORY" \
-            --candidate-tag "$CANDIDATE_TAG" \
-            --created-at "${{ needs.prepare.outputs.created_at }}" \
-            --output candidate/marin-vllm-gpu-manifest.json
-          .venv/bin/python infra/release/gpu_release.py verify-assets \
-            --manifest candidate/marin-vllm-gpu-manifest.json \
-            --directory candidate \
-            --config "$RELEASE_CONFIG"
-          .venv/bin/python infra/release/gpu_release.py release-notes \
-            --manifest candidate/marin-vllm-gpu-manifest.json \
-            --output candidate-notes.md
-
-      - name: Check for an existing immutable candidate
-        id: existing
-        run: |
-          if gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            mkdir existing
-            gh release download "$CANDIDATE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --dir existing
-            .venv/bin/python infra/release/gpu_release.py verify-assets \
-              --manifest existing/marin-vllm-gpu-manifest.json \
-              --directory existing \
-              --config "$RELEASE_CONFIG"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish candidate assets once
-        if: steps.existing.outputs.exists != 'true'
-        run: |
-          SOURCE_COMMIT=$(jq -r '.source.fork_commit' candidate/marin-vllm-gpu-manifest.json)
-          if [[ "$SOURCE_COMMIT" != "$BENCHMARK_SHA" ]]; then
-            echo "Candidate source $SOURCE_COMMIT does not match workflow commit $BENCHMARK_SHA" >&2
-            exit 1
-          fi
-          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
-            --repository "$GITHUB_REPOSITORY" \
-            --workflow-ref "$GITHUB_REF" \
-            --source-commit "$SOURCE_COMMIT" \
-            --candidate-tag "$CANDIDATE_TAG"
-          gh release create "$CANDIDATE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$BENCHMARK_SHA" \
-            --title "Marin vLLM GPU candidate $(git rev-parse --short=12 "$BENCHMARK_SHA")" \
-            --notes-file candidate-notes.md \
-            --prerelease \
-            candidate/*.whl \
-            candidate/marin-vllm-gpu-manifest.json
-
-      - name: Verify published candidate assets
-        if: steps.existing.outputs.exists != 'true'
-        run: |
-          mkdir published
-          gh release download "$CANDIDATE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --dir published
-          .venv/bin/python infra/release/gpu_release.py verify-assets \
-            --manifest published/marin-vllm-gpu-manifest.json \
-            --directory published \
-            --config "$RELEASE_CONFIG"
-
-  publish-tpu:
-    name: Build and publish exact TPU wheel pair
-    if: github.event_name == 'workflow_dispatch' && inputs.lane == 'tpu'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout workflow revision
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: ${{ env.UV_VERSION }}
-
-      - name: Create the metadata environment
-        run: uv venv --python "$(jq -r '.python_version' "$TPU_RELEASE_CONFIG")" .metadata
-
-      - name: Read exact package sources
-        id: pair
-        run: |
-          for commit in "${{ inputs.vllm_commit }}" "${{ inputs.tpu_inference_commit }}"; do
-            if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "TPU package sources must be full lowercase Git SHAs." >&2
-              exit 1
-            fi
-          done
-          if [[ ! "${{ inputs.exclude_newer }}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
-            echo "exclude_newer must be a whole-second UTC timestamp." >&2
-            exit 1
-          fi
-          VLLM_VERSION=$(.metadata/bin/python infra/release/tpu_release.py package-version \
-            --config "$TPU_RELEASE_CONFIG" \
-            --distribution vllm \
-            --source-commit "${{ inputs.vllm_commit }}")
-          TPU_VERSION=$(.metadata/bin/python infra/release/tpu_release.py package-version \
-            --config "$TPU_RELEASE_CONFIG" \
-            --distribution tpu-inference \
-            --source-commit "${{ inputs.tpu_inference_commit }}")
-          {
-            echo "vllm_commit=${{ inputs.vllm_commit }}"
-            echo "tpu_commit=${{ inputs.tpu_inference_commit }}"
-            echo "exclude_newer=${{ inputs.exclude_newer }}"
-            echo "python_version=$(jq -r '.python_version' "$TPU_RELEASE_CONFIG")"
-            echo "target_device=$(jq -r '.vllm_target_device' "$TPU_RELEASE_CONFIG")"
-            echo "vllm_repository=$(jq -r '.repositories.vllm' "$TPU_RELEASE_CONFIG")"
-            echo "tpu_repository=$(jq -r '.repositories["tpu-inference"]' "$TPU_RELEASE_CONFIG")"
-            echo "vllm_version=${VLLM_VERSION}"
-            echo "tpu_version=${TPU_VERSION}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Checkout exact vLLM source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.pair.outputs.vllm_repository }}
-          ref: ${{ steps.pair.outputs.vllm_commit }}
-          fetch-depth: 0
-          path: sources/vllm
-          persist-credentials: false
-
-      - name: Checkout exact tpu-inference source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.pair.outputs.tpu_repository }}
-          ref: ${{ steps.pair.outputs.tpu_commit }}
-          fetch-depth: 0
-          path: sources/tpu-inference
-          persist-credentials: false
-
-      - name: Build both Python 3.12 wheels
-        run: |
-          [[ "$(git -C sources/vllm rev-parse HEAD)" == "${{ steps.pair.outputs.vllm_commit }}" ]]
-          [[ "$(git -C sources/tpu-inference rev-parse HEAD)" == "${{ steps.pair.outputs.tpu_commit }}" ]]
-          mkdir candidate
-          (
-            cd sources/vllm
-            uv venv --python "${{ steps.pair.outputs.python_version }}" .tpu-wheel-build
-            uv pip install \
-              --python .tpu-wheel-build/bin/python \
-              --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-              --index-strategy unsafe-best-match \
-              --requirements requirements/build/tpu.txt
-            VLLM_TARGET_DEVICE="${{ steps.pair.outputs.target_device }}" \
-              VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.vllm_version }}" \
-              uv build --wheel \
-                --no-build-isolation \
-                --python .tpu-wheel-build/bin/python \
-                --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-                --out-dir "$GITHUB_WORKSPACE/candidate"
-          )
-          (
-            cd sources/tpu-inference
-            VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.tpu_version }}" uv build --wheel \
-              --python "${{ steps.pair.outputs.python_version }}" \
-              --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-              --out-dir "$GITHUB_WORKSPACE/candidate"
-          )
-          WHEELS=(candidate/*.whl)
-          if [[ ${#WHEELS[@]} -ne 2 ]]; then
-            echo "Expected two wheels, found ${#WHEELS[@]}" >&2
-            exit 1
-          fi
-
-      - name: Assemble and verify pair manifest
-        id: manifest
-        run: |
-          CREATED_AT=$(git show -s --format=%cI "$BENCHMARK_SHA")
-          WHEEL_ARGS=()
-          while IFS= read -r wheel; do
-            WHEEL_ARGS+=(--wheel "$wheel")
-          done < <(find candidate -maxdepth 1 -name '*.whl' -print | sort)
-          .metadata/bin/python infra/release/tpu_release.py assemble-candidate \
-            --config "$TPU_RELEASE_CONFIG" \
-            "${WHEEL_ARGS[@]}" \
-            --repository "$GITHUB_REPOSITORY" \
-            --vllm-commit "${{ steps.pair.outputs.vllm_commit }}" \
-            --tpu-inference-commit "${{ steps.pair.outputs.tpu_commit }}" \
-            --workflow-commit "$BENCHMARK_SHA" \
-            --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --created-at "$CREATED_AT" \
-            --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-            --output candidate/marin-vllm-tpu-manifest.json
-          .metadata/bin/python infra/release/tpu_release.py write-index \
-            --manifest candidate/marin-vllm-tpu-manifest.json \
-            --directory candidate
-          .metadata/bin/python infra/release/tpu_release.py verify-candidate \
-            --config "$TPU_RELEASE_CONFIG" \
-            --manifest candidate/marin-vllm-tpu-manifest.json \
-            --directory candidate
-          .metadata/bin/python infra/release/tpu_release.py release-notes \
-            --manifest candidate/marin-vllm-tpu-manifest.json \
-            --output candidate-notes.md
-          CANDIDATE_TAG=$(jq -r '.release.tag' candidate/marin-vllm-tpu-manifest.json)
-          echo "candidate_tag=$CANDIDATE_TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Publish candidate assets once
-        env:
-          CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Refusing to overwrite existing candidate $CANDIDATE_TAG" >&2
-            exit 1
-          fi
-          gh release create "$CANDIDATE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$BENCHMARK_SHA" \
-            --title "Marin vLLM TPU candidate ${CANDIDATE_TAG#marin-vllm-tpu-candidate-}" \
-            --notes-file candidate-notes.md \
-            --prerelease \
-            candidate/*.whl \
-            candidate/*.html \
-            candidate/marin-vllm-tpu-manifest.json
-
-      - name: Redownload the published pair
-        env:
-          CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir published
-          gh release download "$CANDIDATE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --dir published
-
-      - name: Verify the published assets
-        env:
-          CANDIDATE_TAG: ${{ steps.manifest.outputs.candidate_tag }}
-        run: |
-          .metadata/bin/python infra/release/tpu_release.py verify-candidate \
-            --config "$TPU_RELEASE_CONFIG" \
-            --manifest published/marin-vllm-tpu-manifest.json \
-            --directory published \
-            --expected-tag "$CANDIDATE_TAG"
-
+          docker buildx build --target wheel --build-arg MARIN_CACHE_FIRST=1 --build-arg VARIANT=changed \
+            --secret id=marin-compile-cache,src="$RUNNER_TEMP/marin-compile-cache" \
+            --output type=local,dest=changed probe 2>&1 | tee artifacts/retry.log
+          cmp compiler-cache/object changed/result
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: marin-vllm-tpu-candidate-${{ github.run_id }}
-          path: candidate/marin-vllm-tpu-manifest.json
-          if-no-files-found: ignore
+          name: guard-smoke-${{ matrix.architecture }}
+          path: artifacts/
           retention-days: 14
