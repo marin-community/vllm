@@ -1,0 +1,82 @@
+name: Native sccache GCS smoke
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      CACHE_PREFIX: build-cache/vllm/native-smoke-01a10d2b/${{ github.run_id }}/${{ matrix.arch }}/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
+          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
+      - name: Check native cache reads, writes, invalidation and outage fallback
+        env:
+          GCS_CREDENTIALS: ${{ steps.auth.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-cache" artifacts
+          curl -fsSL "https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-${{ matrix.arch }}-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/native-cache" --strip-components=1
+          cp infra/release/native-cache-smoke.Dockerfile "$RUNNER_TEMP/native-cache/Dockerfile"
+          printf 'int value(void) { return 1; }\n' > "$RUNNER_TEMP/native-cache/probe.c"
+          printf 'pub fn value() -> i32 { 1 }\n' > "$RUNNER_TEMP/native-cache/probe.rs"
+          build() {
+            DESTINATION=$1
+            shift
+            docker buildx build --no-cache-filter compile \
+              --secret "id=gcs,src=$GCS_CREDENTIALS" \
+              --build-arg "CACHE_PREFIX=$CACHE_PREFIX" \
+              "$@" --output "type=local,dest=artifacts/$DESTINATION" \
+              "$RUNNER_TEMP/native-cache"
+          }
+          build first
+          docker buildx create --driver docker-container --name fresh --use
+          build warm
+          cmp artifacts/first/probe.o artifacts/warm/probe.o
+          cmp artifacts/first/libprobe.rlib artifacts/warm/libprobe.rlib
+          printf 'int value(void) { return 2; }\n' > "$RUNNER_TEMP/native-cache/probe.c"
+          build changed
+          build outage --build-arg CACHE_BUCKET=marin-cache-does-not-exist-01a10d2b
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          records={p.parent.name:json.loads(p.read_text()) for p in Path('artifacts').glob('*/stats.json')}
+          for phase,report in records.items():
+              stats=report['stats']
+              print(phase, json.dumps(stats))
+          def count(phase, metric):
+              return sum(records[phase]['stats'][metric].values())
+          assert count('first','cache_misses') == 2
+          assert count('warm','cache_hits') == 2
+          assert count('changed','cache_hits') == count('changed','cache_misses') == 1
+          assert Path('artifacts/outage/probe.o').is_file()
+          assert Path('artifacts/outage/libprobe.rlib').is_file()
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-gcs-smoke-${{ matrix.arch }}
+          path: artifacts
+      - uses: google-github-actions/setup-gcloud@v3
+        if: always()
+      - name: Remove only this probe's objects
+        if: always()
+        run: |
+          gcloud storage rm "gs://marin-public/$CACHE_PREFIX**" --recursive --quiet || true
