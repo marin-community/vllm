@@ -194,7 +194,10 @@ jobs:
 
       - name: Select the isolated compiler cache
         run: |
-          sed -i 's@build-cache/vllm/objects-v1@build-cache/vllm/registry-benchmark-01a10d2b@' infra/release/compile-cache.json
+          CACHE_CONFIG="$RUNNER_TEMP/benchmark-compile-cache.json"
+          jq '.namespace = "build-cache/vllm/registry-benchmark-01a10d2b"' \
+            infra/release/compile-cache.json > "$CACHE_CONFIG"
+          echo "CACHE_CONFIG=$CACHE_CONFIG" >> "$GITHUB_ENV"
 
       - name: Resolve source and builder provenance
         id: provenance
@@ -312,7 +315,7 @@ jobs:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-auth.outputs.access_token }}
         run: |
           .venv/bin/python infra/release/compile_cache.py restore \
-            --config infra/release/compile-cache.json \
+            --config "$CACHE_CONFIG" \
             --architecture "${{ matrix.architecture }}" \
             --directory compile-cache --output artifacts/cache-restore.json
 
@@ -371,7 +374,7 @@ jobs:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.cache-save-auth.outputs.access_token }}
         run: |
           .venv/bin/python infra/release/compile_cache.py save \
-            --config infra/release/compile-cache.json \
+            --config "$CACHE_CONFIG" \
             --architecture "${{ matrix.architecture }}" \
             --directory compile-cache --output artifacts/cache-save.json \
             --used-since-ns "$(cat artifacts/cache-started-ns.txt)"
