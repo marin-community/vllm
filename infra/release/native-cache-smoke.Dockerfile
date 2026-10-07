@@ -13,7 +13,7 @@ ENV SCCACHE_GCS_BUCKET=${CACHE_BUCKET} \
     SCCACHE_GCS_KEY_PATH=/run/secrets/gcs-credentials \
     SCCACHE_IGNORE_SERVER_IO_ERROR=1
 RUN --mount=type=secret,id=gcs-credentials,required=false \
-    if [ -n "${SCCACHE_GCS_KEY_PATH}" ] && [ ! -f "$SCCACHE_GCS_KEY_PATH" ]; then unset SCCACHE_GCS_BUCKET; fi \
+    if [ -n "${SCCACHE_GCS_KEY_PATH}" ] && [ ! -f "$SCCACHE_GCS_KEY_PATH" ]; then unset SCCACHE_GCS_BUCKET SCCACHE_GCS_KEY_PREFIX SCCACHE_GCS_RW_MODE SCCACHE_GCS_KEY_PATH; fi \
     && mkdir -p /out \
     && sccache --zero-stats \
     && sccache gcc -c probe.c -o /out/probe.o \
