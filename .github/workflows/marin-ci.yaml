@@ -62,7 +62,7 @@ jobs:
               stats=report['stats']
               print(phase, json.dumps(stats))
           def count(phase, metric):
-              return sum(records[phase]['stats'][metric].values())
+              return sum(records[phase]['stats'][metric]['counts'].values())
           assert count('first','cache_misses') == 2
           assert count('warm','cache_hits') == 2
           assert count('changed','cache_hits') == count('changed','cache_misses') == 1
@@ -76,7 +76,20 @@ jobs:
           path: artifacts
       - uses: google-github-actions/setup-gcloud@v3
         if: always()
-      - name: Remove only this probe's objects
+      - name: Check expiry selection and remove only this probe's objects
         if: always()
         run: |
-          gcloud storage rm "gs://marin-public/$CACHE_PREFIX**" --recursive --quiet || true
+          set -euo pipefail
+          PREFIX="gs://marin-public/$CACHE_PREFIX**"
+          gcloud storage objects list "$PREFIX" \
+            --filter="creation_time<$(date -u -d '21 days ago' +%Y-%m-%dT%H:%M:%SZ)" \
+            --format='value(storage_url)' > "$RUNNER_TEMP/expired-objects"
+          test ! -s "$RUNNER_TEMP/expired-objects"
+          gcloud storage objects list "$PREFIX" \
+            --filter="creation_time<$(date -u -d '1 minute' +%Y-%m-%dT%H:%M:%SZ)" \
+            --format='value(storage_url)' > "$RUNNER_TEMP/expired-objects"
+          if [[ -s "$RUNNER_TEMP/expired-objects" ]]; then
+            gcloud storage rm --read-paths-from-stdin < "$RUNNER_TEMP/expired-objects"
+          fi
+          gcloud storage objects list "$PREFIX" --format='value(storage_url)' > "$RUNNER_TEMP/remaining-objects"
+          test ! -s "$RUNNER_TEMP/remaining-objects"

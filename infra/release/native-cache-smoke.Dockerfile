@@ -16,7 +16,7 @@ RUN --mount=type=secret,id=gcs \
     mkdir -p /out \
     && sccache --zero-stats \
     && sccache gcc -c probe.c -o /out/probe.o \
-    && sccache rustc --crate-type=rlib probe.rs -o /out/libprobe.rlib \
+    && sccache rustc --crate-name probe --crate-type=rlib probe.rs --out-dir /out \
     && sccache --show-stats --stats-format=json > /out/stats.json \
     && sccache --stop-server
 FROM scratch
