@@ -344,7 +344,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=secret,id=gcs-credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -n "${SCCACHE_GCS_KEY_PATH}" ] && [ ! -f "$SCCACHE_GCS_KEY_PATH" ]; then \
-            unset SCCACHE_GCS_BUCKET; \
+            unset SCCACHE_GCS_BUCKET SCCACHE_GCS_KEY_PREFIX SCCACHE_GCS_RW_MODE SCCACHE_GCS_KEY_PATH; \
         fi; \
         if [ -z "${SCCACHE_BUCKET}" ]; then \
             unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
@@ -467,7 +467,7 @@ RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=secret,id=gcs-credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -n "${SCCACHE_GCS_KEY_PATH}" ] && [ ! -f "$SCCACHE_GCS_KEY_PATH" ]; then \
-            unset SCCACHE_GCS_BUCKET; \
+            unset SCCACHE_GCS_BUCKET SCCACHE_GCS_KEY_PREFIX SCCACHE_GCS_RW_MODE SCCACHE_GCS_KEY_PATH; \
         fi; \
         if [ -z "${SCCACHE_BUCKET}" ]; then \
             unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
