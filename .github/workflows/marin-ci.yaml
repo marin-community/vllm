@@ -1,96 +1,93 @@
-name: Native sccache GCS smoke
+name: Marin CI
+
+# Marin fork only: CPU-only, no accelerators, no cluster access, a few minutes.
+#
+# It gates the Marin delta and nothing else. Upstream workflow files stay byte-for-byte
+# in the fork and are disabled through repository settings. The marin-style checks are
+# scoped by [tool.marin-style] to Marin-authored files so they cannot reformat upstream
+# code.
+#
+# What the delta smoke can and cannot cover: vLLM cannot infer a device from a
+# python-only build, so the behavior tests in tests/models/test_grugmoe.py (which need a
+# VllmConfig) cannot run on a CPU runner at all -- a compiled VLLM_TARGET_DEVICE=cpu
+# build takes far longer than a PR gate should. Those tests, and the serving path, run
+# on a real H100 in marin-nightly.yaml. What is left here is the check that matters most
+# for a fork: after an upstream refresh, does the delta still import and resolve?
+
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
-permissions:
-  contents: read
-  id-token: write
+
+concurrency:
+  group: marin-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_VERSION: "0.11.21"
+
 jobs:
-  smoke:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
-    env:
-      CACHE_PREFIX: build-cache/vllm/native-smoke-01a10d2b/${{ github.run_id }}/${{ matrix.arch }}/
+  marin-precommit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - id: auth
-        uses: google-github-actions/auth@v3
+      - uses: astral-sh/setup-uv@v6
         with:
-          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
-          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
-      - name: Check native cache reads, writes, invalidation and outage fallback
-        env:
-          GCS_CREDENTIALS: ${{ steps.auth.outputs.credentials_file_path }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/native-cache" artifacts
-          curl -fsSL "https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-${{ matrix.arch }}-unknown-linux-musl.tar.gz" \
-            | tar -xz -C "$RUNNER_TEMP/native-cache" --strip-components=1
-          cp infra/release/native-cache-smoke.Dockerfile "$RUNNER_TEMP/native-cache/Dockerfile"
-          printf 'int value(void) { return 1; }\n' > "$RUNNER_TEMP/native-cache/probe.c"
-          printf 'pub fn value() -> i32 { 1 }\n' > "$RUNNER_TEMP/native-cache/probe.rs"
-          printf '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[lib]\npath="probe.rs"\n' > "$RUNNER_TEMP/native-cache/Cargo.toml"
-          build() {
-            DESTINATION=$1
-            shift
-            docker buildx build --no-cache-filter compile \
-              --secret "id=gcs,src=$GCS_CREDENTIALS" \
-              --build-arg "CACHE_PREFIX=$CACHE_PREFIX" \
-              "$@" --output "type=local,dest=artifacts/$DESTINATION" \
-              "$RUNNER_TEMP/native-cache"
-          }
-          build first
-          docker buildx create --driver docker-container --name fresh --use
-          build warm
-          cmp artifacts/first/probe.o artifacts/warm/probe.o
-          cmp artifacts/first/release/libprobe.rlib artifacts/warm/release/libprobe.rlib
-          printf 'int value(void) { return 2; }\n' > "$RUNNER_TEMP/native-cache/probe.c"
-          build changed
-          build outage --build-arg CACHE_BUCKET=marin-cache-does-not-exist-01a10d2b
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          records={p.parent.name:json.loads(p.read_text()) for p in Path('artifacts').glob('*/stats.json')}
-          for phase,report in records.items():
-              stats=report['stats']
-              print(phase, json.dumps(stats))
-          def count(phase, metric):
-              return sum(records[phase]['stats'][metric]['counts'].values())
-          assert count('first','cache_misses') == 2
-          assert count('warm','cache_hits') == 2
-          assert count('changed','cache_hits') == count('changed','cache_misses') == 1
-          assert Path('artifacts/outage/probe.o').is_file()
-          assert Path('artifacts/outage/release/libprobe.rlib').is_file()
-          PY
-      - uses: actions/upload-artifact@v4
-        if: always()
+          # Pin uv so setup-uv resolves the version locally. Unpinned, it queries the
+          # GitHub /releases/latest API for "latest", which is rate-limited and outage
+          # prone and has flaked this job ("Could not determine uv version ... Falling
+          # back to latest. Getting latest version from GitHub API").
+          version: ${{ env.UV_VERSION }}
+
+      - name: Lint the Marin delta
+        run: uv run infra/pre-commit.py --all-files
+
+      - name: Check the vendored marin-style tree is not stale
+        run: >-
+          uvx --from
+          git+https://github.com/marin-community/marin-style@727f180cd423246ca1a6164163a5883cda5bf52b
+          marin-style sync --check
+
+  delta-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
         with:
-          name: native-gcs-smoke-${{ matrix.arch }}
-          path: artifacts
-      - uses: google-github-actions/setup-gcloud@v3
-        if: always()
-      - name: Check expiry selection and remove only this probe's objects
-        if: always()
+          # Pin uv to avoid setup-uv's flaky GitHub /releases/latest lookup (see the
+          # marin-precommit job above).
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install vLLM (python-only, CPU)
+        # VLLM_TARGET_DEVICE=empty is upstream's documented python-only build: no kernels
+        # are compiled, which is what keeps this in the minutes range.
         run: |
-          set -euo pipefail
-          PREFIX="gs://marin-public/$CACHE_PREFIX**"
-          gcloud storage objects list "$PREFIX" \
-            --filter="creation_time<$(date -u -d '21 days ago' +%Y-%m-%dT%H:%M:%SZ)" \
-            --format='value(storage_url)' > "$RUNNER_TEMP/expired-objects"
-          test ! -s "$RUNNER_TEMP/expired-objects"
-          gcloud storage objects list "$PREFIX" \
-            --filter="creation_time<$(date -u -d '1 minute' +%Y-%m-%dT%H:%M:%SZ)" \
-            --format='value(storage_url)' > "$RUNNER_TEMP/expired-objects"
-          if [[ -s "$RUNNER_TEMP/expired-objects" ]]; then
-            gcloud storage rm --read-paths-from-stdin < "$RUNNER_TEMP/expired-objects"
-          fi
-          gcloud storage objects list "$PREFIX" --format='value(storage_url)' > "$RUNNER_TEMP/remaining-objects"
-          test ! -s "$RUNNER_TEMP/remaining-objects"
+          uv venv --python 3.12
+          VLLM_TARGET_DEVICE=empty uv pip install -e . --torch-backend=cpu
+
+      - name: Check the GrugMoE delta resolves against this base
+        run: .venv/bin/python infra/ci/delta_smoke.py
+
+  release-metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Test GPU release metadata and promotion gates
+        run: >-
+          uv run --python 3.12 --no-project --with pytest --with pyyaml
+          python -m pytest infra/release/tests -v
+
+      - name: Test nightly failure boundaries
+        run: >-
+          uv run --python 3.12 --no-project --with pytest --with pyyaml
+          --with packaging --with setuptools-scm
+          python -m pytest infra/nightly/tests -v
