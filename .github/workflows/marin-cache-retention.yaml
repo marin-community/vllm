@@ -23,3 +23,25 @@ jobs:
           package-type: container
           min-versions-to-keep: 10
           delete-only-untagged-versions: "true"
+
+  compiler-cache:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: projects/748532799086/locations/global/workloadIdentityPools/github-pool/providers/github-oidc
+          service_account: github-iris@hai-gcp-models.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@v3
+      - name: Delete compiler results older than 21 days
+        run: |
+          gcloud storage objects list 'gs://marin-public/build-cache/vllm/sccache-v1/**' \
+            --filter="creation_time<$(date -u -d '21 days ago' +%Y-%m-%dT%H:%M:%SZ)" \
+            --format='value(storage_url)' > "$RUNNER_TEMP/expired-compiler-cache"
+          if [[ -s "$RUNNER_TEMP/expired-compiler-cache" ]]; then
+            gcloud storage rm --read-paths-from-stdin < "$RUNNER_TEMP/expired-compiler-cache"
+          fi
