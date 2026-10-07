@@ -96,7 +96,10 @@ jobs:
           grep -q 'exit code: 42' artifacts/cold.log
           docker buildx build --target inspect-export --build-arg NONCE=before --output type=local,dest=before probe
           test "$(cat before/calls)" = ordinary
-          echo reused-compiler-output > compiler-cache/object
+          echo reused-compiler-output > artifacts/expected-object
+          cp artifacts/expected-object compiler-cache/object
+      - name: Prepare compiler objects
+        run: mkdir -p compiler-cache && cp artifacts/expected-object compiler-cache/object
       - uses: reproducible-containers/buildkit-cache-dance@v3.1.2
         with:
           skip-extraction: true
@@ -108,19 +111,21 @@ jobs:
             --secret id=marin-compile-cache,src="$RUNNER_TEMP/marin-compile-cache" \
             --cache-to type=registry,ref="$CACHE_REF",mode=max,compression=zstd,compression-level=3,oci-mediatypes=true,image-manifest=true \
             --output type=local,dest=loaded probe 2>&1 | tee artifacts/loaded.log
-          cmp compiler-cache/object loaded/result
+          cmp artifacts/expected-object loaded/result
       - name: Reuse layers on a fresh builder without loading compiler files
         run: |
           docker buildx create --name guard-warm --driver docker-container --use
           docker buildx build --target wheel --build-arg MARIN_CACHE_FIRST=1 \
             --cache-from type=registry,ref="$CACHE_REF" \
             --output type=local,dest=warm probe 2>&1 | tee artifacts/warm.log
-          cmp compiler-cache/object warm/result
+          cmp artifacts/expected-object warm/result
           docker buildx build --target inspect-export --build-arg NONCE=after --output type=local,dest=after probe
           test ! -e after/calls
           if docker buildx build --target wheel --build-arg MARIN_CACHE_FIRST=1 --build-arg VARIANT=changed \
             --cache-from type=registry,ref="$CACHE_REF" --output type=local,dest=changed probe > artifacts/changed.log 2>&1; then exit 1; fi
           grep -q 'exit code: 42' artifacts/changed.log
+      - name: Prepare compiler objects
+        run: mkdir -p compiler-cache && cp artifacts/expected-object compiler-cache/object
       - uses: reproducible-containers/buildkit-cache-dance@v3.1.2
         with:
           skip-extraction: true
@@ -130,7 +135,7 @@ jobs:
           docker buildx build --target wheel --build-arg MARIN_CACHE_FIRST=1 --build-arg VARIANT=changed \
             --secret id=marin-compile-cache,src="$RUNNER_TEMP/marin-compile-cache" \
             --output type=local,dest=changed probe 2>&1 | tee artifacts/retry.log
-          cmp compiler-cache/object changed/result
+          cmp artifacts/expected-object changed/result
       - uses: actions/upload-artifact@v4
         if: always()
         with:
