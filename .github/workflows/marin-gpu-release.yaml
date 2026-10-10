@@ -626,7 +626,7 @@ jobs:
             --tpu "${{ needs.resolve_tpu.outputs.hardware }}" --enable-extra-resources \
             --region "${{ needs.resolve_tpu.outputs.region }}" \
             --priority interactive \
-            --cpu 16 --memory 64g --disk 100g \
+            --cpu 16 --memory 64g --disk 64g \
             --timeout 4200 \
             --no-sync \
             --max-retries 0 \
