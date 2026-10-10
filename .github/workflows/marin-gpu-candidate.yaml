@@ -474,54 +474,25 @@ jobs:
             echo "tpu_version=${TPU_VERSION}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Checkout exact vLLM source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.pair.outputs.vllm_repository }}
-          ref: ${{ steps.pair.outputs.vllm_commit }}
-          fetch-depth: 0
-          path: sources/vllm
-          persist-credentials: false
-
-      - name: Checkout exact tpu-inference source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.pair.outputs.tpu_repository }}
-          ref: ${{ steps.pair.outputs.tpu_commit }}
-          fetch-depth: 0
-          path: sources/tpu-inference
-          persist-credentials: false
-
-      - name: Build both Python 3.12 wheels
+      - name: Build both wheels with the portable TPU recipe
         run: |
-          [[ "$(git -C sources/vllm rev-parse HEAD)" == "${{ steps.pair.outputs.vllm_commit }}" ]]
-          [[ "$(git -C sources/tpu-inference rev-parse HEAD)" == "${{ steps.pair.outputs.tpu_commit }}" ]]
-          mkdir candidate
-          (
-            cd sources/vllm
-            uv venv --python "${{ steps.pair.outputs.python_version }}" .tpu-wheel-build
-            uv pip install \
-              --python .tpu-wheel-build/bin/python \
-              --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-              --index-strategy unsafe-best-match \
-              --requirements requirements/build/tpu.txt
-            VLLM_TARGET_DEVICE="${{ steps.pair.outputs.target_device }}" \
-              VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.vllm_version }}" \
-              SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
-              uv build --wheel \
-                --no-build-isolation \
-                --python .tpu-wheel-build/bin/python \
-                --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-                --out-dir "$GITHUB_WORKSPACE/candidate"
-          )
-          (
-            cd sources/tpu-inference
-            VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.tpu_version }}" \
-              SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" uv build --wheel \
-              --python "${{ steps.pair.outputs.python_version }}" \
-              --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-              --out-dir "$GITHUB_WORKSPACE/candidate"
-          )
+          mkdir tpu-builder-context candidate
+          uv venv --python 3.12.13 .tpu-builder-inputs
+          uv pip install --python .tpu-builder-inputs/bin/python "uv==$UV_VERSION"
+          cp .tpu-builder-inputs/bin/uv tpu-builder-context/uv
+          docker build \
+            --tag marin-tpu-builder:release \
+            --file infra/release/Dockerfile.tpu-build \
+            tpu-builder-context
+          docker image inspect marin-tpu-builder:release \
+            --format '{{.Id}}' > candidate/builder-image.txt
+          docker run --name marin-tpu-pair-build --cpus 1 --memory 4g \
+            --mount type=bind,source="$GITHUB_WORKSPACE/infra/release/build_tpu_pair.sh",target=/recipe.sh,readonly \
+            marin-tpu-builder:release nice -n 10 bash /recipe.sh \
+            "${{ steps.pair.outputs.vllm_commit }}" \
+            "${{ steps.pair.outputs.tpu_commit }}" \
+            "${{ steps.pair.outputs.exclude_newer }}"
+          docker cp marin-tpu-pair-build:/work/pair/. candidate/
           WHEELS=(candidate/*.whl)
           if [[ ${#WHEELS[@]} -ne 2 ]]; then
             echo "Expected two wheels, found ${#WHEELS[@]}" >&2
@@ -577,7 +548,9 @@ jobs:
             --prerelease \
             candidate/*.whl \
             candidate/*.html \
-            candidate/marin-vllm-tpu-manifest.json
+            candidate/marin-vllm-tpu-manifest.json \
+            candidate/*.txt \
+            candidate/*.sha256
 
       - name: Redownload the published pair
         env:
