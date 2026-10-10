@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 set -euo pipefail
+umask 022
 
 # Run in an empty /work directory in Dockerfile.tpu-build's x86_64 image.
 vllm_commit=${1:?full vLLM commit required}
