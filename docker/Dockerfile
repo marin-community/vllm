@@ -330,12 +330,22 @@ ENV CARGO_BUILD_JOBS=4
 # separate local sccache daemon while sharing the same remote cache backend.
 ENV SCCACHE_SERVER_PORT=4227
 
+ARG SCCACHE_GCS_BUCKET
+ARG SCCACHE_GCS_KEY_PREFIX
+ARG SCCACHE_GCS_RW_MODE
+ARG SCCACHE_GCS_KEY_PATH
+ARG SCCACHE_IGNORE_SERVER_IO_ERROR
+
 # Build with a stable version so this target snapshot is keyed only by Rust
 # inputs. The child stage below relinks the crates that embed the exact version.
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
+    --mount=type=secret,id=gcs-credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
+        if [ -n "${SCCACHE_GCS_KEY_PATH}" ] && [ ! -f "$SCCACHE_GCS_KEY_PATH" ]; then \
+            unset SCCACHE_GCS_BUCKET SCCACHE_GCS_KEY_PREFIX SCCACHE_GCS_RW_MODE SCCACHE_GCS_KEY_PATH; \
+        fi; \
         if [ -z "${SCCACHE_BUCKET}" ]; then \
             unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
         elif [ -n "${SCCACHE_ENDPOINT}" ]; then \
@@ -347,6 +357,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     && SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+docker.cache" bash build_rust.sh \
     && if [ "$USE_SCCACHE" = "1" ]; then \
         sccache --show-stats; \
+        sccache --stop-server; \
     fi
 
 # Relink with the exact Git-derived package version.
@@ -441,13 +452,23 @@ ENV DEEPGEMM_VENV_PREFIX=/opt/dgenv
 RUN --mount=type=cache,target=/root/.cache/uv \
     tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
 
+ARG SCCACHE_GCS_BUCKET
+ARG SCCACHE_GCS_KEY_PREFIX
+ARG SCCACHE_GCS_RW_MODE
+ARG SCCACHE_GCS_KEY_PATH
+ARG SCCACHE_IGNORE_SERVER_IO_ERROR
+
 # Build the vLLM wheel
 # if USE_SCCACHE is set, use sccache to speed up compilation
 # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)
 RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
+    --mount=type=secret,id=gcs-credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
+        if [ -n "${SCCACHE_GCS_KEY_PATH}" ] && [ ! -f "$SCCACHE_GCS_KEY_PATH" ]; then \
+            unset SCCACHE_GCS_BUCKET SCCACHE_GCS_KEY_PREFIX SCCACHE_GCS_RW_MODE SCCACHE_GCS_KEY_PATH; \
+        fi; \
         if [ -z "${SCCACHE_BUCKET}" ]; then \
             unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS SCCACHE_ENDPOINT; \
         elif [ -n "${SCCACHE_ENDPOINT}" ]; then \
@@ -464,6 +485,7 @@ RUN --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
         && sccache --zero-stats \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
         && sccache --show-stats > /tmp/sccache-stats.txt \
+        && sccache --stop-server \
         && du -sh /root/.cache/sccache > /tmp/sccache-size.txt; \
     fi
 
