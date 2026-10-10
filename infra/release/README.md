@@ -189,6 +189,16 @@ fragment as a 14-day workflow artifact. Record both wheel hashes before using
 them in a consumer qualification. These branch builds cannot enter the GPU
 release lane; publication still requires a source commit on `main`.
 
+Unchanged build layers use `ghcr.io/marin-community/vllm-build-cache:<architecture>`
+with Marin/Iris's registry-cache settings. Compiler steps that must execute use
+sccache 0.8.1's native GCS backend at
+`gs://marin-public/build-cache/vllm/sccache-v1/<architecture>/`.
+The existing `github-iris` workload identity is mounted as a BuildKit secret;
+credentials are excluded from the build context and exported layers.
+Layer hits skip compiler-cache requests. Missing credentials or unavailable
+caches fall back to compilation. GCS expiry is handled separately by the cache
+retention workflow. [Design and measurements](https://echo.oa.dev/wiki/613).
+
 GPU publication runs must use the repository's default branch, which this fork
 expects to be `main`. A candidate from a prior `main` commit remains valid after
 `main` advances. To build immediately after a merge, dispatch from `main`:
