@@ -311,6 +311,45 @@ outside branch-controlled workflow code.
 
 ## TPU wheel pairs
 
+### Portable local builds
+
+[`Dockerfile.tpu-build`](Dockerfile.tpu-build) pins the Python 3.12.13 Debian
+Bookworm base by digest and the signed Debian compiler packages to the
+2026-10-04 snapshot. Its build context must contain the Linux x86_64 uv 0.11.21
+binary as `uv`; the Dockerfile verifies its SHA-256. With uv already installed,
+create a fresh virtual environment and install uv 0.11.21 into it using
+`uv pip install --python <venv>/bin/python uv==0.11.21`. Copy that environment's
+`bin/uv` into the build context.
+
+The shared 0.30 pair uses the full commits and whole-second UTC cutoff below.
+Run from the repository root. Docker applies a one-CPU quota and 4 GiB memory
+limit. Use a new container name for each independent build; each starts with
+an empty `/work` directory.
+
+```bash
+docker build -t marin-tpu-builder:030 -f infra/release/Dockerfile.tpu-build <build-context>
+docker run --name tpu-pair-a --cpus 1 --memory 4g \
+  --mount type=bind,source="$PWD/infra/release/build_tpu_pair.sh",target=/recipe.sh,readonly \
+  marin-tpu-builder:030 nice -n 10 bash /recipe.sh \
+  47b411d5785d1c3dee0328334472d70310c53feb \
+  66c5d8952eec0c263361915cb4613d8f30737955 \
+  2026-10-04T20:00:00Z
+docker cp tpu-pair-a:/work/pair ./pair-a
+```
+
+[`build_tpu_pair.sh`](build_tpu_pair.sh) writes `/work/pair`. It
+contains both wheels, their hashes, installed build dependencies and compiler
+input hashes. Compare complete wheel hashes across independent containers.
+
+This recipe uses the shared 0.30 sources with separate TPU dependencies. It
+builds the C++ TPU helper extensions and skips CUDA and Rust extensions.
+The image, compiler and Python dependency wheels include prebuilt vendor
+payloads. Reproducing this pair does not prove those payloads or later JIT
+outputs independently reproducible. Local build records do not replace the
+GitHub producer and qualification records required for protected promotion.
+
+### Publication and qualification
+
 The TPU lane uses the same `main` source lineage and builds a separate vLLM
 wheel with its own Torch, JAX, and libtpu environment. It never consumes or
 promotes a `tpu` branch. `marin-gpu-candidate.yaml` accepts full vLLM and

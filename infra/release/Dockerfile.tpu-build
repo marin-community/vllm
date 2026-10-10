@@ -1,0 +1,17 @@
+FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2
+
+# Freeze the compiler and system headers independently from the Python cutoff.
+RUN sed -i \
+      -e 's#http://deb.debian.org/debian-security#https://snapshot.debian.org/archive/debian-security/20261004T200000Z#' \
+      -e 's#http://deb.debian.org/debian#https://snapshot.debian.org/archive/debian/20261004T200000Z#' \
+      /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends g++ git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Supply the checksum-verified uv 0.11.21 binary in the build context.
+COPY uv /usr/local/bin/uv
+RUN echo '2856d1bf7e5bcfba7df20ae6f939340ae1f8022d2d103cada1a6da597df86e32  /usr/local/bin/uv' | sha256sum --check \
+    && test "$(uv --version | cut -d ' ' -f 2)" = 0.11.21
+ENV MAX_JOBS=1 CARGO_BUILD_JOBS=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+WORKDIR /work
