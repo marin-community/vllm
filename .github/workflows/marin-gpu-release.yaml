@@ -625,7 +625,7 @@ jobs:
             --user "$JOB_USER" \
             --tpu "${{ needs.resolve_tpu.outputs.hardware }}" --enable-extra-resources \
             --region "${{ needs.resolve_tpu.outputs.region }}" \
-            --priority production \
+            --priority interactive \
             --cpu 16 --memory 64g --disk 100g \
             --timeout 4200 \
             --no-sync \

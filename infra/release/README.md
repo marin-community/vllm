@@ -308,9 +308,10 @@ tpu-inference commits plus a UTC dependency cutoff, builds both wheels once,
 and publishes an immutable content-addressed prerelease and manifest.
 
 `marin-gpu-release.yaml` redownloads that exact pair, verifies its hashes,
-cold-installs it from the candidate index, and runs the Qwen3-0.6B TP8 gate on
-one `v6e-8` in `us-east5`. A qualification dispatch with `promote=false` records
-the physical TPU result without finalizing a release. Later promotion accepts
+cold-installs it from the candidate index, and runs the Qwen3-0.6B TP4 gate on
+one `v6e-4` in `europe-west4` at Iris's interactive job priority. A qualification
+dispatch with `promote=false` records the test result and detected TPU type
+without finalizing a release. Later promotion accepts
 that successful qualification run's exact ID, revalidates its GitHub metadata
 and artifact against the candidate, and reuses the same candidate bytes without
 allocating another TPU.

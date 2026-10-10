@@ -79,7 +79,7 @@ def _candidate(tmp_path: Path) -> dict:
 def _validation(candidate: dict) -> dict:
     return {
         "candidate_tag": candidate["release"]["tag"],
-        "hardware": "v6e-8",
+        "hardware": "v6e-4",
         "run_url": "https://github.com/marin-community/vllm/actions/runs/456",
     }
 

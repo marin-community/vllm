@@ -14,9 +14,9 @@
     }
   },
   "validation": {
-    "hardware": "v6e-8",
-    "region": "us-east5",
-    "tensor_parallel_size": 8,
+    "hardware": "v6e-4",
+    "region": "europe-west4",
+    "tensor_parallel_size": 4,
     "spec": "infra/nightly/specs/qwen3-0.6b-tpu.json"
   },
   "repositories": {
