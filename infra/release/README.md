@@ -25,7 +25,8 @@ with one NVCC thread each and an 800 MiB wheel limit.
 
 `gpu-constraints.txt` and `gpu-constraints-aarch64.txt` pin the Python build and
 runtime dependencies for CPython 3.12 on manylinux 2.28. The release Docker build
-and wheel validation consume the file for their architecture. Their direct inputs live in `gpu-constraints.in`,
+and wheel validation consume the file for their architecture. Their direct
+inputs live in `gpu-constraints.in`,
 including one `torchaudio==2.11.0+cpu` constraint and the Transformers and
 Tokenizers versions qualified by the selected upstream CUDA test environment.
 The generated file records the PyPI, CUDA 13.2, CPU Torch, and FlashInfer
@@ -51,7 +52,8 @@ dependency closure. Use `--upgrade` only when intentionally requalifying that
 closure. For ARM, use `aarch64-manylinux_2_28` and write
 `gpu-constraints-aarch64.txt`. That closure selects the maintained cuSPARSELt
 wheel with its repaired ARM platform tag. The toolkit extras pin the compiler
-and headers used by runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the
+and headers used by runtime JIT compilation. Preserve the CPU TorchAudio version
+constraint: the
 available CUDA 13.0 TorchAudio wheel rejects Torch cu132, while audio
 preprocessing uses Torch's tensor operators.
 
@@ -61,6 +63,12 @@ the remaining toolkit. The manifest records the installed compiler provenance,
 architecture-specific constraints, and packaged native payload hashes. Build
 timestamps use the source commit time; caches and vendor binaries remain part
 of the build inputs.
+
+The qualified 0.30 port also retains its pinned Rust toolchain, frontend Cargo
+profile, NVCC temporary-directory and source-seed flags, and bounded local
+indices in the ARM quantization kernel. Those adaptations remain unchanged;
+their measured reproduction limits and removal conditions are recorded in the
+[qualified recipe](https://github.com/marin-community/vllm/blob/2e5249991b94a79d5d80ad363e8bb0ac30d304a6/infra/release/README.md#gpu-build-configuration).
 
 Each build job removes unused Android, .NET, and GHC toolchains from its
 ephemeral hosted runner before compiling. The wheel-only BuildKit export also

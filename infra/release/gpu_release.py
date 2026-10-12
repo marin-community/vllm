@@ -639,7 +639,9 @@ def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 # Build-arg values are sourced from config.json so the workflow
                 # holds no toolchain literals that can drift from the base image.
                 "cuda_version": config["cuda_toolkit_version"],
-                "constraints_file": f"infra/release/{_constraints_filename(architecture)}",
+                "constraints_file": (
+                    f"infra/release/{_constraints_filename(architecture)}"
+                ),
                 "python_version": config["python_version"],
                 "max_jobs": platform["max_jobs"],
                 "max_wheel_size_mb": platform["max_wheel_size_mb"],
@@ -849,7 +851,9 @@ def main() -> int:
                 base_image=args.base_image,
                 base_image_digest=args.base_image_digest,
                 provenance={
-                    **provenance_from_environment(args.base_image, args.base_image_digest),
+                    **provenance_from_environment(
+                        args.base_image, args.base_image_digest
+                    ),
                     "compiler": compiler,
                     "compiler_provenance_sha256": sha256_file(args.compiler_provenance),
                 },

@@ -237,7 +237,7 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
         "name": "vllm",
         "version": "0.0.0.dev20260803+marin.test.cu130",
         "requires_python": ">=3.10,<3.15",
-        "torch_metadata_requirement": "torch==2.13.0",
+        "torch_metadata_requirement": "torch==2.14.1",
     }
     assert record["source"]["fork_commit"] == FORK_COMMIT
     assert record["source"]["upstream_base"] == UPSTREAM_BASE
@@ -266,6 +266,15 @@ def test_inspect_wheel_cli_runs_without_site_packages(tmp_path):
         f"manylinux_2_28_{architecture}.whl"
     )
     output = tmp_path / "fragment.json"
+    compiler = tmp_path / "compiler.json"
+    compiler.write_text(
+        json.dumps(
+            {
+                "compiler_version": config["cuda_compiler_version"],
+                "architecture": architecture,
+            }
+        )
+    )
     write_wheel(wheel, architecture=architecture)
 
     completed = subprocess.run(
@@ -291,6 +300,8 @@ def test_inspect_wheel_cli_runs_without_site_packages(tmp_path):
             platform["build_base_image"],
             "--base-image-digest",
             platform["build_base_image"],
+            "--compiler-provenance",
+            str(compiler),
             "--output",
             str(output),
         ],
