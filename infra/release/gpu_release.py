@@ -12,8 +12,10 @@ import hashlib
 import json
 import os
 import re
-import subprocess
+import shutil
 import sys
+import tempfile
+import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -50,11 +52,7 @@ UPSTREAM_REPOSITORY = "https://github.com/vllm-project/vllm"
 STABLE_LIBTORCH_GATE = "vllm._C_stable_libtorch"
 REQUIRED_EXTENSIONS = (STABLE_LIBTORCH_GATE, "vllm.cumem_allocator")
 GRUG_ARCHITECTURE = "GrugMoeForCausalLM"
-CANDIDATE_TAG_PREFIX = "marin-vllm-gpu-candidate-"
-STAGED_CANDIDATE_TAG_PREFIX = "marin-vllm-gpu-staged-candidate-"
 RELEASE_TAG_PREFIX = "marin-vllm-gpu-"
-MAINTAINED_BRANCH = "main"
-STAGING_BRANCH = "main-next"
 BUILD_ABI_KEYS = (
     "python_version",
     "torch_version",
@@ -101,7 +99,9 @@ def _packaged_contents(wheel: Path) -> dict[str, str]:
     with zipfile.ZipFile(wheel) as archive:
         members = archive.namelist()
         grug_sources = [
-            name for name in members if name == "vllm/model_executor/models/grugmoe.py"
+            name
+            for name in members
+            if name == "vllm/model_executor/models/grugmoe.py"
         ]
         grug_state = "absent"
         if grug_sources:
@@ -172,6 +172,7 @@ def _constraints_url(architecture: str, fork_commit: str) -> str:
         f"https://raw.githubusercontent.com/{repository}/"
         f"{fork_commit}/infra/release/{_constraints_filename(architecture)}"
     )
+
 
 
 def inspect_wheel(
@@ -301,12 +302,12 @@ def validate_wheel_fragment(fragment: dict[str, Any]) -> None:
     validate_packaged_contents(fragment["platform"]["packaged"])
 
 
-def assemble_candidate(
+def assemble_manifest(
     fragments: list[dict[str, Any]],
     *,
     config: dict[str, Any],
     repository: str,
-    candidate_tag: str,
+    release_tag: str,
     created_at: str,
 ) -> dict[str, Any]:
     expected_architectures = set(config["platforms"])
@@ -314,10 +315,10 @@ def assemble_candidate(
         fragment["platform"]["architecture"]: fragment for fragment in fragments
     }
     if len(by_architecture) != len(fragments):
-        raise ReleaseError("candidate contains duplicate architecture fragments")
+        raise ReleaseError("manifest contains duplicate architecture fragments")
     if set(by_architecture) != expected_architectures:
         raise ReleaseError(
-            "candidate architectures do not match config: "
+            "manifest architectures do not match config: "
             f"expected {sorted(expected_architectures)}, "
             f"got {sorted(by_architecture)}"
         )
@@ -345,7 +346,7 @@ def assemble_candidate(
         platform["build"] = fragment["build"]
         filename = platform["wheel"]["filename"]
         platform["wheel"]["url"] = release_asset_url(
-            repository, candidate_tag, filename
+            repository, release_tag, filename
         )
         platforms.append(platform)
 
@@ -354,8 +355,8 @@ def assemble_candidate(
         "release": {
             "brand": config["brand"],
             "repository": repository,
-            "tag": candidate_tag,
-            "status": "candidate",
+            "tag": release_tag,
+            "status": "built",
             "created_at": created_at,
         },
         "source": first["source"],
@@ -364,6 +365,28 @@ def assemble_candidate(
         "platforms": platforms,
         "validation": {"status": "pending", "targets": []},
     }
+
+
+def download_wheel_artifact(url: str, destination: Path, *, token: str) -> None:
+    """Download one wheel from a GitHub Actions artifact ZIP."""
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "marin-release-validation"}
+    )
+    # GitHub redirects to a short-lived storage URL. Keep the token on the API request.
+    request.add_unredirected_header("Authorization", f"Bearer {token}")
+    with tempfile.TemporaryDirectory(prefix="vllm-artifact-") as directory:
+        archive_path = Path(directory) / "artifact.zip"
+        with (
+            urllib.request.urlopen(request, timeout=900) as response,
+            archive_path.open("wb") as output,
+        ):
+            shutil.copyfileobj(response, output)
+        with (
+            zipfile.ZipFile(archive_path) as archive,
+            archive.open(destination.name) as wheel,
+            destination.open("wb") as output,
+        ):
+            shutil.copyfileobj(wheel, output)
 
 
 def verify_manifest_assets(manifest: dict[str, Any], directory: Path) -> None:
@@ -379,148 +402,12 @@ def verify_manifest_assets(manifest: dict[str, Any], directory: Path) -> None:
             )
 
 
-def _github_api(path: str, context: str) -> dict[str, Any]:
-    try:
-        response = subprocess.run(
-            ["gh", "api", path], check=True, capture_output=True, text=True
-        )
-    except subprocess.CalledProcessError as exc:
-        raise ReleaseError(
-            f"{context}: GitHub API failed: {exc.stderr.strip()}"
-        ) from exc
-    return json.loads(response.stdout)
-
-
-def verify_published_candidate(manifest: dict[str, Any], repository: str) -> None:
-    """Match a published candidate's identity and wheel digests to its manifest."""
-    tag = manifest["release"]["tag"]
-    source = manifest["source"]["fork_commit"]
-    context = f"candidate={tag} source={source}"
-    release = _github_api(f"repos/{repository}/releases/tags/{tag}", context)
-    if (
-        release["tag_name"] != tag
-        or release["target_commitish"] != source
-        or release["draft"]
-        or not release["prerelease"]
-    ):
-        raise ReleaseError(f"{context}: release identity changed")
-    wheels = {
-        platform["wheel"]["filename"]: f"sha256:{platform['wheel']['sha256']}"
-        for platform in manifest["platforms"]
-    }
-    assets = {asset["name"]: asset for asset in release["assets"]}
-    if (
-        set(assets) != {MANIFEST_NAME, *wheels}
-        or any(asset["state"] != "uploaded" for asset in assets.values())
-        or any(assets[name].get("digest") != digest for name, digest in wheels.items())
-    ):
-        raise ReleaseError(f"{context}: release assets disagree with manifest")
-
-
-def validate_candidate(manifest: dict[str, Any], config: dict[str, Any]) -> None:
-    if manifest["release"]["status"] != "candidate":
-        raise ReleaseError("manifest is not a candidate")
+def validate_build(manifest: dict[str, Any], config: dict[str, Any]) -> None:
+    if manifest["release"]["status"] != "built":
+        raise ReleaseError("manifest is not an unqualified build")
     _validate_manifest_common(manifest, config)
-    source_commit = manifest["source"]["fork_commit"]
-    expected_tags = {
-        CANDIDATE_TAG_PREFIX + source_commit[:12],
-        STAGED_CANDIDATE_TAG_PREFIX + source_commit[:12],
-    }
-    candidate_tag = manifest["release"]["tag"]
-    if candidate_tag not in expected_tags:
-        raise ReleaseError("candidate tag does not match its fork commit")
     if manifest["validation"] != {"status": "pending", "targets": []}:
-        raise ReleaseError("candidate validation state is not pending")
-
-
-def newest_published_candidate(releases: list[dict[str, Any]]) -> str:
-    """Select the GPU candidate with the latest publication timestamp."""
-    candidates = [
-        release
-        for release in releases
-        if release["prerelease"]
-        and not release["draft"]
-        and release["tag_name"].startswith(CANDIDATE_TAG_PREFIX)
-    ]
-    if not candidates:
-        raise ReleaseError("No Marin vLLM GPU candidate release exists")
-    return max(
-        candidates, key=lambda release: (release["published_at"], release["id"])
-    )["tag_name"]
-
-
-def verify_main_lineage(
-    repository: str,
-    workflow_ref: str,
-    source_commit: str,
-    candidate_tag: str | None = None,
-) -> None:
-    """Require the running ref and exact GPU source to belong to main."""
-    context = (
-        f"candidate={candidate_tag or '-'} source={source_commit} "
-        f"workflow_ref={workflow_ref}"
-    )
-    default_branch = _github_api(f"repos/{repository}", context)["default_branch"]
-    expected_ref = f"refs/heads/{default_branch}"
-    context += f" expected_default_branch={default_branch}"
-    if default_branch != MAINTAINED_BRANCH or workflow_ref != expected_ref:
-        raise ReleaseError(
-            f"GPU lineage rejected: {context}; "
-            f"workflow must run from {expected_ref} on maintained {MAINTAINED_BRANCH}"
-        )
-    status = _github_api(
-        f"repos/{repository}/compare/{source_commit}...{default_branch}", context
-    )["status"]
-    if status not in {"identical", "ahead"}:
-        raise ReleaseError(
-            f"GPU lineage rejected: {context}; "
-            f"source is not an ancestor of {default_branch} (compare status={status})"
-        )
-
-
-def _branch_head(repository: str, branch: str, context: str) -> str:
-    return _github_api(f"repos/{repository}/git/ref/heads/{branch}", context)["object"][
-        "sha"
-    ]
-
-
-def verify_candidate_lineage(
-    repository: str,
-    workflow_ref: str,
-    source_commit: str,
-    candidate_tag: str,
-) -> None:
-    """Allow a main candidate or the exact main-next staged candidate."""
-    context = (
-        f"candidate={candidate_tag} source={source_commit} workflow_ref={workflow_ref}"
-    )
-    default_branch = _github_api(f"repos/{repository}", context)["default_branch"]
-    if default_branch != MAINTAINED_BRANCH or workflow_ref not in {
-        f"refs/heads/{MAINTAINED_BRANCH}",
-        f"refs/heads/{STAGING_BRANCH}",
-    }:
-        raise ReleaseError(
-            f"GPU candidate workflow ran from an unsupported ref: {context}"
-        )
-    staged_tag = f"{STAGED_CANDIDATE_TAG_PREFIX}{source_commit[:12]}"
-    if workflow_ref == f"refs/heads/{STAGING_BRANCH}" and candidate_tag != staged_tag:
-        raise ReleaseError(
-            f"GPU candidate rejected: {context}; {STAGING_BRANCH} requires a staged tag"
-        )
-    status = _github_api(
-        f"repos/{repository}/compare/{source_commit}...{MAINTAINED_BRANCH}", context
-    )["status"]
-    if status in {"identical", "ahead"}:
-        return
-    if (
-        candidate_tag == staged_tag
-        and _branch_head(repository, STAGING_BRANCH, context) == source_commit
-    ):
-        return
-    raise ReleaseError(
-        f"GPU candidate rejected: {context}; source is neither on "
-        f"{MAINTAINED_BRANCH} nor the exact {STAGING_BRANCH} tip"
-    )
+        raise ReleaseError("build validation state is not pending")
 
 
 def _validate_manifest_common(
@@ -541,14 +428,20 @@ def _validate_manifest_common(
     for field in ("fork_commit", "upstream_base"):
         if re.fullmatch(r"[0-9a-f]{40}", source[field]) is None:
             raise ReleaseError(f"source {field} is not a full Git commit")
+    source_prefix = source["fork_commit"][:12]
+    if re.fullmatch(
+        rf"{RELEASE_TAG_PREFIX}[0-9]{{8}}-{source_prefix}", release["tag"]
+    ) is None:
+        raise ReleaseError("release tag does not match its fork commit")
     if manifest["distribution"]["name"] != config["distribution_name"]:
         raise ReleaseError("distribution name changed")
     expected_abi = {key: config[key] for key in RELEASE_ABI_KEYS}
     if manifest["abi"] != expected_abi:
         raise ReleaseError("release ABI changed")
     architectures = {item["architecture"] for item in manifest["platforms"]}
-    if architectures != set(config["platforms"]) or len(manifest["platforms"]) != len(
-        config["platforms"]
+    if (
+        architectures != set(config["platforms"])
+        or len(manifest["platforms"]) != len(config["platforms"])
     ):
         raise ReleaseError("release platform set is incomplete")
     if not manifest["distribution"].get("version"):
@@ -556,29 +449,27 @@ def _validate_manifest_common(
     for platform in manifest["platforms"]:
         architecture = platform["architecture"]
         expected_platform = config["platforms"][architecture]
-        constraints = platform.get("constraints")
-        if constraints is not None:
-            expected_constraints_url = _constraints_url(
-                architecture, source["fork_commit"]
-            )
-            if constraints.get("url") != expected_constraints_url:
-                raise ReleaseError(f"{architecture} constraints are not source-pinned")
-            if re.fullmatch(r"[0-9a-f]{64}", constraints.get("sha256", "")) is None:
-                raise ReleaseError(f"{architecture} constraints SHA-256 is malformed")
+        constraints = platform["constraints"]
+        expected_constraints_url = _constraints_url(architecture, source["fork_commit"])
+        if constraints.get("url") != expected_constraints_url:
+            raise ReleaseError(f"{architecture} constraints are not source-pinned")
+        if re.fullmatch(r"[0-9a-f]{64}", constraints.get("sha256", "")) is None:
+            raise ReleaseError(f"{architecture} constraints SHA-256 is malformed")
         if platform["sm_targets"] != expected_platform["sm_targets"]:
             raise ReleaseError(f"{architecture} SM targets changed")
         filename = platform["wheel"]["filename"]
-        if (
-            re.fullmatch(rf".+-manylinux_[0-9]+_[0-9]+_{architecture}\.whl", filename)
-            is None
-        ):
+        if re.fullmatch(
+            rf".+-manylinux_[0-9]+_[0-9]+_{architecture}\.whl", filename
+        ) is None:
             raise ReleaseError(f"{architecture} wheel filename is not manylinux")
         filename_parts = Path(filename).stem.rsplit("-", 3)
         if len(filename_parts) != 4 or platform["filename_tag"] != "-".join(
             filename_parts[-3:]
         ):
             raise ReleaseError(f"{architecture} wheel filename tag changed")
-        if not any(tag.endswith(f"_{architecture}") for tag in platform["wheel_tags"]):
+        if not any(
+            tag.endswith(f"_{architecture}") for tag in platform["wheel_tags"]
+        ):
             raise ReleaseError(f"{architecture} wheel metadata tags changed")
         expected_url = release_asset_url(
             release["repository"], release["tag"], filename
@@ -593,23 +484,13 @@ def _validate_manifest_common(
         for key, expected in expected_build.items():
             if build.get(key) != expected:
                 raise ReleaseError(f"{architecture} build {key} changed")
-        if (
-            re.fullmatch(
-                r"[^@]+@sha256:[0-9a-f]{64}", build.get("base_image_digest", "")
-            )
-            is None
-        ):
+        if re.fullmatch(
+            r"[^@]+@sha256:[0-9a-f]{64}", build.get("base_image_digest", "")
+        ) is None:
             raise ReleaseError(f"{architecture} base image digest is malformed")
         expected_digest = expected_platform["build_base_image"].rsplit("@", 1)[-1]
         if build["base_image_digest"].rsplit("@", 1)[-1] != expected_digest:
             raise ReleaseError(f"{architecture} base image digest changed")
-        provenance = build.get("provenance", {})
-        if provenance.get("system") != "GitHub Actions":
-            raise ReleaseError(f"{architecture} build provenance is missing")
-        if not provenance.get("run_url", "").startswith(
-            f"{SOURCE_REPOSITORY}/actions/runs/"
-        ):
-            raise ReleaseError(f"{architecture} build run URL is missing")
         validate_packaged_contents(platform["packaged"])
 
 
@@ -617,39 +498,12 @@ def validate_release(manifest: dict[str, Any], config: dict[str, Any]) -> None:
     if manifest["release"]["status"] != "released":
         raise ReleaseError("manifest is not a final release")
     _validate_manifest_common(manifest, config)
-    source_prefix = manifest["source"]["fork_commit"][:12]
-    candidate_tag = manifest["release"].get("candidate_tag", "")
-    if candidate_tag not in {
-        f"{CANDIDATE_TAG_PREFIX}{source_prefix}",
-        f"{STAGED_CANDIDATE_TAG_PREFIX}{source_prefix}",
-    }:
-        raise ReleaseError("release names the wrong candidate tag")
-    if (
-        re.fullmatch(
-            rf"{RELEASE_TAG_PREFIX}[0-9]{{8}}-{source_prefix}",
-            manifest["release"]["tag"],
-        )
-        is None
-    ):
-        raise ReleaseError("release tag does not match its fork commit")
     if manifest["validation"].get("status") != "passed":
         raise ReleaseError("release validation status is not passed")
     validations = manifest["validation"].get("targets", [])
     index_validations(validations, config)
-    candidate = copy.deepcopy(manifest)
-    candidate["release"]["tag"] = manifest["release"]["candidate_tag"]
-    candidate["release"]["status"] = "candidate"
-    candidate["validation"] = {"status": "pending", "targets": []}
-    for platform in candidate["platforms"]:
-        wheel = platform["wheel"]
-        wheel["url"] = release_asset_url(
-            candidate["release"]["repository"],
-            candidate["release"]["tag"],
-            wheel["filename"],
-        )
-    validate_candidate(candidate, config)
     for result in validations:
-        validate_validation_result(result, candidate, config)
+        validate_validation_result(result, manifest, config)
 
 
 def verify_release_assets(
@@ -667,25 +521,24 @@ def verify_release_assets(
 
 
 def validate_validation_result(
-    result: dict[str, Any], candidate: dict[str, Any], config: dict[str, Any]
+    result: dict[str, Any], manifest: dict[str, Any], config: dict[str, Any]
 ) -> None:
     architecture = result.get("architecture")
     if architecture not in config["platforms"]:
         raise ReleaseError(f"validation has unknown architecture {architecture!r}")
     platform = next(
-        item for item in candidate["platforms"] if item["architecture"] == architecture
+        item for item in manifest["platforms"] if item["architecture"] == architecture
     )
     expected_validation = config["platforms"][architecture]["validation"]
-    if result.get("candidate_tag") != candidate["release"]["tag"]:
-        raise ReleaseError(f"{architecture} validation names a different candidate")
-    if result.get("source_commit") != candidate["source"]["fork_commit"]:
+    if result.get("release_tag") != manifest["release"]["tag"]:
+        raise ReleaseError(f"{architecture} validation names a different release")
+    if result.get("source_commit") != manifest["source"]["fork_commit"]:
         raise ReleaseError(f"{architecture} validation names a different commit")
     if result.get("hardware", {}).get("requested") != expected_validation["gpu"]:
         raise ReleaseError(f"{architecture} validation used the wrong GPU")
-    if (
-        result.get("hardware", {}).get("compute_capability")
-        != expected_validation["compute_capability"]
-    ):
+    if result.get("hardware", {}).get("compute_capability") != expected_validation[
+        "compute_capability"
+    ]:
         raise ReleaseError(f"{architecture} validation used the wrong SM")
     expected_wheel = {
         key: platform["wheel"][key] for key in ("filename", "sha256", "url")
@@ -752,40 +605,27 @@ def index_validations(
 
 
 def finalize_release(
-    candidate: dict[str, Any],
+    manifest: dict[str, Any],
     validations: list[dict[str, Any]],
     *,
     config: dict[str, Any],
-    release_tag: str,
     published_at: str,
     provenance: dict[str, Any],
 ) -> dict[str, Any]:
-    validate_candidate(candidate, config)
+    validate_build(manifest, config)
     by_architecture = index_validations(validations, config)
     for result in validations:
-        validate_validation_result(result, candidate, config)
+        validate_validation_result(result, manifest, config)
 
-    manifest = copy.deepcopy(candidate)
-    candidate_tag = candidate["release"]["tag"]
-    manifest["release"] = {
-        "brand": config["brand"],
-        "repository": candidate["release"]["repository"],
-        "tag": release_tag,
-        "status": "released",
-        "published_at": published_at,
-        "candidate_tag": candidate_tag,
-        "provenance": provenance,
-    }
-    for platform in manifest["platforms"]:
-        filename = platform["wheel"]["filename"]
-        platform["wheel"]["url"] = release_asset_url(
-            manifest["release"]["repository"], release_tag, filename
-        )
-    manifest["validation"] = {
+    released = copy.deepcopy(manifest)
+    released["release"].update(
+        status="released", published_at=published_at, provenance=provenance
+    )
+    released["validation"] = {
         "status": "passed",
         "targets": [by_architecture[key] for key in sorted(by_architecture)],
     }
-    return manifest
+    return released
 
 
 def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -799,9 +639,7 @@ def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 # Build-arg values are sourced from config.json so the workflow
                 # holds no toolchain literals that can drift from the base image.
                 "cuda_version": config["cuda_toolkit_version"],
-                "constraints_file": (
-                    f"infra/release/{_constraints_filename(architecture)}"
-                ),
+                "constraints_file": f"infra/release/{_constraints_filename(architecture)}",
                 "python_version": config["python_version"],
                 "max_jobs": platform["max_jobs"],
                 "max_wheel_size_mb": platform["max_wheel_size_mb"],
@@ -885,13 +723,6 @@ def release_notes(manifest: dict[str, Any]) -> str:
             f"Machine-readable provenance: [{MANIFEST_NAME}]({manifest_url})",
         ]
     )
-    if manifest["release"]["status"] == "candidate":
-        lines.extend(
-            [
-                "",
-                "This candidate has not passed both Iris GPU validation lanes.",
-            ]
-        )
     return "\n".join(lines) + "\n"
 
 
@@ -927,20 +758,6 @@ def parse_args() -> argparse.Namespace:
     validation_matrix_parser = subparsers.add_parser("validation-matrix")
     validation_matrix_parser.add_argument("--config", type=Path, required=True)
 
-    lineage_parser = subparsers.add_parser("verify-main-lineage")
-    lineage_parser.add_argument("--repository", required=True)
-    lineage_parser.add_argument("--workflow-ref", required=True)
-    lineage_parser.add_argument("--source-commit", required=True)
-    lineage_parser.add_argument("--candidate-tag")
-
-    candidate_lineage_parser = subparsers.add_parser("verify-candidate-lineage")
-    candidate_lineage_parser.add_argument("--repository", required=True)
-    candidate_lineage_parser.add_argument("--workflow-ref", required=True)
-    candidate_lineage_parser.add_argument("--source-commit", required=True)
-    candidate_lineage_parser.add_argument("--candidate-tag", required=True)
-
-    subparsers.add_parser("select-newest-candidate")
-
     inspect_parser = subparsers.add_parser("inspect-wheel")
     inspect_parser.add_argument("--config", type=Path, required=True)
     inspect_parser.add_argument("--wheel", type=Path, required=True)
@@ -953,13 +770,13 @@ def parse_args() -> argparse.Namespace:
     inspect_parser.add_argument("--compiler-provenance", type=Path, required=True)
     inspect_parser.add_argument("--output", type=Path, required=True)
 
-    assemble_parser = subparsers.add_parser("assemble-candidate")
+    assemble_parser = subparsers.add_parser("assemble-manifest")
     assemble_parser.add_argument("--config", type=Path, required=True)
     assemble_parser.add_argument(
         "--fragment", type=Path, action="append", required=True
     )
     assemble_parser.add_argument("--repository", default=RELEASE_REPOSITORY)
-    assemble_parser.add_argument("--candidate-tag", required=True)
+    assemble_parser.add_argument("--release-tag", required=True)
     assemble_parser.add_argument("--created-at", required=True)
     assemble_parser.add_argument("--output", type=Path, required=True)
 
@@ -968,14 +785,6 @@ def parse_args() -> argparse.Namespace:
     verify_parser.add_argument("--directory", type=Path, required=True)
     verify_parser.add_argument("--config", type=Path)
 
-    candidate_parser = subparsers.add_parser("validate-candidate")
-    candidate_parser.add_argument("--manifest", type=Path, required=True)
-    candidate_parser.add_argument("--config", type=Path, required=True)
-
-    published_candidate_parser = subparsers.add_parser("verify-published-candidate")
-    published_candidate_parser.add_argument("--manifest", type=Path, required=True)
-    published_candidate_parser.add_argument("--repository", required=True)
-
     release_parser = subparsers.add_parser("verify-release")
     release_parser.add_argument("--manifest", type=Path, required=True)
     release_parser.add_argument("--directory", type=Path, required=True)
@@ -983,16 +792,15 @@ def parse_args() -> argparse.Namespace:
 
     validation_parser = subparsers.add_parser("validate-result")
     validation_parser.add_argument("--result", type=Path, required=True)
-    validation_parser.add_argument("--candidate", type=Path, required=True)
+    validation_parser.add_argument("--manifest", type=Path, required=True)
     validation_parser.add_argument("--config", type=Path, required=True)
 
     finalize_parser = subparsers.add_parser("finalize-release")
-    finalize_parser.add_argument("--candidate", type=Path, required=True)
+    finalize_parser.add_argument("--manifest", type=Path, required=True)
     finalize_parser.add_argument(
         "--validation", type=Path, action="append", required=True
     )
     finalize_parser.add_argument("--config", type=Path, required=True)
-    finalize_parser.add_argument("--release-tag", required=True)
     finalize_parser.add_argument("--published-at", required=True)
     finalize_parser.add_argument("--output", type=Path, required=True)
 
@@ -1011,7 +819,9 @@ def main() -> int:
     try:
         if args.command == "build-matrix":
             print(
-                json.dumps(build_matrix(load_json(args.config)), separators=(",", ":"))
+                json.dumps(
+                    build_matrix(load_json(args.config)), separators=(",", ":")
+                )
             )
             return 0
         if args.command == "validation-matrix":
@@ -1021,25 +831,6 @@ def main() -> int:
                     separators=(",", ":"),
                 )
             )
-            return 0
-        if args.command == "verify-main-lineage":
-            verify_main_lineage(
-                args.repository,
-                args.workflow_ref,
-                args.source_commit,
-                args.candidate_tag,
-            )
-            return 0
-        if args.command == "verify-candidate-lineage":
-            verify_candidate_lineage(
-                args.repository,
-                args.workflow_ref,
-                args.source_commit,
-                args.candidate_tag,
-            )
-            return 0
-        if args.command == "select-newest-candidate":
-            print(newest_published_candidate([json.loads(line) for line in sys.stdin]))
             return 0
         if args.command == "inspect-wheel":
             compiler = load_json(args.compiler_provenance)
@@ -1058,9 +849,7 @@ def main() -> int:
                 base_image=args.base_image,
                 base_image_digest=args.base_image_digest,
                 provenance={
-                    **provenance_from_environment(
-                        args.base_image, args.base_image_digest
-                    ),
+                    **provenance_from_environment(args.base_image, args.base_image_digest),
                     "compiler": compiler,
                     "compiler_provenance_sha256": sha256_file(args.compiler_provenance),
                 },
@@ -1068,12 +857,12 @@ def main() -> int:
             write_json(args.output, fragment)
             validate_wheel_fragment(fragment)
             return 0
-        if args.command == "assemble-candidate":
-            manifest = assemble_candidate(
+        if args.command == "assemble-manifest":
+            manifest = assemble_manifest(
                 [load_json(path) for path in args.fragment],
                 config=load_json(args.config),
                 repository=args.repository,
-                candidate_tag=args.candidate_tag,
+                release_tag=args.release_tag,
                 created_at=args.created_at,
             )
             write_json(args.output, manifest)
@@ -1081,14 +870,8 @@ def main() -> int:
         if args.command == "verify-assets":
             manifest = load_json(args.manifest)
             if args.config:
-                validate_candidate(manifest, load_json(args.config))
+                validate_build(manifest, load_json(args.config))
             verify_manifest_assets(manifest, args.directory)
-            return 0
-        if args.command == "validate-candidate":
-            validate_candidate(load_json(args.manifest), load_json(args.config))
-            return 0
-        if args.command == "verify-published-candidate":
-            verify_published_candidate(load_json(args.manifest), args.repository)
             return 0
         if args.command == "verify-release":
             verify_release_assets(
@@ -1098,16 +881,15 @@ def main() -> int:
         if args.command == "validate-result":
             validate_validation_result(
                 load_json(args.result),
-                load_json(args.candidate),
+                load_json(args.manifest),
                 load_json(args.config),
             )
             return 0
         if args.command == "finalize-release":
             manifest = finalize_release(
-                load_json(args.candidate),
+                load_json(args.manifest),
                 [load_json(path) for path in args.validation],
                 config=load_json(args.config),
-                release_tag=args.release_tag,
                 published_at=args.published_at,
                 provenance=provenance_from_environment("", ""),
             )

@@ -1,22 +1,21 @@
 # Marin vLLM releases
 
-The GPU release flow publishes `vllm` wheels under commit-addressed Marin vLLM
-GitHub release tags. It does not publish a `marin-vllm` distribution or maintain
-a moving `latest` alias.
+GPU releases publish `vllm` wheels under tags that name the source commit.
+Marin adopts a release in a separate PR after its model tests pass.
 
 ## GPU build configuration
 
-[`config.json`](config.json) is the release ABI contract. It pins CPython 3.12,
+[`config.json`](config.json) pins the build and test environment: CPython 3.12,
 Torch 2.14.1+cu132, CUDA 13.2.2, digest-pinned upstream manylinux builder
-images, deployment-specific SM targets, Iris validation hardware, and the digest-pinned
-multi-architecture validation image. Update the config and workflows in one PR
-when an ABI changes.
+images, target GPU compute capabilities, Iris test hardware, and the
+multi-architecture test image. Update the config and workflows in one PR when
+these build settings change.
 
 The x86_64 and aarch64 builds reuse the `wheel-build` target in
 [`docker/Dockerfile`](../../docker/Dockerfile). That is the same build path
-used by upstream's release pipeline. The source requirements and release config
-agree on Torch 2.14.1. A final scratch stage contains `/dist` and compiler
-provenance; BuildKit
+used by upstream's release pipeline. Release code does not edit
+`requirements/cuda.txt`, `requirements/build/cuda.txt`, or the `vllm`
+distribution metadata. A final scratch stage contains only `/dist`; BuildKit
 exports that directory directly instead of loading the build image into the
 runner's Docker image store.
 
@@ -24,33 +23,14 @@ The x86_64 wheel targets SM90 on H100, and the aarch64 wheel targets SM100 on
 GB200. Every configured validation gate must pass. Compilation uses two jobs
 with one NVCC thread each and an 800 MiB wheel limit.
 
-The candidate workflow's `qualify` mode builds both architectures and uploads
-workflow artifacts. `qualify-x86_64` and `qualify-aarch64` select one architecture.
-The `stage` mode publishes an immutable candidate from `main-next` after both
-builds pass.
-
 `gpu-constraints.txt` and `gpu-constraints-aarch64.txt` pin the Python build and
-runtime dependencies for CPython 3.12 on manylinux 2.28. Each architecture's
-release Docker build and wheel validation consume its file. Their direct inputs
-live in `gpu-constraints.in`,
-including one `torchaudio==2.11.0+cpu` constraint and the agreed GPU targets,
-Transformers 5.18.0 and Tokenizers 0.23.2. The selected stable source's CUDA test
-environment pins Transformers 5.16.1; release gates qualify the target
-environment separately.
+runtime dependencies for CPython 3.12 on manylinux 2.28. The release Docker build
+and wheel validation consume the file for their architecture. Their direct inputs live in `gpu-constraints.in`,
+including one `torchaudio==2.11.0+cpu` constraint and the Transformers and
+Tokenizers versions qualified by the selected upstream CUDA test environment.
 The generated file records the PyPI, CUDA 13.2, CPU Torch, and FlashInfer
 indexes. uv selects compatible wheels for the builder architecture from those
 indexes.
-
-The serving-only closure uses `fsspec==2026.6.0`, within Datasets 5.0.1's cap.
-The combined trainer profile separately selects Fsspec/S3fs 2026.4.0 and GCSfs
-2026.6.0. Agreement on the GPU core does not make these I/O closures identical;
-record the actual installed profile for each qualification or comparison.
-
-Pixtral carries the upstream Transformers 5.17 axial RoPE port from
-[`ec4a3a537068`](https://github.com/vllm-project/vllm/commit/ec4a3a537068db40afbc9374a67da719c8c9b964).
-Transformers 5.18 removed the rotary class and flattened position helper used by
-the selected vLLM release, breaking Llava model inspection in the scheduler
-suite. Drop this port when the selected stable release includes it.
 
 Use uv 0.11.21 and regenerate the file from the repository root with:
 
@@ -68,126 +48,25 @@ uv pip compile infra/release/gpu-constraints.in \
 
 The checked-in output seeds regeneration, so this command retains the frozen
 dependency closure. Use `--upgrade` only when intentionally requalifying that
-closure. Repeat with `--python-platform aarch64-manylinux_2_28` and
-`--output-file infra/release/gpu-constraints-aarch64.txt` for ARM. That closure
-uses the maintained cuSPARSELt 0.8.1 wheel tag repair because the vendor's ARM
-wheel declares the unsupported `manylinux2014_sbsa` tag. The repair changes
-WHEEL and RECORD metadata; its native bytes are unchanged.
-
-Rust dependency compilation, wheel packaging and platform tagging use the
-package source's Git timestamp as `SOURCE_DATE_EPOCH`. Set it before Cargo
-builds vendored C dependencies so OpenSSL build information and C date/time
-macros also use the frozen source time. The tagger forwards it into its helper
-container so the regenerated RECORD entry also has a stable timestamp.
-
-Both Rust build stages additionally include a generated C header that freezes
-`__DATE__` and `__TIME__` to that timestamp. The executable retained a changing
-clock-time string after the OpenSSL date and LLVM symbol layout stabilized;
-Mimalloc's verbose build banner uses those C macros. A local sccache 0.8.1 probe
-also emitted wall-clock C macros despite a frozen epoch in the build environment.
-The header makes expansion explicit while preserving existing C/C++ flags.
-
-Rust is pinned to 1.99.0, released before the dependency cutoff, with LLVM
-23.1.1. Independent Rust 1.95.0/LLVM 22.1.2 builds differed in sixteen SIMD
-F32 image-resize functions despite identical timestamps and symbol tables.
-A small caller reproduced those differences in three uncached builds. The
-same caller built with 1.99.0 produced three identical binaries and preserved
-all 480 resized values byte for byte. Its LLVM source includes the ordered
-loop-vectorizer address-definition iteration from the
-[upstream nondeterminism fix](https://github.com/llvm/llvm-project/pull/200833).
-Complete wheel reproduction remains the release gate.
-
-The frontend executable's release build uses
-`CARGO_PROFILE_RELEASE_LTO=off` and `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`.
-Identical-source ThinLTO builds produced different promoted LLVM symbol
-suffixes and executable layouts after their source timestamps matched. These
-settings apply to the frontend through its Cargo environment. The Python
-parser extension uses the upstream release profile. Verify complete wheel
-archives from independent builds before claiming reproducibility.
-
-CUDA compilation uses NVCC's `--objdir-as-tempdir` option. Uncached builds
-otherwise embed process-specific `tmpxft` filenames in ELF symbols, including
-FlashAttention's fetched targets. The directory-level CMake option reaches
-those targets even though they redefine the extension helper. Object paths
-remain separate for each target and source, and NVCC removes its intermediate
-files after compilation. A repeated local NVCC 13.2.86 compile with CCCL headers
-produced identical object bytes with this option when its kernel had a fixed
-external name. Template-only translation units still embedded process IDs in
-internal symbols. The CUDA compile rule also passes `--frandom-seed=<SOURCE>`
-to give each source a distinct, stable seed, including fetched targets that
-redefine the extension helper. A CMake/Ninja/sccache probe reproduced the
-unseeded differences and matched both targets across three forced cold builds
-with source seeds. Complete native wheel reproduction is still required. See
-the [temporary directory option](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-compiler-driver-nvcc/index.html#objdir-as-tempdir-objtemp)
-and [random seed option](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-compiler-driver-nvcc/index.html#frandom-seed-frandom-seed).
-
-The per-block RMS quantization kernel uses 32-bit local group and thread indices
-while retaining 64-bit global tensor offsets. Native ARM CICC 13.2.86 produced
-four PTX variants across six uncached runs with the original 64-bit local
-indices, even with identical preprocessed input and source seeds. All six
-runs with bounded 32-bit indices matched both PTX and complete CUDA objects.
-The compiler version and optimization settings remain unchanged. GPU numerical
-checks and independent complete wheel comparisons remain required. Drop this
-port when upstream carries the bounded indices or the compiler produces stable
-code for the original loops.
-
-The toolkit extras pin the compiler and headers used by
-runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the
+closure. For ARM, use `aarch64-manylinux_2_28` and write
+`gpu-constraints-aarch64.txt`. That closure selects the maintained cuSPARSELt
+wheel with its repaired ARM platform tag. The toolkit extras pin the compiler
+and headers used by runtime JIT compilation. Preserve the CPU TorchAudio version constraint: the
 available CUDA 13.0 TorchAudio wheel rejects Torch cu132, while audio
 preprocessing uses Torch's tensor operators.
 
-`cuda-compiler-inputs.json` fixes component URLs and SHA-256 values for the
-13.2.86 NVCC, CRT, NVVM, runtime, CCCL and NVRTC cohort. The Docker recipe
-overlays those owned files into its full CUDA prefix before native compilation.
-`compiler_provenance.py` verifies the compiler and assembler versions, hashes
-every installed component file, and compiles an SM90/SM100 fatbin probe. The
-candidate manifest embeds that record and hashes packaged shared libraries and
-ELF executables, including FA2, FA3 and the Rust frontend. Rust compiler inputs
-come from the source-pinned toolchain and Cargo lock; CUDA compiler provenance
-does not describe the Rust compiler.
+The build installs CUDA compiler components 13.2.86 from the immutable URLs and
+SHA-256 values in `cuda-compiler-inputs.json`. The digest-pinned builder supplies
+the remaining toolkit. The manifest records the installed compiler provenance,
+architecture-specific constraints, and packaged native payload hashes. Build
+timestamps use the source commit time; caches and vendor binaries remain part
+of the build inputs.
 
-Wheel archives use their source commit's `SOURCE_DATE_EPOCH`. This removes
-wall-clock ZIP timestamps from repeated builds. Native byte reproducibility
-still needs a repeated native build comparison; fixed compiler inputs alone do
-not prove it. Vendor cubins/libraries, Torch native kernels, CuTe compiler
-libraries and driver JIT have separate provenance. During qualification,
-FlashInfer NVCC and both Triton assembler selectors use the installed 13.2.86
-tools with fresh owned caches. Record actual attention selection and kernel
-results before treating any path as qualified.
-
-Each candidate job removes unused Android, .NET, and GHC toolchains from its
+Each build job removes unused Android, .NET, and GHC toolchains from its
 ephemeral hosted runner before compiling. The wheel-only BuildKit export also
 avoids duplicating the build toolchains and intermediate objects in the
 runner's Docker image store. Together these keep compilation and artifact
 export within the hosted runners' root filesystems.
-
-## GPU candidate publication
-
-[`marin-gpu-candidate.yaml`](../../.github/workflows/marin-gpu-candidate.yaml)
-runs on every merge to `main`. It builds x86_64 SM90 and aarch64 SM100 wheels,
-derives the manylinux tag from each wheel's ELF symbols, and publishes a
-prerelease named `marin-vllm-gpu-candidate-<12-character-sha>`.
-
-The candidate manifest records:
-
-- fork commit and upstream merge base;
-- Python, Torch, CUDA, platform, and SM targets;
-- builder image and GitHub Actions provenance;
-- wheel filename, tags, size, and SHA-256;
-- hashes of every packaged native library, including FA2 and FA3;
-- source-pinned architecture-specific dependency constraints and their SHA-256;
-- packaged `_C`, cuMem allocator, and Grug model state.
-
-Candidate tags and assets are immutable. A rerun verifies an existing
-candidate instead of replacing it.
-
-Before merge, a branch can build either architecture through the same release
-recipe without publishing a candidate. Dispatch `marin-gpu-candidate.yaml` on
-the branch with `lane=gpu` and `gpu_mode=qualify-x86_64` or
-`gpu_mode=qualify-aarch64`. Each run uploads its inspected wheel and provenance
-fragment as a 14-day workflow artifact. Record both wheel hashes before using
-them in a consumer qualification. These branch builds cannot enter the GPU
-release lane; publication still requires a source commit on `main`.
 
 Unchanged build layers use `ghcr.io/marin-community/vllm-build-cache:<architecture>`
 with Marin/Iris's registry-cache settings. Compiler steps that must execute use
@@ -199,156 +78,57 @@ Layer hits skip compiler-cache requests. Missing credentials or unavailable
 caches fall back to compilation. GCS expiry is handled separately by the cache
 retention workflow. [Design and measurements](https://echo.oa.dev/wiki/613).
 
-GPU publication runs must use the repository's default branch, which this fork
-expects to be `main`. A candidate from a prior `main` commit remains valid after
-`main` advances. To build immediately after a merge, dispatch from `main`:
+## GPU build, qualification, and publication
+
+Review and land vLLM source changes on `main` before building wheels. This
+applies to upstream refreshes and patches authored in the fork. Marin's
+[GPU guide](https://github.com/marin-community/marin/blob/main/.agents/skills/refresh-fork/docs/vllm.md#triggers-and-tests)
+defines the automatic checks, agent-run model tests, and adoption steps.
+
+[`marin-gpu-candidate.yaml`](../../.github/workflows/marin-gpu-candidate.yaml)
+builds, tests, and publishes GPU wheels in one workflow. Source changes on
+`main` start it automatically. `paths-ignore` lists excluded documentation,
+release-automation, and cache-maintenance files. A manual dispatch must also
+select `main`:
 
 ```bash
 gh workflow run marin-gpu-candidate.yaml \
-  --repo marin-community/vllm \
-  --ref main \
-  -f lane=gpu \
-  -f gpu_mode=publish
+  --repo marin-community/vllm --ref main -f lane=gpu
 ```
 
-A source refresh uses the separate `main-next` staging lane. `gpu_mode=stage`
-requires the workflow source to equal the current remote `main-next` tip and
-publishes under `marin-vllm-gpu-staged-candidate-<12-character-sha>`. Staged
-candidates never match scheduled candidate selection. The manifest binds the
-source commit and both wheel digests. Arbitrary branches cannot publish either
-candidate kind.
+The workflow selects `marin-vllm-gpu-<source-UTC-date>-<12-character-sha>` and
+skips the build if that release already exists. Both architecture builds,
+dependency constraints, validation sources, and qualification code come from
+the same workflow commit. A later change to `main` does not change a running
+build.
 
-The `qualify-x86_64` and `qualify-aarch64` modes remain useful for branch-only
-dependency checks. They build one short-lived Actions artifact and publish no
-GitHub release. They do not replace the two-wheel staged candidate used by a
-source refresh.
+The builds upload wheels and metadata to temporary GitHub Actions artifacts.
+No GPU candidate release is published. The metadata records the source SHA,
+upstream base, build settings, builder image, wheel contents, and SHA-256. Schema 2
+uses the final release tag throughout, including each qualification record's
+`release_tag` and wheel URL.
 
-## GPU validation and release
+Qualification installs the x86_64 wheel on one H100 in `cw-rno2a` and the
+aarch64 wheel on one GB200 in `cw-us-east-08a`. Both jobs check the
+`vllm._C_stable_libtorch` extension and GrugMoE model implementation, allocate
+through cuMem, and serve `Qwen/Qwen3-0.6B` against the hardware's smoke-test
+spec. The H100 job also checks sparse NCCL weight transfer and runs the fork's
+model, scheduler, and weight-transfer regression tests.
 
-[`marin-gpu-release.yaml`](../../.github/workflows/marin-gpu-release.yaml) runs
-on a schedule and through `workflow_dispatch`. The optional `candidate_tag`
-input selects an exact published candidate; an empty input selects the newest
-published candidate by GitHub's `published_at` timestamp across release-list
-pages. Drafts are ineligible. Invalid provenance, ABI, or assets fail the run;
-it does not try an older candidate.
+Each Iris job downloads its wheel from the current workflow's Actions artifact
+with a temporary read-only GitHub token. It checks the wheel's SHA-256 before
+installation. The model probe and serving process run in a temporary environment
+outside the checkout, so they import the installed wheel. The source tests use
+a separate tree from the same commit.
 
-The workflow qualifies both wheels on their configured hardware:
-
-- H100x1 on `cw-rno2a` installs the x86_64 wheel, checks `_C` and
-  `GrugMoeForCausalLM`, validates the sparse NCCL trainer and worker contract,
-  allocates through cuMem, runs the Marin delta tests, and serves
-  Qwen/Qwen3-0.6B against the H100 spec.
-- GB200x1 on `cw-us-east-08a` installs the aarch64 wheel, checks `_C` and
-  `GrugMoeForCausalLM`, allocates through cuMem, and serves Qwen/Qwen3-0.6B
-  against the GB200 spec.
-
-An absent cuMem extension is recorded as `absent` and fails promotion. Iris
-setup failures and missing validation output also become explicit failed JSON
-records.
-
-The runtime probe and serving process run with the temporary venv outside the
-checkout. The workflow extracts the candidate commit's tests and serving smoke
-into a separate validation-source tree, while the release harness comes from
-the workflow commit. Each validation runner imports and verifies `vllm` from
-the venv before adding that tree to `sys.path` for the `tests` package. It keeps
-its working directory outside the tree as well, so model-inspection
-subprocesses also import the wheel instead of an unbuilt source package.
-
-Both GPU results must pass before the workflow creates
-`marin-vllm-gpu-<UTC-date>-<12-character-sha>`. The final release contains the
-unchanged candidate wheels, their validation records, and a final manifest that
-binds every result to a wheel digest. The workflow never overwrites an existing
-release tag or asset.
-
-For a staged refresh, dispatch the release workflow from trusted `main` with
-`qualification_only=true`. It accepts only the exact current `main-next` source,
-runs the normal H100 and GB200 gates, and retains their artifacts without
-publishing a final release. After an administrator promotes that exact source to
-`main`, dispatch again with the successful qualification run ID. The promotion
-accepts only a successful release-workflow run from `main`, then checks that its
-validation records name the same candidate, source commit, and wheel digests.
-It publishes the same bytes without another GPU allocation.
-Complete promotion within the validation artifacts' 14-day retention window;
-after expiry, the exact qualification records cannot be reused.
-
-```bash
-gh workflow run marin-gpu-candidate.yaml \
-  --repo marin-community/vllm \
-  --ref main-next \
-  -f lane=gpu \
-  -f gpu_mode=stage
-
-gh workflow run marin-gpu-release.yaml \
-  --repo marin-community/vllm \
-  --ref main \
-  -f lane=gpu \
-  -f candidate_tag=marin-vllm-gpu-staged-candidate-0123456789ab \
-  -f qualification_only=true
-
-# After the lease-checked main-next -> main promotion:
-gh workflow run marin-gpu-release.yaml \
-  --repo marin-community/vllm \
-  --ref main \
-  -f lane=gpu \
-  -f candidate_tag=marin-vllm-gpu-staged-candidate-0123456789ab \
-  -f qualification_run_id=<successful-qualification-run-id>
-```
-
-Dispatch a specific candidate with:
-
-```bash
-gh workflow run marin-gpu-release.yaml \
-  --repo marin-community/vllm \
-  --ref main \
-  -f lane=gpu \
-  -f candidate_tag=marin-vllm-gpu-candidate-0123456789ab
-```
-
-Check the published tag and final assets independently. [GitHub runs](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows)
-the workflow file on the selected ref, so an older branch can still run its old
-publication logic. Enforcing this against repository writers requires a publisher
-outside branch-controlled workflow code.
+Both qualification jobs must pass before publication. The workflow publishes
+the built wheels once, alongside the manifest and qualification records. It
+checks the recorded hashes and never overwrites a release. Failed qualification
+publishes no GPU release. The temporary artifacts remain available for 14 days;
+rerun the failed jobs in that workflow to retry. There is no separate GPU
+promotion dispatch or reuse of another qualification run.
 
 ## TPU wheel pairs
-
-### Portable local builds
-
-[`Dockerfile.tpu-build`](Dockerfile.tpu-build) pins the Python 3.12.13 Debian
-Bookworm base by digest and the signed Debian compiler packages to the
-2026-10-04 snapshot. Its build context must contain the Linux x86_64 uv 0.11.21
-binary as `uv`; the Dockerfile verifies its SHA-256. With uv already installed,
-create a fresh virtual environment and install uv 0.11.21 into it using
-`uv pip install --python <venv>/bin/python uv==0.11.21`. Copy that environment's
-`bin/uv` into the build context.
-
-The shared 0.30 pair uses the full commits and whole-second UTC cutoff below.
-Run from the repository root. Docker applies a one-CPU quota and 4 GiB memory
-limit. Use a new container name for each independent build; each starts with
-an empty `/work` directory.
-
-```bash
-docker build -t marin-tpu-builder:030 -f infra/release/Dockerfile.tpu-build <build-context>
-docker run --name tpu-pair-a --cpus 1 --memory 4g \
-  --mount type=bind,source="$PWD/infra/release/build_tpu_pair.sh",target=/recipe.sh,readonly \
-  marin-tpu-builder:030 nice -n 10 bash /recipe.sh \
-  47b411d5785d1c3dee0328334472d70310c53feb \
-  66c5d8952eec0c263361915cb4613d8f30737955 \
-  2026-10-04T20:00:00Z
-docker cp tpu-pair-a:/work/pair ./pair-a
-```
-
-[`build_tpu_pair.sh`](build_tpu_pair.sh) writes `/work/pair`. It
-contains both wheels, their hashes, installed build dependencies and compiler
-input hashes. Compare complete wheel hashes across independent containers.
-
-This recipe uses the shared 0.30 sources with separate TPU dependencies. It
-builds the C++ TPU helper extensions and skips CUDA and Rust extensions.
-The image, compiler and Python dependency wheels include prebuilt vendor
-payloads. Reproducing this pair does not prove those payloads or later JIT
-outputs independently reproducible. Local build records do not replace the
-GitHub producer and qualification records required for protected promotion.
-
-### Publication and qualification
 
 The TPU lane uses the same `main` source lineage and builds a separate vLLM
 wheel with its own Torch, JAX, and libtpu environment. It never consumes or
@@ -357,16 +137,15 @@ tpu-inference commits plus a UTC dependency cutoff, builds both wheels once,
 and publishes an immutable content-addressed prerelease and manifest.
 
 `marin-gpu-release.yaml` redownloads that exact pair, verifies its hashes,
-cold-installs it from the candidate index, and runs the Qwen3-0.6B TP4 gate on
-one `v6e-4` in `europe-west4` at Iris's interactive job priority. A qualification
-dispatch with `promote=false` records the test result and detected TPU type
-without finalizing a release. Later promotion accepts
+cold-installs it from the candidate index, and runs the Qwen3-0.6B TP8 gate on
+one `v6e-8` in `us-east5`. A qualification dispatch with `promote=false` records
+the physical TPU result without finalizing a release. Later promotion accepts
 that successful qualification run's exact ID, revalidates its GitHub metadata
 and artifact against the candidate, and reuses the same candidate bytes without
 allocating another TPU.
 
 The GPU and TPU lanes are dispatched separately. Advancing tpu-inference does
-not rebuild a GPU wheel, and promoting a GPU candidate does not rebuild the TPU
+not rebuild a GPU wheel, and publishing a GPU release does not rebuild the TPU
 pair.
 
 ```bash
