@@ -7,99 +7,37 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import zipfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
-import yaml
 
 from infra.nightly.gpu_serve_smoke import server_command
 from infra.release.gpu_release import (
     GRUG_ARCHITECTURE,
     SPARSE_NCCL_GATE,
     STABLE_LIBTORCH_GATE,
-    assemble_candidate,
+    assemble_manifest,
     build_matrix,
+    download_wheel_artifact,
     extract_validation,
     finalize_release,
     inspect_wheel,
-    newest_published_candidate,
-    validate_candidate,
+    validate_build,
     validate_wheel_fragment,
     validation_matrix,
-    verify_main_lineage,
-    verify_published_candidate,
     verify_release_assets,
 )
 from infra.release.release_common import ReleaseError, load_json, sha256_file
 
 REPOSITORY_ROOT = Path(__file__).parents[3]
 CONFIG_PATH = Path(__file__).parents[1] / "config.json"
-GPU_CANDIDATE_WORKFLOW_PATH = (
-    REPOSITORY_ROOT / ".github/workflows/marin-gpu-candidate.yaml"
-)
-GPU_RELEASE_WORKFLOW_PATH = (
-    REPOSITORY_ROOT / ".github/workflows/marin-gpu-release.yaml"
-)
 FORK_COMMIT = "a" * 40
 UPSTREAM_BASE = "b" * 40
 BUILT_AT = "2026-08-03T12:00:00Z"
-CANDIDATE_TAG = f"marin-vllm-gpu-candidate-{FORK_COMMIT[:12]}"
-
-
-def test_publish_uses_current_release_automation_for_an_older_candidate():
-    workflow = yaml.safe_load(GPU_RELEASE_WORKFLOW_PATH.read_text())
-    checkout = workflow["jobs"]["publish"]["steps"][0]
-
-    assert "ref" not in checkout.get("with", {})
-
-
-def test_release_publishers_use_builtin_token_with_write_permission():
-    workflow_paths = (
-        GPU_CANDIDATE_WORKFLOW_PATH,
-        GPU_RELEASE_WORKFLOW_PATH,
-    )
-
-    for workflow_path in workflow_paths:
-        publish = yaml.safe_load(workflow_path.read_text())["jobs"]["publish"]
-        assert publish["permissions"]["contents"] == "write"
-        assert publish["env"]["GH_TOKEN"] == "${{ github.token }}"
-
-
-def test_candidate_build_ignores_release_only_changes():
-    workflow = yaml.load(
-        GPU_CANDIDATE_WORKFLOW_PATH.read_text(), Loader=yaml.BaseLoader
-    )
-    ignored_paths = set(workflow["on"]["push"]["paths-ignore"])
-
-    assert ignored_paths >= {
-        ".github/workflows/marin-ci.yaml",
-        ".github/workflows/marin-gpu-candidate.yaml",
-        ".github/workflows/marin-gpu-release.yaml",
-        "infra/release/gpu_validation.py",
-        "infra/release/validation_common.py",
-        "infra/release/tests/**",
-    }
-
-
-def test_candidate_gpu_modes_keep_single_architecture_builds_nonpublishing():
-    workflow = yaml.load(
-        GPU_CANDIDATE_WORKFLOW_PATH.read_text(), Loader=yaml.BaseLoader
-    )
-    inputs = workflow["on"]["workflow_dispatch"]["inputs"]
-    publish = workflow["jobs"]["publish"]
-    gpu_mode = inputs["gpu_mode"]
-
-    assert gpu_mode["type"] == "choice"
-    assert gpu_mode["default"] == "publish"
-    assert gpu_mode["options"] == [
-        "publish",
-        "qualify-x86_64",
-        "qualify-aarch64",
-    ]
-    assert publish["if"] == (
-        "github.event_name == 'push' || inputs.gpu_mode == 'publish'"
-    )
+RELEASE_TAG = f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}"
 
 
 def test_server_command_pins_requested_attention_backend():
@@ -204,121 +142,30 @@ def fragment(
     )
 
 
-def candidate(tmp_path: Path) -> dict:
+def built_manifest(tmp_path: Path) -> dict:
     config = load_json(CONFIG_PATH)
-    return assemble_candidate(
+    return assemble_manifest(
         [fragment(tmp_path, architecture) for architecture in config["platforms"]],
         config=config,
         repository="marin-community/vllm",
-        candidate_tag=CANDIDATE_TAG,
+        release_tag=RELEASE_TAG,
         created_at=BUILT_AT,
     )
 
 
-def test_newest_candidate_uses_publication_time_without_provenance_fallback():
-    releases = [
-        dict(
-            tag_name=f"marin-vllm-gpu-candidate-{tag}",
-            prerelease=True,
-            draft=False,
-            published_at=published_at,
-            id=index,
-        )
-        for index, (tag, published_at) in enumerate(
-            [
-                ("e09cfd55a7a9", "2026-09-20T00:47:34Z"),
-                ("744111c4f161", "2026-09-20T16:33:38Z"),
-            ]
-        )
-    ]
-    assert newest_published_candidate(releases) == releases[1]["tag_name"]
-    releases[0]["published_at"] = "2026-09-21T00:00:00Z"
-    assert newest_published_candidate(releases) == releases[0]["tag_name"]
-
-
-def test_published_candidate_rejects_changed_assets_and_target(monkeypatch):
-    manifest = {
-        "release": {"tag": CANDIDATE_TAG},
-        "source": {"fork_commit": FORK_COMMIT},
-        "platforms": [{"wheel": {"filename": "wheel.whl", "sha256": "a" * 64}}],
-    }
-    release = {
-        "tag_name": CANDIDATE_TAG,
-        "target_commitish": FORK_COMMIT,
-        "draft": False,
-        "prerelease": True,
-        "assets": [
-            {"name": "marin-vllm-gpu-manifest.json", "state": "uploaded"},
-            {"name": "wheel.whl", "state": "uploaded", "digest": "sha256:" + "a" * 64},
-        ],
-    }
-
-    monkeypatch.setattr(
-        "infra.release.gpu_release.subprocess.run",
-        lambda args, **kwargs: subprocess.CompletedProcess(
-            args, 0, stdout=json.dumps(release), stderr=""
-        ),
-    )
-
-    verify_published_candidate(manifest, "marin-community/vllm")
-    digest = release["assets"][1]["digest"]
-    release["assets"][1]["digest"] = "sha256:" + "0" * 64
-    with pytest.raises(ReleaseError, match="assets disagree with manifest"):
-        verify_published_candidate(manifest, "marin-community/vllm")
-    release["assets"][1]["digest"] = digest
-    release["target_commitish"] = "b" * 40
-    with pytest.raises(ReleaseError, match="release identity changed"):
-        verify_published_candidate(manifest, "marin-community/vllm")
-
-
-@pytest.mark.parametrize(
-    ("branch", "workflow_ref", "source", "status", "failure"),
-    [
-        ("main", "refs/heads/main", FORK_COMMIT, "identical", None),
-        ("main", "refs/heads/main", FORK_COMMIT, "ahead", None),
-        ("main", "refs/heads/feature", FORK_COMMIT, "ahead", "workflow must run"),
-        ("main", "refs/heads/main", FORK_COMMIT, "diverged", "not an ancestor"),
-        ("develop", "refs/heads/develop", FORK_COMMIT, "ahead", "maintained main"),
-    ],
-)
-def test_gpu_lineage_policy(
-    monkeypatch, branch, workflow_ref, source, status, failure
-):
-    def gh_api(args, **kwargs):
-        body = (
-            {"default_branch": branch}
-            if args[2] == "repos/marin-community/vllm"
-            else {"status": status}
-        )
-        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(body), stderr="")
-
-    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
-    if failure is None:
-        assert verify_main_lineage("marin-community/vllm", workflow_ref, source) is None
-    else:
-        with pytest.raises(ReleaseError, match=failure) as exc:
-            verify_main_lineage(
-                "marin-community/vllm", workflow_ref, source, CANDIDATE_TAG
-            )
-        assert all(
-            value in str(exc.value)
-            for value in (workflow_ref, branch, source, CANDIDATE_TAG)
-        )
-
-
-def test_candidate_rejects_abi_change(tmp_path):
-    manifest = candidate(tmp_path)
+def test_build_rejects_abi_change(tmp_path):
+    manifest = built_manifest(tmp_path)
     manifest["abi"]["torch_version"] = "0.0.0"
 
     with pytest.raises(ReleaseError, match="release ABI changed"):
-        validate_candidate(manifest, load_json(CONFIG_PATH))
+        validate_build(manifest, load_json(CONFIG_PATH))
 
 
-def validation(candidate_manifest: dict, architecture: str) -> dict:
+def validation(build_manifest: dict, architecture: str) -> dict:
     config = load_json(CONFIG_PATH)
     platform = next(
         item
-        for item in candidate_manifest["platforms"]
+        for item in build_manifest["platforms"]
         if item["architecture"] == architecture
     )
     validation_config = config["platforms"][architecture]["validation"]
@@ -326,9 +173,9 @@ def validation(candidate_manifest: dict, architecture: str) -> dict:
         "passed" if validation_config["run_source_tests"] else "not_run"
     )
     return {
-        "schema_version": 1,
-        "candidate_tag": candidate_manifest["release"]["tag"],
-        "source_commit": candidate_manifest["source"]["fork_commit"],
+        "schema_version": config["schema_version"],
+        "release_tag": build_manifest["release"]["tag"],
+        "source_commit": build_manifest["source"]["fork_commit"],
         "architecture": architecture,
         "wheel": {
             "filename": platform["wheel"]["filename"],
@@ -461,7 +308,7 @@ def test_inspect_wheel_rejects_filename_metadata_tag_mismatch(tmp_path):
         fragment(tmp_path, "x86_64", metadata_platform_tag="linux_x86_64")
 
 
-def test_missing_cumem_allocator_is_explicit_and_blocks_candidate(tmp_path):
+def test_missing_cumem_allocator_is_explicit_and_blocks_release(tmp_path):
     record = fragment(tmp_path, "x86_64", include_cumem=False)
 
     assert record["platform"]["packaged"]["vllm.cumem_allocator"] == "absent"
@@ -469,7 +316,7 @@ def test_missing_cumem_allocator_is_explicit_and_blocks_candidate(tmp_path):
         validate_wheel_fragment(record)
 
 
-def test_candidate_rejects_cross_arch_source_mismatch(tmp_path):
+def test_build_rejects_cross_arch_source_mismatch(tmp_path):
     config = load_json(CONFIG_PATH)
     config["platforms"]["aarch64"] = copy.deepcopy(config["platforms"]["x86_64"])
     x86 = fragment(tmp_path, "x86_64")
@@ -477,11 +324,11 @@ def test_candidate_rejects_cross_arch_source_mismatch(tmp_path):
     arm["source"]["upstream_base"] = "c" * 40
 
     with pytest.raises(ReleaseError, match="disagrees on source"):
-        assemble_candidate(
+        assemble_manifest(
             [x86, arm],
             config=config,
             repository="marin-community/vllm",
-            candidate_tag=CANDIDATE_TAG,
+            release_tag=RELEASE_TAG,
             created_at=BUILT_AT,
         )
 
@@ -525,81 +372,126 @@ def test_build_matrix_targets_only_the_validated_gpu():
 
 def release_fixture(tmp_path: Path) -> tuple[dict, dict, list[dict], dict]:
     config = load_json(CONFIG_PATH)
-    candidate_manifest = candidate(tmp_path)
+    build_manifest = built_manifest(tmp_path)
     validations = [
-        validation(candidate_manifest, architecture)
+        validation(build_manifest, architecture)
         for architecture in config["platforms"]
     ]
     manifest = finalize_release(
-        candidate_manifest,
+        build_manifest,
         validations,
         config=config,
-        release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
         published_at="2026-08-04T00:00:00Z",
         provenance={"run_id": "456"},
     )
-    return config, candidate_manifest, validations, manifest
+    return config, build_manifest, validations, manifest
 
 
-def test_release_binds_passed_gpu_results_to_candidate_wheel_digests(tmp_path):
+def test_release_binds_passed_gpu_results_to_built_wheel_digests(tmp_path):
     config, _, _, manifest = release_fixture(tmp_path)
 
     assert manifest["release"]["status"] == "released"
-    assert manifest["release"]["candidate_tag"] == CANDIDATE_TAG
+    assert manifest["release"]["tag"] == RELEASE_TAG
     assert manifest["validation"]["status"] == "passed"
     assert {item["architecture"] for item in manifest["validation"]["targets"]} == {
         *config["platforms"],
     }
     for platform in manifest["platforms"]:
         assert f"/{manifest['release']['tag']}/" in platform["wheel"]["url"]
+        result = next(
+            item for item in manifest["validation"]["targets"]
+            if item["architecture"] == platform["architecture"]
+        )
+        assert result["wheel"] == {
+            key: platform["wheel"][key] for key in ("filename", "sha256", "url")
+        }
+
+
+def test_wheel_artifact_download_follows_redirect_and_extracts_exact_wheel(
+    tmp_path
+):
+    wheel = tmp_path / "wheel.whl"
+    artifact = tmp_path / "artifact.zip"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr(wheel.name, b"built wheel bytes")
+        archive.writestr("fragment.json", b"build metadata")
+    authorization = []
+
+    class ArtifactServer(BaseHTTPRequestHandler):
+        def do_GET(self):
+            authorization.append(self.headers.get("Authorization"))
+            if self.path == "/api/artifact":
+                self.send_response(302)
+                self.send_header("Location", "/storage/artifact.zip")
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(artifact.read_bytes())
+
+        def log_message(self, *args):
+            pass
+
+    with HTTPServer(("127.0.0.1", 0), ArtifactServer) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            download_wheel_artifact(
+                f"http://127.0.0.1:{server.server_port}/api/artifact", wheel,
+                token="test-read-only-token",
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    assert wheel.read_bytes() == b"built wheel bytes"
+    assert authorization == ["Bearer test-read-only-token", None]
+    assert not (tmp_path / "fragment.json").exists()
 
 
 def test_release_rejects_allocator_absence_from_gpu_result(tmp_path):
-    config, candidate_manifest, validations, _ = release_fixture(tmp_path)
+    config, build_manifest, validations, _ = release_fixture(tmp_path)
     broken = copy.deepcopy(validations[0])
     broken["gates"]["cumem_allocator"] = {"status": "absent"}
     validations[0] = broken
 
     with pytest.raises(ReleaseError, match="cumem_allocator.*absent"):
         finalize_release(
-            candidate_manifest,
+            build_manifest,
             validations,
             config=config,
-            release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
             published_at="2026-08-04T00:00:00Z",
             provenance={"run_id": "456"},
         )
 
 
 def test_release_rejects_missing_sparse_nccl_contract(tmp_path):
-    config, candidate_manifest, validations, _ = release_fixture(tmp_path)
+    config, build_manifest, validations, _ = release_fixture(tmp_path)
     broken = copy.deepcopy(validations[0])
     broken["gates"][SPARSE_NCCL_GATE] = {"status": "failed"}
     validations[0] = broken
 
     with pytest.raises(ReleaseError, match="sparse_nccl_contract.*failed"):
         finalize_release(
-            candidate_manifest,
+            build_manifest,
             validations,
             config=config,
-            release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
             published_at="2026-08-04T00:00:00Z",
             provenance={"run_id": "456"},
         )
 
 
 def test_release_rejects_wrong_serving_attention_backend(tmp_path):
-    config, candidate_manifest, validations, _ = release_fixture(tmp_path)
+    config, build_manifest, validations, _ = release_fixture(tmp_path)
     broken = copy.deepcopy(validations[0])
     broken["environment"]["attention_backend"] = "FLASHINFER"
     validations[0] = broken
 
     with pytest.raises(ReleaseError, match="attention_backend='FLASHINFER'"):
         finalize_release(
-            candidate_manifest,
+            build_manifest,
             validations,
             config=config,
-            release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
             published_at="2026-08-04T00:00:00Z",
             provenance={"run_id": "456"},
         )
