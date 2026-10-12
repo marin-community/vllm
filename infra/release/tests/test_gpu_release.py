@@ -3,6 +3,7 @@
 
 import base64
 import copy
+import hashlib
 import json
 import os
 import subprocess
@@ -18,6 +19,7 @@ from infra.release.gpu_release import (
     GRUG_ARCHITECTURE,
     SPARSE_NCCL_GATE,
     STABLE_LIBTORCH_GATE,
+    STAGED_CANDIDATE_TAG_PREFIX,
     assemble_candidate,
     build_matrix,
     extract_validation,
@@ -25,8 +27,10 @@ from infra.release.gpu_release import (
     inspect_wheel,
     newest_published_candidate,
     validate_candidate,
+    validate_release,
     validate_wheel_fragment,
     validation_matrix,
+    verify_candidate_lineage,
     verify_main_lineage,
     verify_published_candidate,
     verify_release_assets,
@@ -38,13 +42,12 @@ CONFIG_PATH = Path(__file__).parents[1] / "config.json"
 GPU_CANDIDATE_WORKFLOW_PATH = (
     REPOSITORY_ROOT / ".github/workflows/marin-gpu-candidate.yaml"
 )
-GPU_RELEASE_WORKFLOW_PATH = (
-    REPOSITORY_ROOT / ".github/workflows/marin-gpu-release.yaml"
-)
+GPU_RELEASE_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/marin-gpu-release.yaml"
 FORK_COMMIT = "a" * 40
 UPSTREAM_BASE = "b" * 40
 BUILT_AT = "2026-08-03T12:00:00Z"
 CANDIDATE_TAG = f"marin-vllm-gpu-candidate-{FORK_COMMIT[:12]}"
+STAGED_CANDIDATE_TAG = f"{STAGED_CANDIDATE_TAG_PREFIX}{FORK_COMMIT[:12]}"
 
 
 def test_publish_uses_current_release_automation_for_an_older_candidate():
@@ -82,7 +85,7 @@ def test_candidate_build_ignores_release_only_changes():
     }
 
 
-def test_candidate_gpu_modes_keep_single_architecture_builds_nonpublishing():
+def test_candidate_gpu_modes_keep_qualifying_builds_nonpublishing():
     workflow = yaml.load(
         GPU_CANDIDATE_WORKFLOW_PATH.read_text(), Loader=yaml.BaseLoader
     )
@@ -94,12 +97,16 @@ def test_candidate_gpu_modes_keep_single_architecture_builds_nonpublishing():
     assert gpu_mode["default"] == "publish"
     assert gpu_mode["options"] == [
         "publish",
+        "stage",
+        "qualify",
         "qualify-x86_64",
         "qualify-aarch64",
     ]
-    assert publish["if"] == (
-        "github.event_name == 'push' || inputs.gpu_mode == 'publish'"
-    )
+    publish_condition = " ".join(publish["if"].split())
+    assert "inputs.gpu_mode == 'stage'" in publish_condition
+    assert "inputs.gpu_mode == 'qualify'" not in publish_condition
+    assert "inputs.gpu_mode == 'qualify-x86_64'" not in publish_condition
+    assert "inputs.gpu_mode == 'qualify-aarch64'" not in publish_condition
 
 
 def test_server_command_pins_requested_attention_backend():
@@ -138,7 +145,7 @@ def write_wheel(
         "Name: vllm\n"
         f"Version: {version}\n"
         "Requires-Python: >=3.10,<3.15\n"
-        "Requires-Dist: torch==2.13.0\n"
+        "Requires-Dist: torch==2.14.1\n"
         "Requires-Dist: transformers>=4.56.0\n"
         "\n"
     )
@@ -153,10 +160,9 @@ def write_wheel(
         archive.writestr(f"{dist_info}/METADATA", metadata)
         archive.writestr(f"{dist_info}/WHEEL", wheel_metadata)
         archive.writestr("vllm/_C_stable_libtorch.cpython-312-test.so", b"compiled")
+        archive.writestr("vllm/vllm-rs", b"\x7fELFrust-frontend")
         if include_cumem:
-            archive.writestr(
-                "vllm/cumem_allocator.cpython-312-test.so", b"compiled"
-            )
+            archive.writestr("vllm/cumem_allocator.cpython-312-test.so", b"compiled")
         archive.writestr(
             "vllm/model_executor/models/grugmoe.py",
             b"class GrugMoeForCausalLM:\n    pass\n",
@@ -215,6 +221,17 @@ def candidate(tmp_path: Path) -> dict:
     )
 
 
+def staged_candidate(tmp_path: Path) -> dict:
+    config = load_json(CONFIG_PATH)
+    return assemble_candidate(
+        [fragment(tmp_path, architecture) for architecture in config["platforms"]],
+        config=config,
+        repository="marin-community/vllm",
+        candidate_tag=STAGED_CANDIDATE_TAG,
+        created_at=BUILT_AT,
+    )
+
+
 def test_newest_candidate_uses_publication_time_without_provenance_fallback():
     releases = [
         dict(
@@ -231,6 +248,15 @@ def test_newest_candidate_uses_publication_time_without_provenance_fallback():
             ]
         )
     ]
+    releases.append(
+        dict(
+            tag_name=STAGED_CANDIDATE_TAG,
+            prerelease=True,
+            draft=False,
+            published_at="2026-09-22T00:00:00Z",
+            id=3,
+        )
+    )
     assert newest_published_candidate(releases) == releases[1]["tag_name"]
     releases[0]["published_at"] = "2026-09-21T00:00:00Z"
     assert newest_published_candidate(releases) == releases[0]["tag_name"]
@@ -281,9 +307,7 @@ def test_published_candidate_rejects_changed_assets_and_target(monkeypatch):
         ("develop", "refs/heads/develop", FORK_COMMIT, "ahead", "maintained main"),
     ],
 )
-def test_gpu_lineage_policy(
-    monkeypatch, branch, workflow_ref, source, status, failure
-):
+def test_gpu_lineage_policy(monkeypatch, branch, workflow_ref, source, status, failure):
     def gh_api(args, **kwargs):
         body = (
             {"default_branch": branch}
@@ -306,6 +330,68 @@ def test_gpu_lineage_policy(
         )
 
 
+def test_staged_candidate_lifecycle_fails_if_the_source_moves(monkeypatch, tmp_path):
+    state = {"main_status": "diverged", "staging_tip": FORK_COMMIT}
+
+    def gh_api(args, **kwargs):
+        path = args[2]
+        if path == "repos/marin-community/vllm":
+            body = {"default_branch": "main"}
+        elif path.endswith("/git/ref/heads/main-next"):
+            body = {"object": {"sha": state["staging_tip"]}}
+        else:
+            body = {"status": state["main_status"]}
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(body), stderr="")
+
+    monkeypatch.setattr("infra.release.gpu_release.subprocess.run", gh_api)
+    staged = staged_candidate(tmp_path)
+    validate_candidate(staged, load_json(CONFIG_PATH))
+    verify_candidate_lineage(
+        "marin-community/vllm",
+        "refs/heads/main-next",
+        FORK_COMMIT,
+        STAGED_CANDIDATE_TAG,
+    )
+    with pytest.raises(ReleaseError, match="requires a staged tag"):
+        verify_candidate_lineage(
+            "marin-community/vllm", "refs/heads/main-next", FORK_COMMIT, CANDIDATE_TAG
+        )
+    verify_candidate_lineage(
+        "marin-community/vllm", "refs/heads/main", FORK_COMMIT, STAGED_CANDIDATE_TAG
+    )
+
+    state["staging_tip"] = "c" * 40
+    with pytest.raises(
+        ReleaseError, match="neither on main nor the exact main-next tip"
+    ):
+        verify_candidate_lineage(
+            "marin-community/vllm", "refs/heads/main", FORK_COMMIT, STAGED_CANDIDATE_TAG
+        )
+    with pytest.raises(ReleaseError, match="unsupported ref"):
+        verify_candidate_lineage(
+            "marin-community/vllm",
+            "refs/heads/feature",
+            FORK_COMMIT,
+            STAGED_CANDIDATE_TAG,
+        )
+
+    state["main_status"] = "ahead"
+    verify_main_lineage("marin-community/vllm", "refs/heads/main", FORK_COMMIT)
+    config = load_json(CONFIG_PATH)
+    validations = [
+        validation(staged, architecture) for architecture in config["platforms"]
+    ]
+    release = finalize_release(
+        staged,
+        validations,
+        config=config,
+        release_tag=f"marin-vllm-gpu-20260803-{FORK_COMMIT[:12]}",
+        published_at="2026-08-04T00:00:00Z",
+        provenance={"run_id": "789"},
+    )
+    validate_release(release, config)
+
+
 def test_candidate_rejects_abi_change(tmp_path):
     manifest = candidate(tmp_path)
     manifest["abi"]["torch_version"] = "0.0.0"
@@ -322,9 +408,7 @@ def validation(candidate_manifest: dict, architecture: str) -> dict:
         if item["architecture"] == architecture
     )
     validation_config = config["platforms"][architecture]["validation"]
-    source_status = (
-        "passed" if validation_config["run_source_tests"] else "not_run"
-    )
+    source_status = "passed" if validation_config["run_source_tests"] else "not_run"
     return {
         "schema_version": 1,
         "candidate_tag": candidate_manifest["release"]["tag"],
@@ -390,16 +474,12 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
         "name": "vllm",
         "version": "0.0.0.dev20260803+marin.test.cu130",
         "requires_python": ">=3.10,<3.15",
-        "torch_metadata_requirement": "torch==2.13.0",
+        "torch_metadata_requirement": "torch==2.14.1",
     }
     assert record["source"]["fork_commit"] == FORK_COMMIT
     assert record["source"]["upstream_base"] == UPSTREAM_BASE
-    assert record["platform"]["wheel_tags"] == [
-        "cp38-abi3-manylinux_2_28_x86_64"
-    ]
-    assert record["platform"]["filename_tag"] == (
-        "cp38-abi3-manylinux_2_28_x86_64"
-    )
+    assert record["platform"]["wheel_tags"] == ["cp38-abi3-manylinux_2_28_x86_64"]
+    assert record["platform"]["filename_tag"] == ("cp38-abi3-manylinux_2_28_x86_64")
     assert record["platform"]["packaged"] == {
         STABLE_LIBTORCH_GATE: "included",
         "vllm.cumem_allocator": "included",
@@ -408,6 +488,63 @@ def test_inspect_wheel_records_release_identity_and_packaged_extensions(tmp_path
     wheel_path = tmp_path / wheel["filename"]
     assert wheel["sha256"] == sha256_file(wheel_path)
     assert wheel["size_bytes"] == wheel_path.stat().st_size
+    native = {
+        item["path"]: item for item in record["platform"]["native_artifacts"]
+    }
+    assert set(native) == {
+        "vllm/_C_stable_libtorch.cpython-312-test.so",
+        "vllm/cumem_allocator.cpython-312-test.so",
+        "vllm/vllm-rs",
+    }
+    executable = b"\x7fELFrust-frontend"
+    assert native["vllm/vllm-rs"]["sha256"] == hashlib.sha256(executable).hexdigest()
+    assert native["vllm/vllm-rs"]["size_bytes"] == len(executable)
+
+
+@pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
+def test_inspection_emits_downloadable_source_constraints(tmp_path, architecture):
+    record = fragment(tmp_path, architecture)
+    filename = (
+        "gpu-constraints-aarch64.txt"
+        if architecture == "aarch64"
+        else "gpu-constraints.txt"
+    )
+
+    assert record["platform"]["constraints"] == {
+        "url": (
+            "https://raw.githubusercontent.com/marin-community/vllm/"
+            f"{FORK_COMMIT}/infra/release/{filename}"
+        ),
+        "sha256": sha256_file(CONFIG_PATH.with_name(filename)),
+    }
+
+
+@pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
+def test_candidate_rejects_embedded_repository_url(tmp_path, architecture):
+    manifest = candidate(tmp_path)
+    record = next(
+        item for item in manifest["platforms"] if item["architecture"] == architecture
+    )
+    record["constraints"]["url"] = record["constraints"]["url"].replace(
+        "raw.githubusercontent.com/", "raw.githubusercontent.com/https://github.com/"
+    )
+
+    with pytest.raises(ReleaseError, match="constraints are not source-pinned"):
+        validate_candidate(manifest, load_json(CONFIG_PATH))
+
+
+@pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
+def test_candidate_rejects_constraints_from_another_source(tmp_path, architecture):
+    manifest = candidate(tmp_path)
+    record = next(
+        item for item in manifest["platforms"] if item["architecture"] == architecture
+    )
+    record["constraints"]["url"] = record["constraints"]["url"].replace(
+        FORK_COMMIT, "c" * 40
+    )
+
+    with pytest.raises(ReleaseError, match="constraints are not source-pinned"):
+        validate_candidate(manifest, load_json(CONFIG_PATH))
 
 
 def test_inspect_wheel_cli_runs_without_site_packages(tmp_path):
@@ -419,6 +556,15 @@ def test_inspect_wheel_cli_runs_without_site_packages(tmp_path):
         f"manylinux_2_28_{architecture}.whl"
     )
     output = tmp_path / "fragment.json"
+    compiler_record = tmp_path / "compiler.json"
+    compiler_record.write_text(
+        json.dumps(
+            {
+                "compiler_version": config["cuda_compiler_version"],
+                "architecture": architecture,
+            }
+        )
+    )
     write_wheel(wheel, architecture=architecture)
 
     completed = subprocess.run(
@@ -444,6 +590,8 @@ def test_inspect_wheel_cli_runs_without_site_packages(tmp_path):
             platform["build_base_image"],
             "--base-image-digest",
             platform["build_base_image"],
+            "--compiler-provenance",
+            str(compiler_record),
             "--output",
             str(output),
         ],

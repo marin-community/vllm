@@ -18,6 +18,10 @@ on:
       - "infra/nightly/specs/qwen3-0.6b-tpu.json"
       - "infra/release/README.md"
       - "infra/release/gpu_validation.py"
+      - "infra/release/config.json"
+      - "infra/release/gpu_release.py"
+      - "infra/release/gpu-constraints.txt"
+      - "infra/release/gpu-constraints-aarch64.txt"
       - "infra/release/tpu_config.json"
       - "infra/release/tpu_release.py"
       - "infra/release/tpu_validation.py"
@@ -40,22 +44,24 @@ on:
         type: choice
         options:
           - publish
+          - stage
+          - qualify
           - qualify-x86_64
           - qualify-aarch64
       vllm_commit:
         description: "Exact vLLM package source for the TPU lane"
         required: true
-        default: 4c1c798a7b6072aab4f435b0fe0eb9e3ae9e5e19
+        default: 39e62869693c46402b1a95fde4fc55ca1aab9ae1
         type: string
       tpu_inference_commit:
         description: "Exact tpu-inference package source for the TPU lane"
         required: true
-        default: 29548fbab663b7ea946546ca7efaa473dab55ba5
+        default: 66c5d8952eec0c263361915cb4613d8f30737955
         type: string
       exclude_newer:
         description: "UTC dependency cutoff for the TPU pair"
         required: true
-        default: "2026-09-13T03:00:00Z"
+        default: "2026-10-04T20:00:00Z"
         type: string
 
 concurrency:
@@ -92,23 +98,13 @@ jobs:
       - name: Create the metadata environment
         run: uv venv --python 3.12
 
-      # Branch qualifications produce short-lived build artifacts only. The
-      # publish job still verifies main lineage before creating a release.
-      - name: Require a main-line GPU source for publication
-        if: github.event_name == 'push' || inputs.gpu_mode == 'publish'
-        run: |
-          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
-            --repository "$GITHUB_REPOSITORY" \
-            --workflow-ref "$GITHUB_REF" \
-            --source-commit "$GITHUB_SHA"
-
       - name: Read the release platforms
         id: matrix
         env:
           GPU_MODE: ${{ inputs.gpu_mode || 'publish' }}
         run: |
           MATRIX=$(.venv/bin/python infra/release/gpu_release.py build-matrix --config "$RELEASE_CONFIG")
-          if [[ "$GPU_MODE" != publish ]]; then
+          if [[ "$GPU_MODE" == qualify-* ]]; then
             ARCHITECTURE=${GPU_MODE#qualify-}
             MATRIX=$(jq -c --arg architecture "$ARCHITECTURE" \
               '{include: [.include[] | select(.architecture == $architecture)]}' \
@@ -122,13 +118,35 @@ jobs:
 
       - name: Resolve the immutable candidate identity
         id: source
+        env:
+          GPU_MODE: ${{ inputs.gpu_mode || 'publish' }}
         run: |
+          if [[ "$GPU_MODE" == stage && "$GITHUB_REF" != refs/heads/main-next ]]; then
+            echo "GPU staging must run from refs/heads/main-next." >&2
+            exit 1
+          fi
           SHORT_SHA=$(git rev-parse --short=12 "$GITHUB_SHA")
           CREATED_AT=$(git show -s --format=%cI "$GITHUB_SHA")
+          CANDIDATE_PREFIX=marin-vllm-gpu-candidate
+          if [[ "$GPU_MODE" == stage ]]; then
+            CANDIDATE_PREFIX=marin-vllm-gpu-staged-candidate
+          fi
           {
-            echo "candidate_tag=marin-vllm-gpu-candidate-${SHORT_SHA}"
+            echo "candidate_tag=${CANDIDATE_PREFIX}-${SHORT_SHA}"
             echo "created_at=${CREATED_AT}"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Require an approved GPU source lane for publication
+        if: >-
+          github.event_name == 'push' ||
+          inputs.gpu_mode == 'publish' ||
+          inputs.gpu_mode == 'stage'
+        run: |
+          .venv/bin/python infra/release/gpu_release.py verify-candidate-lineage \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$GITHUB_REF" \
+            --source-commit "$GITHUB_SHA" \
+            --candidate-tag "${{ steps.source.outputs.candidate_tag }}"
 
   build:
     name: Build ${{ matrix.architecture }} wheel
@@ -189,8 +207,14 @@ jobs:
         run: |
           git remote add upstream https://github.com/vllm-project/vllm.git 2>/dev/null || \
             git remote set-url upstream https://github.com/vllm-project/vllm.git
-          git fetch --quiet --no-tags upstream main
-          UPSTREAM_BASE=$(git merge-base upstream/main "$GITHUB_SHA")
+          UPSTREAM_RELEASE=$(jq -r '.upstream_release' "$RELEASE_CONFIG")
+          UPSTREAM_BASE=$(jq -r '.upstream_base' "$RELEASE_CONFIG")
+          git fetch --quiet --no-tags upstream "refs/tags/$UPSTREAM_RELEASE"
+          if [[ $(git rev-parse 'FETCH_HEAD^{commit}') != "$UPSTREAM_BASE" ]]; then
+            echo "Selected upstream release no longer matches its frozen commit." >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor "$UPSTREAM_BASE" "$GITHUB_SHA"
 
           VERSION_DATE=$(date -u -d "${{ needs.prepare.outputs.created_at }}" +%Y%m%d)
           VERSION_TAG="v0.0.0.dev${VERSION_DATE}+marin.$(git rev-parse --short=12 "$GITHUB_SHA")"
@@ -210,6 +234,7 @@ jobs:
             echo "upstream_base=${UPSTREAM_BASE}"
             echo "base_image_digest=${{ matrix.build_base_image }}"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "source_date_epoch=$(git show -s --format=%ct HEAD)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Authenticate the shared compiler cache
@@ -236,6 +261,9 @@ jobs:
             --build-arg BUILD_OS=manylinux \
             --build-arg BUILD_BASE_IMAGE="${{ matrix.build_base_image }}" \
             --build-arg UV_CONSTRAINT=/opt/marin-gpu-constraints.txt \
+            --build-arg MARIN_GPU_CONSTRAINT_FILE="${{ matrix.constraints_file }}" \
+            --build-arg MARIN_FIXED_CUDA_COMPILER=true \
+            --build-arg MARIN_SOURCE_DATE_EPOCH="${{ steps.provenance.outputs.source_date_epoch }}" \
             --build-arg CUDA_VERSION="${{ matrix.cuda_version }}" \
             --build-arg PYTHON_VERSION="${{ matrix.python_version }}" \
             --build-arg torch_cuda_arch_list="${{ matrix.sm_targets }}" \
@@ -257,6 +285,7 @@ jobs:
 
       - name: Tag the wheel
         run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           source .buildkite/scripts/lib/manylinux.sh
           WHEELS=(artifacts/dist/*.whl)
           if [[ ${#WHEELS[@]} -ne 1 ]]; then
@@ -277,6 +306,7 @@ jobs:
             --built-at "${{ steps.provenance.outputs.built_at }}" \
             --base-image "${{ matrix.build_base_image }}" \
             --base-image-digest "${{ steps.provenance.outputs.base_image_digest }}" \
+            --compiler-provenance artifacts/compiler-provenance.json \
             --output "artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json"
           mv "${WHEELS[0]}" artifacts/
 
@@ -286,13 +316,17 @@ jobs:
           path: |
             artifacts/*.whl
             artifacts/marin-vllm-${{ matrix.architecture }}-fragment.json
+            artifacts/compiler-provenance.json
           if-no-files-found: error
           retention-days: 14
 
   publish:
     name: Publish immutable candidate
     needs: [prepare, build]
-    if: github.event_name == 'push' || inputs.gpu_mode == 'publish'
+    if: >-
+      github.event_name == 'push' ||
+      inputs.gpu_mode == 'publish' ||
+      inputs.gpu_mode == 'stage'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -350,6 +384,9 @@ jobs:
               --manifest existing/marin-vllm-gpu-manifest.json \
               --directory existing \
               --config "$RELEASE_CONFIG"
+            .venv/bin/python infra/release/gpu_release.py verify-published-candidate \
+              --manifest existing/marin-vllm-gpu-manifest.json \
+              --repository "$GITHUB_REPOSITORY"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
@@ -362,7 +399,7 @@ jobs:
             echo "Candidate source $SOURCE_COMMIT does not match workflow commit $GITHUB_SHA" >&2
             exit 1
           fi
-          .venv/bin/python infra/release/gpu_release.py verify-main-lineage \
+          .venv/bin/python infra/release/gpu_release.py verify-candidate-lineage \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-ref "$GITHUB_REF" \
             --source-commit "$SOURCE_COMMIT" \
@@ -442,52 +479,25 @@ jobs:
             echo "tpu_version=${TPU_VERSION}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Checkout exact vLLM source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.pair.outputs.vllm_repository }}
-          ref: ${{ steps.pair.outputs.vllm_commit }}
-          fetch-depth: 0
-          path: sources/vllm
-          persist-credentials: false
-
-      - name: Checkout exact tpu-inference source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.pair.outputs.tpu_repository }}
-          ref: ${{ steps.pair.outputs.tpu_commit }}
-          fetch-depth: 0
-          path: sources/tpu-inference
-          persist-credentials: false
-
-      - name: Build both Python 3.12 wheels
+      - name: Build both wheels with the portable TPU recipe
         run: |
-          [[ "$(git -C sources/vllm rev-parse HEAD)" == "${{ steps.pair.outputs.vllm_commit }}" ]]
-          [[ "$(git -C sources/tpu-inference rev-parse HEAD)" == "${{ steps.pair.outputs.tpu_commit }}" ]]
-          mkdir candidate
-          (
-            cd sources/vllm
-            uv venv --python "${{ steps.pair.outputs.python_version }}" .tpu-wheel-build
-            uv pip install \
-              --python .tpu-wheel-build/bin/python \
-              --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-              --index-strategy unsafe-best-match \
-              --requirements requirements/build/tpu.txt
-            VLLM_TARGET_DEVICE="${{ steps.pair.outputs.target_device }}" \
-              VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.vllm_version }}" \
-              uv build --wheel \
-                --no-build-isolation \
-                --python .tpu-wheel-build/bin/python \
-                --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-                --out-dir "$GITHUB_WORKSPACE/candidate"
-          )
-          (
-            cd sources/tpu-inference
-            VLLM_VERSION_OVERRIDE="${{ steps.pair.outputs.tpu_version }}" uv build --wheel \
-              --python "${{ steps.pair.outputs.python_version }}" \
-              --exclude-newer "${{ steps.pair.outputs.exclude_newer }}" \
-              --out-dir "$GITHUB_WORKSPACE/candidate"
-          )
+          mkdir tpu-builder-context candidate
+          uv venv --python 3.12.13 .tpu-builder-inputs
+          uv pip install --python .tpu-builder-inputs/bin/python "uv==$UV_VERSION"
+          cp .tpu-builder-inputs/bin/uv tpu-builder-context/uv
+          docker build \
+            --tag marin-tpu-builder:release \
+            --file infra/release/Dockerfile.tpu-build \
+            tpu-builder-context
+          docker image inspect marin-tpu-builder:release \
+            --format '{{.Id}}' > candidate/builder-image.txt
+          docker run --name marin-tpu-pair-build --cpus 1 --memory 4g \
+            --mount type=bind,source="$GITHUB_WORKSPACE/infra/release/build_tpu_pair.sh",target=/recipe.sh,readonly \
+            marin-tpu-builder:release nice -n 10 bash /recipe.sh \
+            "${{ steps.pair.outputs.vllm_commit }}" \
+            "${{ steps.pair.outputs.tpu_commit }}" \
+            "${{ steps.pair.outputs.exclude_newer }}"
+          docker cp marin-tpu-pair-build:/work/pair/. candidate/
           WHEELS=(candidate/*.whl)
           if [[ ${#WHEELS[@]} -ne 2 ]]; then
             echo "Expected two wheels, found ${#WHEELS[@]}" >&2
@@ -543,7 +553,9 @@ jobs:
             --prerelease \
             candidate/*.whl \
             candidate/*.html \
-            candidate/marin-vllm-tpu-manifest.json
+            candidate/marin-vllm-tpu-manifest.json \
+            candidate/*.txt \
+            candidate/*.sha256
 
       - name: Redownload the published pair
         env:
