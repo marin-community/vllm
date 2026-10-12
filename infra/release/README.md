@@ -81,8 +81,9 @@ shows which checks run automatically and which the adoption agent runs.
 
 [`marin-gpu-candidate.yaml`](../../.github/workflows/marin-gpu-candidate.yaml)
 builds, qualifies, and publishes GPU wheels in one workflow. Source changes on
-`main` start it automatically; release-only and documentation changes are
-excluded by `paths-ignore`. A manual dispatch must also select `main`:
+`main` start it automatically. `paths-ignore` lists excluded documentation,
+release-automation, and cache-maintenance files. A manual dispatch must also
+select `main`:
 
 ```bash
 gh workflow run marin-gpu-candidate.yaml \
@@ -103,12 +104,14 @@ uses the final release tag throughout, including each qualification record's
 
 Qualification runs on the configured Iris hardware:
 
-- H100x1 on `cw-rno2a` installs the x86_64 wheel, checks the stable Torch
-  extension and Grug model, validates sparse NCCL weight transfer, allocates
-  through cuMem, runs the Marin delta tests, and serves Qwen/Qwen3-0.6B against
-  the H100 spec.
-- GB200x1 on `cw-us-east-08a` installs the aarch64 wheel, checks the stable
-  Torch extension and Grug model, allocates through cuMem, and serves
+- H100x1 on `cw-rno2a` installs the x86_64 wheel, checks the
+  `vllm._C_stable_libtorch` extension and GrugMoE model implementation,
+  validates sparse NCCL weight transfer, allocates through cuMem, runs the
+  fork's model/scheduler/weight-transfer regression tests, and serves
+  Qwen/Qwen3-0.6B against the H100 spec.
+- GB200x1 on `cw-us-east-08a` installs the aarch64 wheel, checks the
+  `vllm._C_stable_libtorch` extension and GrugMoE model implementation,
+  allocates through cuMem, and serves
   Qwen/Qwen3-0.6B against the GB200 spec.
 
 Each Iris job downloads its wheel from the current workflow's Actions artifact
