@@ -364,6 +364,10 @@ jobs:
           name: marin-vllm-gpu-manifest
           path: build
 
+      - name: Include the release manifest in the Iris bundle
+        # Iris omits gitignored files unless they are tracked.
+        run: git add --force build/marin-vllm-gpu-manifest.json
+
       - name: Materialize this commit's validation sources
         run: |
           mkdir validation-source
