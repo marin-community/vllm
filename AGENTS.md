@@ -68,6 +68,9 @@ promoted GPU artifact in `config/external/vllm/gpu.toml`. Refreshes follow
 Marin's `.agents/skills/refresh-fork/SKILL.md`; they never stage or promote a
 `tpu` or `tpu-next` branch in this repository.
 
+For GPU build triggers, wheel qualification, publication, and Marin adoption,
+read [the release guide](infra/release/README.md#gpu-build-qualification-and-publication).
+
 ## Install, test, run
 
 Use `uv` and `.venv/bin/python` — never system `python3` or bare `pip`.

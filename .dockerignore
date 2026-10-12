@@ -36,3 +36,6 @@ share/python-wheels/
 *.egg
 MANIFEST
 rust/target/
+
+# Keyless build credentials are supplied only through a BuildKit secret.
+gha-creds-*.json

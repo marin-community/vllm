@@ -61,11 +61,23 @@ avoids duplicating the build toolchains and intermediate objects in the
 runner's Docker image store. Together these keep compilation and artifact
 export within the hosted runners' root filesystems.
 
+Unchanged build layers use `ghcr.io/marin-community/vllm-build-cache:<architecture>`
+with Marin/Iris's registry-cache settings. Compiler steps that must execute use
+sccache 0.8.1's native GCS backend at
+`gs://marin-public/build-cache/vllm/sccache-v1/<architecture>/`.
+The existing `github-iris` workload identity is mounted as a BuildKit secret;
+credentials are excluded from the build context and exported layers.
+Layer hits skip compiler-cache requests. Missing credentials or unavailable
+caches fall back to compilation. GCS expiry is handled separately by the cache
+retention workflow. [Design and measurements](https://echo.oa.dev/wiki/613).
+
 ## GPU build, qualification, and publication
 
 Review and land vLLM source changes on `main` before building wheels. This
 applies to an upstream refresh and to patches authored in the fork. Marin keeps
 its existing wheel until a separate adoption PR passes its tests and merges.
+Marin's [trigger and test table](https://github.com/marin-community/marin/blob/main/.agents/skills/refresh-fork/docs/vllm.md#triggers-and-tests)
+shows which checks run automatically and which the adoption agent runs.
 
 [`marin-gpu-candidate.yaml`](../../.github/workflows/marin-gpu-candidate.yaml)
 builds, qualifies, and publishes GPU wheels in one workflow. Source changes on
