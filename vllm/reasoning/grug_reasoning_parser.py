@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
@@ -9,6 +9,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 from vllm.tokenizers import TokenizerLike
+from vllm.tool_parsers.utils import partial_tag_overlap
+
+TOOL_CALL_START = "<tool_call>"
 
 
 class GrugReasoningParser(BaseThinkingReasoningParser):
@@ -18,6 +21,9 @@ class GrugReasoningParser(BaseThinkingReasoningParser):
         chat_kwargs = kwargs.get("chat_template_kwargs") or {}
         self._thinking_enabled = chat_kwargs.get("enable_thinking") is not False
         super().__init__(tokenizer, *args, **kwargs)
+        self._header_token_id = self.vocab.get("<|start_header_id|>")
+        self._streamed_reasoning_length = 0
+        self._tool_call_started = False
 
     @property
     def start_token(self) -> str:
@@ -30,15 +36,32 @@ class GrugReasoningParser(BaseThinkingReasoningParser):
     def _nothink_content(self, input_ids: Sequence[int]) -> bool:
         return not self._thinking_enabled and self.start_token_id not in input_ids
 
+    def _current_turn_ids(self, input_ids: Sequence[int]) -> Sequence[int]:
+        if self._header_token_id is None:
+            return input_ids
+        for index in range(len(input_ids) - 1, -1, -1):
+            if input_ids[index] == self._header_token_id:
+                return input_ids[index:]
+        return input_ids
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        if self._nothink_content(input_ids):
+        current_turn_ids = self._current_turn_ids(input_ids)
+        if self._nothink_content(current_turn_ids):
             return True
-        return super().is_reasoning_end(input_ids)
+        return super().is_reasoning_end(current_turn_ids)
+
+    def is_reasoning_end_streaming(
+        self, input_ids: Sequence[int], delta_ids: Iterable[int]
+    ) -> bool:
+        return self._tool_call_started or super().is_reasoning_end_streaming(
+            input_ids, delta_ids
+        )
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        if self._nothink_content(input_ids):
-            return input_ids
-        return super().extract_content_ids(input_ids)
+        current_turn_ids = list(self._current_turn_ids(input_ids))
+        if self._nothink_content(current_turn_ids):
+            return current_turn_ids
+        return super().extract_content_ids(current_turn_ids)
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -62,20 +85,48 @@ class GrugReasoningParser(BaseThinkingReasoningParser):
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
     ) -> DeltaMessage | None:
-        delta = super().extract_reasoning_streaming(
-            previous_text,
-            current_text,
-            delta_text,
-            previous_token_ids,
-            current_token_ids,
-            delta_token_ids,
+        if not self._thinking_enabled and self.start_token not in current_text:
+            return DeltaMessage(content=delta_text)
+
+        start = current_text.find(self.start_token)
+        body_start = start + len(self.start_token) if start >= 0 else 0
+        end = current_text.find(self.end_token, body_start)
+        tool = current_text.find(TOOL_CALL_START, body_start)
+        if tool >= 0 and (end < 0 or tool < end):
+            marker_start = tool
+            marker_end = tool
+            self._tool_call_started = True
+        elif end >= 0:
+            marker_start = end
+            marker_end = end + len(self.end_token)
+        else:
+            if start < 0:
+                # An unmarked prefix may still be reasoning if a close follows.
+                return None
+            body = current_text[body_start:]
+            withheld = max(
+                partial_tag_overlap(body, self.end_token),
+                partial_tag_overlap(body, TOOL_CALL_START),
+            )
+            sendable_length = len(body) - withheld
+            reasoning = body[self._streamed_reasoning_length : sendable_length]
+            self._streamed_reasoning_length = sendable_length
+            return DeltaMessage(reasoning=reasoning) if reasoning else None
+
+        body = current_text[body_start:marker_start]
+        reasoning = body[self._streamed_reasoning_length :]
+        self._streamed_reasoning_length = len(body)
+        content = current_text[marker_end:]
+        return DeltaMessage(
+            reasoning=reasoning or None,
+            content=content or None,
         )
-        if (
-            delta is not None
-            and delta.reasoning is not None
-            and self.start_token_id in delta_token_ids
-        ):
-            # The base parser includes a start marker when it shares a text delta.
-            reasoning = delta.reasoning.replace(self.start_token, "", 1)
-            return delta.model_copy(update={"reasoning": reasoning})
-        return delta
+
+    def get_streaming_fallback_content(
+        self,
+        previous_text: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> str | None:
+        if self.start_token in previous_text or self.end_token in previous_text:
+            return None
+        return previous_text or None
