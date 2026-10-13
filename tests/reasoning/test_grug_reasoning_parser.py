@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from typing import NamedTuple
 
 import pytest
 
+from vllm.entrypoints.generate.base.protocol import DeltaToolCall
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.parser.abstract_parser import DelegatingParser
 from vllm.reasoning.grug_reasoning_parser import GrugReasoningParser
@@ -12,8 +14,16 @@ from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
 
 START_THINK = "<|start_think|>"
 END_THINK = "<|end_think|>"
+START_THINK_ID = 128002
+END_THINK_ID = 128003
 START_HEADER_ID = 128006
 END_HEADER_ID = 128007
+
+
+class StreamResult(NamedTuple):
+    reasoning: str
+    content: str
+    calls: list[DeltaToolCall]
 
 
 class GrugWithTools(DelegatingParser):
@@ -24,14 +34,14 @@ class GrugWithTools(DelegatingParser):
 class GrugTokenizer:
     def get_vocab(self) -> dict[str, int]:
         return {
-            START_THINK: 128002,
-            END_THINK: 128003,
+            START_THINK: START_THINK_ID,
+            END_THINK: END_THINK_ID,
             "<|start_header_id|>": START_HEADER_ID,
             "<|end_header_id|>": END_HEADER_ID,
         }
 
 
-def stream_grug(chunks, prompt_token_ids=None, *, tools=False):
+def stream_grug(chunks, prompt_token_ids=None, *, tools=False) -> StreamResult:
     parser = GrugWithTools(GrugTokenizer())
     request = ChatCompletionRequest(
         model="grug",
@@ -70,7 +80,7 @@ def stream_grug(chunks, prompt_token_ids=None, *, tools=False):
         if delta and delta.tool_calls
         for call in delta.tool_calls
     ]
-    return reasoning, content, calls
+    return StreamResult(reasoning, content, calls)
 
 
 @pytest.fixture
@@ -114,7 +124,7 @@ def test_grug_reasoning_parser_preserves_nothink_answer(parser: GrugReasoningPar
 
 
 def test_grug_reasoning_parser_splits_streaming_answer(parser: GrugReasoningParser):
-    start_id, end_id = 128002, 128003
+    start_id, end_id = START_THINK_ID, END_THINK_ID
     reasoning = parser.extract_reasoning_streaming(
         "", f"{START_THINK}The answer is 63.", f"{START_THINK}The answer is 63.", [],
         [start_id, 1], [start_id, 1],
@@ -164,33 +174,36 @@ def test_grug_streaming_ignores_previous_turn_closing_marker():
         START_HEADER_ID,
         10,
         END_HEADER_ID,
-        128002,
+        START_THINK_ID,
         11,
-        128003,
+        END_THINK_ID,
         START_HEADER_ID,
         10,
         END_HEADER_ID,
     ]
-    reasoning, content, _ = stream_grug(
-        [(f"{START_THINK}Check.", [128002, 1]), (f"{END_THINK}42", [128003, 2])],
+    result = stream_grug(
+        [
+            (f"{START_THINK}Check.", [START_THINK_ID, 1]),
+            (f"{END_THINK}42", [END_THINK_ID, 2]),
+        ],
         prompt_ids,
     )
 
-    assert reasoning == "Check."
-    assert content == "42"
+    assert result.reasoning == "Check."
+    assert result.content == "42"
 
 
 def test_grug_streaming_holds_unmarked_reasoning_until_closing_marker():
-    reasoning, content, _ = stream_grug(
-        [("Check.", [1]), (f"{END_THINK}4", [128003, 2])], []
+    result = stream_grug(
+        [("Check.", [1]), (f"{END_THINK}4", [END_THINK_ID, 2])], []
     )
 
-    assert reasoning == "Check."
-    assert content == "4"
+    assert result.reasoning == "Check."
+    assert result.content == "4"
 
 
 def test_grug_streaming_hands_marker_free_tool_call_to_hermes():
-    reasoning, content, calls = stream_grug(
+    result = stream_grug(
         [
             ("<tool_", [1]),
             ('call>{"name":"calculator","arguments":{"x":4}}</tool_call>', [2]),
@@ -199,18 +212,18 @@ def test_grug_streaming_hands_marker_free_tool_call_to_hermes():
         tools=True,
     )
 
-    assert reasoning == ""
-    assert content == ""
-    assert calls[0].function.name == "calculator"
-    arguments = "".join(call.function.arguments or "" for call in calls)
+    assert result.reasoning == ""
+    assert result.content == ""
+    assert result.calls[0].function.name == "calculator"
+    arguments = "".join(call.function.arguments or "" for call in result.calls)
     assert json.loads(arguments) == {"x": 4}
 
 
 def test_grug_streaming_preserves_marker_free_plain_answer():
-    reasoning, content, calls = stream_grug(
+    result = stream_grug(
         [("Plain", [1]), (" answer", [2])], []
     )
 
-    assert reasoning == ""
-    assert content == "Plain answer"
-    assert calls == []
+    assert result.reasoning == ""
+    assert result.content == "Plain answer"
+    assert result.calls == []
