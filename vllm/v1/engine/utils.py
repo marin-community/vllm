@@ -367,6 +367,11 @@ def get_physical_gpu_ids_for_local_dp_rank(
     """
     if local_world_size is None:
         local_world_size = world_size
+    # Native 0.30 strides by global world_size, skipping node-local device shards
+    # for local DP rank >0 on multi-node engines. Remove when native assignment
+    # strides by local_world_size; verify explicit and masked GPU slice tests
+    # plus multi-node DP serving. This is the same upstream function:
+    # https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/engine/utils.py#L361
     if user_assigned_gpu_ids is not None:
         start = local_dp_rank * local_world_size
         stop = start + local_world_size

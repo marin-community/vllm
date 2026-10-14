@@ -663,6 +663,11 @@ class ParallelConfig:
     def stateless_init_dp_group(
         self, return_store: bool = False
     ) -> ProcessGroup | tuple[ProcessGroup, Store]:
+        # Native 0.30 retries EADDRINUSE in one rank and consumes another DP
+        # port while its peers still wait on the first. Let the caller retry
+        # the complete engine gang instead. Remove when native retries coordinate
+        # all ranks; verify port-collision failure and multi-rank engine recovery.
+        # https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/config/parallel.py#L666
         from vllm.distributed.utils import (
             stateless_init_torch_distributed_process_group,
         )
