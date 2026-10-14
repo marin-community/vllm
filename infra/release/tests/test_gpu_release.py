@@ -381,6 +381,29 @@ def test_build_matrix_targets_only_the_validated_gpu():
         assert item["nvcc_threads"] == 1
 
 
+def test_build_matrix_cli_refuses_unverified_workaround_abi(tmp_path):
+    config = load_json(CONFIG_PATH)
+    config["torch_version"] = "2.14.2+cu132"
+    changed = tmp_path / "config.json"
+    changed.write_text(json.dumps(config))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CONFIG_PATH.with_name("gpu_release.py")),
+            "build-matrix",
+            "--config",
+            str(changed),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "unverified workaround ABI" in result.stderr
+
+
 def release_fixture(tmp_path: Path) -> tuple[dict, dict, list[dict], dict]:
     config = load_json(CONFIG_PATH)
     build_manifest = built_manifest(tmp_path)

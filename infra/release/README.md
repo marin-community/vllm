@@ -70,6 +70,13 @@ indices in the ARM quantization kernel. Those adaptations remain unchanged;
 their measured reproduction limits and removal conditions are recorded in the
 [qualified recipe](https://github.com/marin-community/vllm/blob/2e5249991b94a79d5d80ad363e8bb0ac30d304a6/infra/release/README.md#gpu-build-configuration).
 
+The workflow's existing `gpu_release.py build-matrix` entry point refuses
+dependency or upstream-base changes outside retained workaround coverage before
+starting either architecture's build. It reads the release config, generated
+architecture constraints, compiler wheel inputs and Rust toolchain. Extending
+coverage requires a removal experiment and new necessity evidence beside the
+affected fix; a successful patch application is insufficient.
+
 Each build job removes unused Android, .NET, and GHC toolchains from its
 ephemeral hosted runner before compiling. The wheel-only BuildKit export also
 avoids duplicating the build toolchains and intermediate objects in the

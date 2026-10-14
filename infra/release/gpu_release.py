@@ -20,6 +20,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import tomllib
+
 if __package__:
     from .release_common import (
         RELEASE_REPOSITORY,
@@ -79,6 +81,34 @@ REQUIRED_RUNTIME_GATES = (
     SPARSE_NCCL_GATE,
     SERVE_GATE,
 )
+
+# Coverage for the CUDA/compiler, Pixtral and package-bound workarounds in the
+# 0.30 port. Test removal and retain new causal evidence before extending it.
+# https://github.com/marin-community/vllm/blob/2e5249991b94a79d5d80ad363e8bb0ac30d304a6/infra/release/README.md#gpu-build-configuration
+VERIFIED_WORKAROUND_ABI = {
+    "upstream_base": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+    "torch_version": "2.14.1+cu132",
+    "cuda_toolkit_version": "13.2.2",
+    "cuda_compiler_version": "13.2.86",
+}
+VERIFIED_WORKAROUND_DEPENDENCIES = {
+    "torch": "2.14.1+cu132",
+    "torchvision": "0.29.1+cu132",
+    "torchaudio": "2.11.0+cpu",
+    "apache-tvm-ffi": "0.1.12",
+    "tilelang": "0.1.14",
+    "tokenspeed-mla": "0.1.9",
+    "transformers": "5.18.0",
+    "tokenizers": "0.23.2",
+    "nvidia-cudnn-frontend": "1.30.0",
+    "nvidia-cutlass-dsl": "4.7.1",
+    "setuptools": "80.10.2",
+    "cuda-toolkit": "13.2.2",
+    "nvidia-cuda-nvcc": "13.2.86",
+    "nvidia-cuda-cccl": "13.2.86",
+    "nvidia-cuda-crt": "13.2.86",
+    "nvidia-cuda-nvrtc": "13.2.86",
+}
 
 
 def _expand_wheel_tag(tag: str) -> set[str]:
@@ -628,7 +658,42 @@ def finalize_release(
     return released
 
 
+def require_verified_workaround_inputs(config: dict[str, Any]) -> None:
+    """Reject uncovered dependency changes before starting a wheel build."""
+    actual_abi = {name: config[name] for name in VERIFIED_WORKAROUND_ABI}
+    if actual_abi != VERIFIED_WORKAROUND_ABI:
+        raise ReleaseError(
+            f"unverified workaround ABI: {actual_abi}; test removal and record "
+            "new necessity evidence before extending coverage"
+        )
+    root = Path(__file__).resolve().parents[2]
+    rust = tomllib.loads((root / "rust-toolchain.toml").read_text())
+    if rust["toolchain"]["channel"] != "1.99.0":
+        raise ReleaseError("unverified Rust toolchain for retained build workarounds")
+    compiler = load_json(Path(__file__).with_name("cuda-compiler-inputs.json"))
+    if compiler["compiler_version"] != config["cuda_compiler_version"]:
+        raise ReleaseError("compiler wheel inputs disagree with workaround coverage")
+    for architecture in config["platforms"]:
+        text = Path(__file__).with_name(_constraints_filename(architecture)).read_text()
+        pins = dict(re.findall(r"(?m)^([\w.-]+)\s*==\s*([^\s;#]+)", text))
+        selected = {
+            name: pins.get(name) for name in VERIFIED_WORKAROUND_DEPENDENCIES
+        }
+        if selected != VERIFIED_WORKAROUND_DEPENDENCIES:
+            raise ReleaseError(
+                f"unverified {architecture} workaround dependencies: {selected}; "
+                "test removal and record new necessity evidence before "
+                "extending coverage"
+            )
+        if any(
+            item["version"] != config["cuda_compiler_version"]
+            for item in compiler["platforms"][architecture]
+        ):
+            raise ReleaseError("unverified compiler wheel cohort")
+
+
 def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    require_verified_workaround_inputs(config)
     includes = []
     for architecture, platform in config["platforms"].items():
         includes.append(
