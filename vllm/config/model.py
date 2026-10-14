@@ -1910,6 +1910,9 @@ class ModelConfig:
             return False
         # Snowball GrugMoE is attention-only. Hero uses the same serialized
         # model identity but becomes hybrid when short convolutions are enabled.
+        # Native 0.30 class metadata cannot distinguish those configurations.
+        # Remove when native metadata consults the HF config; verify both model
+        # variants' cache allocation, ShortConv state and serving parity.
         if getattr(self.hf_text_config, "model_type", None) == "grug_moe":
             return bool(getattr(self.hf_text_config, "sconv", False))
         # Handle granite-4.0-micro case which uses hybrid config but does not
@@ -1925,6 +1928,8 @@ class ModelConfig:
 
     @property
     def has_inner_state(self):
+        # Same config-dependent Grug identity as is_hybrid; keep both predicates
+        # consistent until native model metadata supports conditional state.
         if getattr(self.hf_text_config, "model_type", None) == "grug_moe":
             return self._model_info.has_inner_state and bool(
                 getattr(self.hf_text_config, "sconv", False)
