@@ -191,6 +191,10 @@ if (NOT HIP_FOUND AND NOT PYTORCH_FOUND_HIP AND CUDA_FOUND)
 
   # Keep NVCC's embedded intermediate filenames stable across compiler processes.
   # A directory option also reaches FlashAttention's separately defined targets.
+  # Native NVCC 13.2.86/sccache 0.8.1 emitted PID-dependent tmpxft symbols;
+  # source seeds matched three cold builds including fetched FA targets.
+  # Remove these flags when native unseeded output is stable, then compare
+  # independent complete wheels (infra/release/README.md links the reproduction).
   if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--objdir-as-tempdir>)
     # Template-only translation units still use process IDs in internal symbols.

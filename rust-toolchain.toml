@@ -1,2 +1,7 @@
 [toolchain]
+# Native 1.95/LLVM22 varied 16 image-resize functions in repeated cold builds;
+# 1.99/LLVM23 matched three builds and all 480 resized values. Remove when the
+# upstream toolchain includes https://github.com/llvm/llvm-project/pull/200833
+# and independent full wheel archives match. Reproduction and limits:
+# https://github.com/marin-community/vllm/blob/2e5249991b94a79d5d80ad363e8bb0ac30d304a6/infra/release/README.md#gpu-build-configuration
 channel = "1.99.0"
