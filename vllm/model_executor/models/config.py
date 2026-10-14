@@ -462,6 +462,12 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
 class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        # Native 0.30 advertises ShortConv graph support, but the Hero removal
+        # probe produced NaN logprobs after replay with batch sizes 1/2/3/1;
+        # eager replay stayed finite. Native backend at the qualified base:
+        # https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/attention/backends/short_conv_attn.py
+        # Remove only after changing-batch Hero graph/eager generation and
+        # repeated weight reload pass the existing numerical gates.
         if not getattr(vllm_config.model_config.hf_text_config, "sconv", False):
             return
 
