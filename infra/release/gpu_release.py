@@ -91,6 +91,16 @@ VERIFIED_WORKAROUND_ABI = {
     "cuda_toolkit_version": "13.2.2",
     "cuda_compiler_version": "13.2.86",
 }
+VERIFIED_WORKAROUND_BUILD_IMAGES = {
+    "x86_64": (
+        "pytorch/manylinux2_28-builder:cuda13.2@sha256:"
+        "313d3fa7551f14335d7d3196fb00b94acd97550faf81923b610dfac87dd028af"
+    ),
+    "aarch64": (
+        "pytorch/manylinuxaarch64-builder:cuda13.2@sha256:"
+        "b6294ee66020334c6cb80c4392b2cf88b0722a49ac30ada9ed2126c9c453384d"
+    ),
+}
 VERIFIED_WORKAROUND_DEPENDENCIES = {
     "torch": "2.14.1+cu132",
     "torchvision": "0.29.1+cu132",
@@ -98,6 +108,9 @@ VERIFIED_WORKAROUND_DEPENDENCIES = {
     "apache-tvm-ffi": "0.1.11",
     "tilelang": "0.1.12",
     "tokenspeed-mla": "0.1.8",
+    # Native JIT/linker paths and the paired compiler/kernel interface.
+    "flashinfer-python": "0.6.18.post1",
+    "flashinfer-cubin": "0.6.18.post1",
     # Match the actual Marin/MSRL runtime. Native 0.30 Pixtral imports,
     # rotary construction and grid positions work with this API; the 5.17+
     # branch is removed rather than carried into the wheel.
@@ -678,6 +691,15 @@ def require_verified_workaround_inputs(config: dict[str, Any]) -> None:
             "new necessity evidence before extending coverage"
         )
     root = Path(__file__).resolve().parents[2]
+    # The actual installer selects sccache in Dockerfile. Check its download and
+    # extraction versions rather than introduce a second build configuration.
+    dockerfile = (root / "docker/Dockerfile").read_text()
+    sccache_versions = set(re.findall(r"sccache-v([\d.]+)-", dockerfile))
+    sccache_versions.update(
+        re.findall(r"sccache/releases/download/v([\d.]+)/", dockerfile)
+    )
+    if sccache_versions != {"0.8.1"}:
+        raise ReleaseError("unverified sccache input for retained compiler workarounds")
     rust = tomllib.loads((root / "rust-toolchain.toml").read_text())
     if rust["toolchain"]["channel"] != "1.99.0":
         raise ReleaseError("unverified Rust toolchain for retained build workarounds")
@@ -685,6 +707,14 @@ def require_verified_workaround_inputs(config: dict[str, Any]) -> None:
     if compiler["compiler_version"] != config["cuda_compiler_version"]:
         raise ReleaseError("compiler wheel inputs disagree with workaround coverage")
     for architecture in config["platforms"]:
+        if (
+            config["platforms"][architecture]["build_base_image"]
+            != VERIFIED_WORKAROUND_BUILD_IMAGES.get(architecture)
+        ):
+            raise ReleaseError(
+                f"unverified {architecture} builder image for compiler overlay; "
+                "test removal and record necessity before extending coverage"
+            )
         text = Path(__file__).with_name(_constraints_filename(architecture)).read_text()
         pins = dict(re.findall(r"(?m)^([\w.-]+)\s*==\s*([^\s;#]+)", text))
         selected = {

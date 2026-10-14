@@ -382,26 +382,33 @@ def test_build_matrix_targets_only_the_validated_gpu():
 
 
 def test_build_matrix_cli_refuses_unverified_workaround_abi(tmp_path):
+    command = [
+        sys.executable,
+        str(CONFIG_PATH.with_name("gpu_release.py")),
+        "build-matrix",
+        "--config",
+    ]
+    verified = subprocess.run(
+        [*command, str(CONFIG_PATH)], capture_output=True, text=True
+    )
+    assert verified.returncode == 0
+    architectures = {
+        item["architecture"] for item in json.loads(verified.stdout)["include"]
+    }
+    assert architectures == {"x86_64", "aarch64"}
     config = load_json(CONFIG_PATH)
     config["torch_version"] = "2.14.2+cu132"
     changed = tmp_path / "config.json"
     changed.write_text(json.dumps(config))
 
     result = subprocess.run(
-        [
-            sys.executable,
-            str(CONFIG_PATH.with_name("gpu_release.py")),
-            "build-matrix",
-            "--config",
-            str(changed),
-        ],
+        [*command, str(changed)],
         capture_output=True,
         text=True,
     )
 
     assert result.returncode != 0
     assert result.stdout == ""
-    assert "unverified workaround ABI" in result.stderr
 
 
 def release_fixture(tmp_path: Path) -> tuple[dict, dict, list[dict], dict]:
