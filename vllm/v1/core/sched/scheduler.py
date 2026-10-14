@@ -1929,6 +1929,11 @@ class Scheduler(SchedulerInterface):
         # whose routing was just D2H'd into model_runner_output.
         routing_data = None
         routing_offsets: dict[str, int] = {}
+        # Native 0.30 only constructs the manager when public route return is
+        # enabled, but internal capture can still supply routed-expert output:
+        # https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/sched/scheduler.py#L386
+        # Remove when native storage uses the same guard; verify internal EAGLE
+        # capture with public route return off, plus normal route delivery.
         if (
             self.enable_return_routed_experts
             and model_runner_output.routed_experts is not None
