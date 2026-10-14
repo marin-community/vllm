@@ -28,7 +28,14 @@ runtime dependencies for CPython 3.12 on manylinux 2.28. The release Docker buil
 and wheel validation consume the file for their architecture. Their direct
 inputs live in `gpu-constraints.in`,
 including one `torchaudio==2.11.0+cpu` constraint and the Transformers and
-Tokenizers versions qualified by the selected upstream CUDA test environment.
+Tokenizers versions used by the Marin/MSRL application runtime (5.12.1 and
+0.22.2). Native upstream 0.30 Pixtral supports that API; the former adaptation
+for Transformers 5.17+ is removed. The original upstream TVM FFI 0.1.11,
+TileLang 0.1.12 and Tokenspeed MLA 0.1.8 requirements are also restored. Native
+CPU/CUDA DLPack exchanges and FlashInfer norm/sampler kernels work with that
+family under Torch 2.14.1; full serving gates still qualify the built artifacts.
+Changing this pair requires an unpatched
+Pixtral import/rotary/grid check and the normal serving qualification gates.
 The generated file records the PyPI, CUDA 13.2, CPU Torch, and FlashInfer
 indexes. uv selects compatible wheels for the builder architecture from those
 indexes.
@@ -69,6 +76,13 @@ profile, NVCC temporary-directory and source-seed flags, and bounded local
 indices in the ARM quantization kernel. Those adaptations remain unchanged;
 their measured reproduction limits and removal conditions are recorded in the
 [qualified recipe](https://github.com/marin-community/vllm/blob/2e5249991b94a79d5d80ad363e8bb0ac30d304a6/infra/release/README.md#gpu-build-configuration).
+
+The workflow's existing `gpu_release.py build-matrix` entry point refuses
+dependency or upstream-base changes outside retained workaround coverage before
+starting either architecture's build. It reads the release config, generated
+architecture constraints, compiler wheel inputs and Rust toolchain. Extending
+coverage requires a removal experiment and new necessity evidence beside the
+affected fix; a successful patch application is insufficient.
 
 Each build job removes unused Android, .NET, and GHC toolchains from its
 ephemeral hosted runner before compiling. The wheel-only BuildKit export also

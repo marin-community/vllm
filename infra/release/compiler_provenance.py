@@ -23,6 +23,12 @@ def sha256(path: Path) -> str:
 
 
 def install_compiler(inputs: dict, cuda_home: Path) -> dict:
+    # Digest-pinned upstream cuda13.2 builders contain the 13.2.1 compiler.
+    # NVIDIA fixed divergent nested-loop reconvergence (6111901) in 13.2.2:
+    # https://docs.nvidia.com/cuda/archive/13.2.2/cuda-toolkit-release-notes/index.html#cuda-compiler
+    # No Marin model miscompile is claimed. Remove this overlay when the pinned
+    # native builder supplies the fixed complete cohort. Verify provenance,
+    # compiler smoke and normal H100/GB200 application gates before removal.
     architecture = platform.machine()
     packages = inputs["platforms"][architecture]
     version = inputs["compiler_version"]

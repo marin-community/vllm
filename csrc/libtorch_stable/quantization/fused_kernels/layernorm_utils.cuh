@@ -305,8 +305,12 @@ __device__ void compute_dynamic_per_token_scales(
   if constexpr (group_size > 0) {
     __shared__ float s_max_vals[1024];
 
-    // Local indices fit in int32; tensor offsets remain int64. This keeps
-    // CUDA 13.2 code generation stable for the group reduction loops.
+    // Local indices fit in int32; tensor offsets remain int64.
+    // ARM CICC 13.2.86 emitted four PTX variants in six cold int64 builds;
+    // six int32 builds matched PTX and objects. Remove when upstream carries
+    // these bounds or native int64 compilation is stable. Verify independent
+    // full-wheel hashes and GPU quantization values/gradients; the old
+    // reproduction is linked from infra/release/README.md.
     int32_t const num_groups = hidden_size / group_size;
     int32_t const threads_per_group = blockDim.x / num_groups;
     int32_t const thread_in_group = threadIdx.x % threads_per_group;

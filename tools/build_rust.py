@@ -22,7 +22,10 @@ def prepare_build_environment() -> str | None:
     version = os.getenv(VLLM_RS_BUILD_VERSION) or None
     if version is None:
         try:
-            version = get_version(root=ROOT_DIR)
+            version = get_version(
+                root=ROOT_DIR,
+                git_describe_command="git describe --dirty --tags --long --match v[0-9]*",
+            )
         except LookupError:
             return None
 
@@ -42,6 +45,9 @@ def rust_extensions(*, optional: bool = False) -> list[RustExtension]:
             # Identical ThinLTO builds changed promoted LLVM symbol suffixes
             # and executable layout. Use one release codegen unit and disable
             # LTO for the frontend; preserve the inherited version/source epoch.
+            # Remove when native ThinLTO produces matching independent frontend
+            # binaries and full wheels. Necessity was measured on Rust 1.99/LLVM 23;
+            # see infra/release/README.md's linked qualified reproduction.
             env={
                 **os.environ,
                 "CARGO_PROFILE_RELEASE_LTO": "off",
