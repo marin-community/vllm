@@ -196,6 +196,11 @@ def bundle_tcmalloc(build_lib: str) -> None:
 
 
 def _cmake_cache_has_missing_tool_path(cmake_cache: str) -> bool:
+    # CMake 4.4.4/Ninja 1.13.2 reuse an absolute Ninja path after its uv build
+    # environment disappears; normal configure then fails to execute Ninja.
+    # Native --fresh resolves it but clears CMakeFiles, including cached objects.
+    # Remove when upstream refreshes tool paths or builders keep them persistent.
+    # Verify with two configure calls across an expired build environment.
     cached_tool_paths = {
         "CMAKE_AR",
         "CMAKE_C_COMPILER",
@@ -1307,19 +1312,12 @@ def get_vllm_version() -> str:
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(write_to="vllm/_version.py")
 
-    try:
-        version = get_version(write_to="vllm/_version.py")
-    except Exception as exc:
-        git_sha = subprocess.check_output(
-            ["git", "rev-parse", "--short=9", "HEAD"], text=True
-        ).strip()
-        version = f"0.30.0.dev0+g{git_sha}"
-        print(
-            "Falling back to "
-            f"{version} because setuptools-scm could not parse this checkout: {exc!r}"
-        )
-        os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = version
-        version = get_version(write_to="vllm/_version.py")
+    # Artifact release tags contain dates and hashes, not package versions.
+    # Let setuptools-scm derive the version from upstream's native v* tags.
+    version = get_version(
+        write_to="vllm/_version.py",
+        git_describe_command="git describe --dirty --tags --long --match v[0-9]*",
+    )
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
