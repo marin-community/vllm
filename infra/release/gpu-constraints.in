@@ -4,15 +4,20 @@
 # Shared GPU ABI agreed with the trainer refresh. The TPU lane is isolated.
 cuda-toolkit[nvcc,cccl,nvrtc]==13.2.2
 torch==2.14.1+cu132
+# The native cu130 audio wheel pins another Torch build. CPU audio permits this
+# Torch ABI and the target text-model paths use tensor operations. Remove when
+# native cu132 audio metadata agrees; qualify audio features separately.
 torchaudio==2.11.0+cpu
 torchvision==0.29.1+cu132
 nvidia-cudnn-frontend==1.30.0
-tokenizers==0.23.2
-transformers==5.18.0
+tokenizers==0.22.2
+transformers==5.12.1
 
 # Datasets 5.0.1 in the shared trainer runtime caps fsspec at this version.
 fsspec==2026.6.0
 
 # NVIDIA's 0.8.1 ARM wheel has an unsupported sbsa WHEEL tag. This repair changes
-# only WHEEL/RECORD; the trainer's maintained recipe verifies native byte identity.
+# only WHEEL/RECORD; the archived trainer recipe verifies native byte identity.
+# Remove when the selected Torch admits a correctly tagged native NVIDIA wheel;
+# verify ARM pip check and serving. Torch2.14.1 exactly requires cuSPARSELt0.8.1.
 nvidia-cusparselt-cu13 @ https://github.com/marin-community/MarinSkyRL/releases/download/native-cu132-cusparselt081-armtag-20261004/nvidia_cusparselt_cu13-0.8.1-py3-none-manylinux2014_aarch64.whl#sha256=76c16ba86fc7b15771e0f4df42256a4a29bdd378a186ddfd4744e51fdb384594 ; platform_machine == "aarch64"

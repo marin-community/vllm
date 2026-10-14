@@ -4,6 +4,11 @@
 numba == 0.65.0 # Required for N-gram speculative decoding
 
 # Dependencies for NVIDIA GPUs
+# Native 0.30 pins Torch 2.13, whose cu132 toolkit is 13.2.1. Keep Torch 2.14.1's
+# native fixed 13.2.2 cohort (NVIDIA compiler issue 6111901) without a Torch toolkit
+# override. Remove this departure when a native compatible group admits that
+# fixed cohort; verify resolver, H100/GB200 serving and application parity.
+# https://docs.nvidia.com/cuda/archive/13.2.2/cuda-toolkit-release-notes/index.html#cuda-compiler
 torch==2.14.1
 torchaudio==2.11.0
 # These must be updated alongside torch
@@ -16,8 +21,8 @@ PyNvVideoCodec==2.0.4
 --extra-index-url https://flashinfer.ai/whl/
 flashinfer-python==0.6.18.post1
 flashinfer-cubin==0.6.18.post1
-apache-tvm-ffi==0.1.12
-tilelang==0.1.14
+apache-tvm-ffi==0.1.11
+tilelang==0.1.12
 nvidia-cudnn-frontend>=1.19.1
 # Required for LLM_NVTX_SCOPES_FOR_PROFILING=1
 nvtx==0.2.15
@@ -29,8 +34,8 @@ instanttensor >= 0.1.9
 nvidia-cutlass-dsl[cu13]==4.7.1
 quack-kernels==0.6.5  # Required by MSA
 
-# Tokenspeed_MLA 0.1.9 is the first release compatible with TVM FFI 0.1.12.
-tokenspeed-mla==0.1.9; platform_system == "Linux"
+# Tokenspeed_MLA for faster mla with spec decode
+tokenspeed-mla==0.1.8; platform_system == "Linux"
 
 # Humming kernels for quantization gemm
 humming-kernels[cu13]==0.1.12

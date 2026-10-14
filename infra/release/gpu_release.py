@@ -95,19 +95,30 @@ VERIFIED_WORKAROUND_DEPENDENCIES = {
     "torch": "2.14.1+cu132",
     "torchvision": "0.29.1+cu132",
     "torchaudio": "2.11.0+cpu",
-    "apache-tvm-ffi": "0.1.12",
-    "tilelang": "0.1.14",
-    "tokenspeed-mla": "0.1.9",
-    "transformers": "5.18.0",
-    "tokenizers": "0.23.2",
+    "apache-tvm-ffi": "0.1.11",
+    "tilelang": "0.1.12",
+    "tokenspeed-mla": "0.1.8",
+    # Match the actual Marin/MSRL runtime. Native 0.30 Pixtral imports,
+    # rotary construction and grid positions work with this API; the 5.17+
+    # branch is removed rather than carried into the wheel.
+    "transformers": "5.12.1",
+    "tokenizers": "0.22.2",
     "nvidia-cudnn-frontend": "1.30.0",
     "nvidia-cutlass-dsl": "4.7.1",
     "setuptools": "80.10.2",
+    # CMake stale-tool-path detection and native SCM/Rust tag discovery.
+    "cmake": "4.4.4",
+    "ninja": "1.13.2",
+    "setuptools-scm": "10.3.4",
+    "setuptools-rust": "1.13.0",
     "cuda-toolkit": "13.2.2",
     "nvidia-cuda-nvcc": "13.2.86",
     "nvidia-cuda-cccl": "13.2.86",
     "nvidia-cuda-crt": "13.2.86",
     "nvidia-cuda-nvrtc": "13.2.86",
+    "nvidia-nvvm": "13.2.86",
+    "nvidia-nccl-cu13": "2.30.7",
+    "uvloop": "0.23.0",
 }
 
 
