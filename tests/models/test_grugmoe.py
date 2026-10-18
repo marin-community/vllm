@@ -604,6 +604,7 @@ def _minimal_vllm_config_for_mode_check(
         parallel_config=SimpleNamespace(tensor_parallel_size=tensor_parallel_size),
         lora_config=None,
         quant_config=quant_config,
+        additional_config={},
     )
 
 
@@ -1218,6 +1219,97 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights():
     assert actual.dtype == torch.bfloat16
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+_SNOWBALL_ROW_INVARIANT_GATES = GrugMoeRuntimeConfig(
+    vocab_size=64,
+    hidden_dim=2560,
+    intermediate_dim=64,
+    shared_expert_intermediate_dim=0,
+    num_experts=256,
+    num_experts_per_token=4,
+    num_layers=1,
+    num_heads=20,
+    num_kv_heads=5,
+    head_dim=128,
+    row_invariant_gates=True,
+).validate()
+_HERO_ROW_INVARIANT_GATES = GrugMoeRuntimeConfig(
+    vocab_size=64,
+    artifact_schema_version=2,
+    hidden_dim=6144,
+    intermediate_dim=64,
+    shared_expert_intermediate_dim=0,
+    num_shared_experts=2,
+    num_experts=384,
+    num_experts_per_token=8,
+    latent_dim=512,
+    num_layers=1,
+    num_heads=48,
+    num_kv_heads=12,
+    local_kv_heads=12,
+    global_kv_heads=6,
+    head_dim=128,
+    row_invariant_gates=True,
+).validate()
+
+
+def _same_bits(actual: torch.Tensor, expected: torch.Tensor) -> bool:
+    return torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "cfg",
+    [_SNOWBALL_ROW_INVARIANT_GATES, _HERO_ROW_INVARIANT_GATES],
+    ids=["snowball", "hero"],
+)
+def test_grug_row_invariant_gates_give_each_row_the_same_bits_in_any_batch(cfg):
+    mlp = GrugMoeMLP(cfg, params_dtype=torch.bfloat16).cuda()
+    attn = GrugMoeAttention(
+        cfg,
+        cache_config=None,
+        params_dtype=torch.bfloat16,
+        sliding_window=cfg.sliding_window,
+        use_rope=True,
+        qk_mult_scale=1.0,
+    ).cuda()
+    generator = torch.Generator().manual_seed(0)
+    scale = 10.0 ** torch.empty(300, 1).uniform_(-30, 30, generator=generator)
+    x = torch.randn(300, cfg.hidden_dim, generator=generator) * scale
+    x = x.to(torch.bfloat16).cuda()
+    with torch.no_grad():
+        for layer in (mlp.router, attn.attn_gate):
+            weight = torch.randn(layer.weight.shape, generator=generator) * 0.02
+            layer.weight.copy_(weight.to(torch.bfloat16))
+            layer.quant_method.process_weights_after_loading(layer)
+
+    # GrugMoeMLP passes the router fp32 activations holding bf16 values.
+    for layer, inputs in ((mlp.router, x.float()), (attn.attn_gate, x)):
+        full, _ = layer(inputs)
+        for rows in (1, 7, 64, 65, 129):
+            chunked = torch.cat([layer(chunk)[0] for chunk in inputs.split(rows)])
+            assert _same_bits(chunked, full)
+
+        static = inputs[:65].clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            layer(static)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured, _ = layer(static)
+        for start in (65, 130, 0):
+            static.copy_(inputs[start : start + 65])
+            graph.replay()
+            assert _same_bits(captured, full[start : start + 65])
+
+        weight = layer.weight.double()
+        exact = inputs.double() @ weight.t()
+        bound = 1e-5 * (inputs.double().abs() @ weight.abs().t())
+        bound += torch.finfo(full.dtype).eps * exact.abs()
+        assert bool(((full.double() - exact).abs() <= bound).all())
 
 
 def test_grug_moe_router_selects_logical_expert_ids():
