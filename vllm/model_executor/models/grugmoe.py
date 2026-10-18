@@ -3,7 +3,7 @@
 """Correctness-first GPU and TPU implementation of Marin GrugMoE."""
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Any
 
@@ -21,7 +21,10 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    ReplicatedLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -57,6 +60,7 @@ from vllm.transformers_utils.configs.grugmoe import (
     grug_moe_rope_parameters,
     grug_moe_rope_theta,
 )
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -80,6 +84,14 @@ _ROUTER_COMBINE_WEIGHT_EPS = 1e-9
 _UNQUANTIZED_METHOD = "unquantized"
 _HERO_ARTIFACT_SCHEMA_VERSION = 2
 _SUPPORTED_SCONV_SITES = frozenset({"k", "attn", "mlp"})
+_ROW_INVARIANT_GATES_KEY = "grug_row_invariant_gates"
+# _ROW_INVARIANT_GEMM_SPLITS and _ROW_INVARIANT_GEMM_BLOCK_K set the summation
+# order; every call uses the same values.
+_ROW_INVARIANT_GEMM_SPLITS = 8
+_ROW_INVARIANT_GEMM_BLOCK_K = 64
+_ROW_INVARIANT_GEMM_BLOCK_M = 64
+_ROW_INVARIANT_GEMM_BLOCK_N = 64
+_ROW_INVARIANT_GEMM_SUM_BLOCK = 1024
 
 
 def _config_attr(config: Any, names: tuple[str, ...], default: Any = None) -> Any:
@@ -231,6 +243,7 @@ class GrugMoeRuntimeConfig:
     sconv: bool = False
     sconv_kernel: int = 4
     sconv_sites: tuple[str, ...] = ("k", "attn", "mlp")
+    row_invariant_gates: bool = False
     tie_word_embeddings: bool = False
     rope_theta: float = 10000.0
     rope_parameters: dict[str, Any] | None = None
@@ -452,6 +465,21 @@ class GrugMoeRuntimeConfig:
         return self
 
 
+def _row_invariant_gates(vllm_config: VllmConfig) -> bool:
+    additional_config = vllm_config.additional_config
+    value = (
+        additional_config.get(_ROW_INVARIANT_GATES_KEY, False)
+        if isinstance(additional_config, dict)
+        else False
+    )
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"additional_config[{_ROW_INVARIANT_GATES_KEY!r}] must be true or "
+            f"false, got {value!r}"
+        )
+    return value
+
+
 class GrugMoeGatedNorm(nn.Module):
     def __init__(
         self,
@@ -579,6 +607,169 @@ def _apply_grug_linear(layer: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor
     return output
 
 
+@triton.jit
+def _row_invariant_gemm_partials(
+    x_ptr,
+    w_ptr,
+    partial_ptr,
+    rows,
+    columns,
+    split_depth,
+    x_row_stride,
+    w_row_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """``partial[s, m, n]``: the sum over K slice ``s`` of ``x[m, k] * w[n, k]``,
+    accumulated in fp32 one ``BLOCK_K`` block after another."""
+    row_block = tl.program_id(0)
+    column_block = tl.program_id(1)
+    split = tl.program_id(2)
+    row_offsets = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    column_offsets = column_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    depth_offsets = split * split_depth + tl.arange(0, BLOCK_K)
+    row_mask = row_offsets[:, None] < rows
+    column_mask = column_offsets[None, :] < columns
+    x_block = (
+        x_ptr
+        + row_offsets[:, None].to(tl.int64) * x_row_stride
+        + depth_offsets[None, :]
+    )
+    w_block = (
+        w_ptr
+        + column_offsets[None, :].to(tl.int64) * w_row_stride
+        + depth_offsets[:, None]
+    )
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, split_depth, BLOCK_K):
+        x = tl.load(x_block, mask=row_mask, other=0.0).to(tl.bfloat16)
+        w = tl.load(w_block, mask=column_mask, other=0.0).to(tl.bfloat16)
+        accumulator += tl.dot(x, w)
+        x_block += BLOCK_K
+        w_block += BLOCK_K
+    partial = (
+        partial_ptr
+        + (split * rows + row_offsets[:, None]).to(tl.int64) * columns
+        + column_offsets[None, :]
+    )
+    tl.store(partial, accumulator, mask=row_mask & column_mask)
+
+
+@triton.jit
+def _row_invariant_gemm_sum(
+    partial_ptr,
+    out_ptr,
+    elements,
+    SPLITS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """``out = partial[0] + partial[1] + ... + partial[SPLITS - 1]``, left to
+    right."""
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < elements
+    total = tl.load(partial_ptr + offsets, mask=mask, other=0.0)
+    for split in tl.static_range(1, SPLITS):
+        total += tl.load(partial_ptr + split * elements + offsets, mask=mask, other=0.0)
+    tl.store(out_ptr + offsets, total, mask=mask)
+
+
+def grug_row_invariant_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Return ``x @ weight.T`` in fp32 for bf16-valued ``x [rows, K]`` and
+    ``weight [N, K]``, each row's result depending on that row and ``weight`` alone.
+    """
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
+        raise ValueError(
+            "grug_row_invariant_gemm needs [rows, K] and [N, K], got "
+            f"{tuple(x.shape)} and {tuple(weight.shape)}"
+        )
+    depth = x.shape[1]
+    if depth % (_ROW_INVARIANT_GEMM_SPLITS * _ROW_INVARIANT_GEMM_BLOCK_K):
+        raise ValueError(
+            "grug_row_invariant_gemm needs K divisible by "
+            f"{_ROW_INVARIANT_GEMM_SPLITS * _ROW_INVARIANT_GEMM_BLOCK_K}, got {depth}"
+        )
+    x, weight = x.contiguous(), weight.contiguous()
+    rows, columns = x.shape[0], weight.shape[0]
+    out = torch.empty(rows, columns, dtype=torch.float32, device=x.device)
+    if rows == 0:
+        return out
+    partials = torch.empty(
+        _ROW_INVARIANT_GEMM_SPLITS,
+        rows,
+        columns,
+        dtype=torch.float32,
+        device=x.device,
+    )
+    grid = (
+        triton.cdiv(rows, _ROW_INVARIANT_GEMM_BLOCK_M),
+        triton.cdiv(columns, _ROW_INVARIANT_GEMM_BLOCK_N),
+        _ROW_INVARIANT_GEMM_SPLITS,
+    )
+    _row_invariant_gemm_partials[grid](
+        x,
+        weight,
+        partials,
+        rows,
+        columns,
+        depth // _ROW_INVARIANT_GEMM_SPLITS,
+        x.stride(0),
+        weight.stride(0),
+        BLOCK_M=_ROW_INVARIANT_GEMM_BLOCK_M,
+        BLOCK_N=_ROW_INVARIANT_GEMM_BLOCK_N,
+        BLOCK_K=_ROW_INVARIANT_GEMM_BLOCK_K,
+        num_warps=4,
+        num_stages=3,
+    )
+    elements = rows * columns
+    _row_invariant_gemm_sum[(triton.cdiv(elements, _ROW_INVARIANT_GEMM_SUM_BLOCK),)](
+        partials,
+        out,
+        elements,
+        SPLITS=_ROW_INVARIANT_GEMM_SPLITS,
+        BLOCK=_ROW_INVARIANT_GEMM_SUM_BLOCK,
+        num_warps=4,
+    )
+    return out
+
+
+def _grug_row_invariant_gemm_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="grug_row_invariant_gemm",
+    op_func=grug_row_invariant_gemm,
+    fake_impl=_grug_row_invariant_gemm_fake,
+)
+
+
+class GrugRowInvariantLinearMethod(UnquantizedLinearMethod):
+    """A linear method that computes the projection with ``grug_row_invariant_gemm``
+    and refuses a weight that bf16 cannot represent."""
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        weight = layer.weight
+        if not torch.equal(weight, weight.to(torch.bfloat16).to(weight.dtype)):
+            raise ValueError(
+                f"{layer.prefix}.weight holds values bf16 cannot represent; "
+                f"{_ROW_INVARIANT_GATES_KEY} multiplies in bf16"
+            )
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert bias is None
+        return torch.ops.vllm.grug_row_invariant_gemm(x, layer.weight).to(x.dtype)
+
+
 class GrugMoeMLP(nn.Module):
     """QB-routed MoE with normalized sigmoid combine weights."""
 
@@ -602,6 +793,8 @@ class GrugMoeMLP(nn.Module):
             skip_bias_add=True,
             prefix=f"{prefix}.router",
         )
+        if cfg.row_invariant_gates:
+            self.router.quant_method = GrugRowInvariantLinearMethod()
         moe_router = GrugMoeRouter(
             top_k=cfg.num_experts_per_token,
             global_num_experts=cfg.num_experts,
@@ -947,6 +1140,8 @@ class GrugMoeAttention(nn.Module):
             disable_tp=True,
             prefix=f"{prefix}.attn_gate",
         )
+        if cfg.row_invariant_gates:
+            self.attn_gate.quant_method = GrugRowInvariantLinearMethod()
         self.sconv_k = (
             GrugMoeShortConv(
                 self.kv_size,
@@ -1156,7 +1351,10 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
         if hf_config is None:
             hf_config = vllm_config.model_config.hf_config
-        self.config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
+        self.config = replace(
+            GrugMoeRuntimeConfig.from_hf_config(hf_config),
+            row_invariant_gates=_row_invariant_gates(vllm_config),
+        )
         if not self.config.disable_pko:
             raise NotImplementedError(
                 "GrugMoE does not support Partial Key Offset; export a checkpoint "
@@ -1289,6 +1487,14 @@ def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
             f"{parallel_config.tensor_parallel_size} != "
             f"{get_tensor_model_parallel_world_size()}"
         )
+    if _row_invariant_gates(vllm_config):
+        if not current_platform.is_cuda():
+            raise NotImplementedError(f"{_ROW_INVARIANT_GATES_KEY} requires CUDA")
+        if vllm_config.model_config.dtype != torch.bfloat16:
+            raise ValueError(
+                f"{_ROW_INVARIANT_GATES_KEY} requires dtype=bfloat16, got "
+                f"{vllm_config.model_config.dtype}"
+            )
 
 
 _EXPERT_WEIGHT_MAPPING: tuple[tuple[str, str, str], ...] = (
@@ -1508,4 +1714,5 @@ __all__ = [
     "GrugMoeRuntimeConfig",
     "GrugMoeRouter",
     "get_grug_moe_runtime_info",
+    "grug_row_invariant_gemm",
 ]
