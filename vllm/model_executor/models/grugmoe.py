@@ -54,6 +54,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.grugmoe import (
     grug_moe_layer_types,
+    grug_moe_rope_parameters,
     grug_moe_rope_theta,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -232,6 +233,7 @@ class GrugMoeRuntimeConfig:
     sconv_sites: tuple[str, ...] = ("k", "attn", "mlp")
     tie_word_embeddings: bool = False
     rope_theta: float = 10000.0
+    rope_parameters: dict[str, Any] | None = None
 
     @classmethod
     def from_hf_config(cls, config: Any) -> "GrugMoeRuntimeConfig":
@@ -315,6 +317,7 @@ class GrugMoeRuntimeConfig:
                 _config_attr(config, ("tie_word_embeddings",), False)
             ),
             rope_theta=grug_moe_rope_theta(config),
+            rope_parameters=grug_moe_rope_parameters(config),
         ).validate()
 
     @property
@@ -658,12 +661,20 @@ class GrugMoeMLP(nn.Module):
             return routed_output
         return _apply_grug_linear(self.latent_up_proj, routed_output)
 
+    def _router_logits(self, x: torch.Tensor) -> torch.Tensor:
+        logits = _apply_grug_linear(self.router, x.float())
+        if self.cfg.is_hero:
+            # Native Hero's dot has the hidden dtype, then casts to FP32 for
+            # QB bias/top-k. Round before adding the independently FP32 bias.
+            return logits.to(x.dtype).float()
+        return logits
+
     def _forward_torch_reference(
         self,
         x_flat: torch.Tensor,
         routed_input: torch.Tensor,
     ) -> torch.Tensor:
-        router_logits = _apply_grug_linear(self.router, x_flat.float())
+        router_logits = self._router_logits(x_flat)
         combine_weights, selected = self.experts.router.select_experts(
             hidden_states=x_flat,
             router_logits=router_logits,
@@ -710,7 +721,7 @@ class GrugMoeMLP(nn.Module):
         if not x_flat.is_cuda and not current_platform.is_tpu():
             out = self._forward_torch_reference(x_flat, routed_input)
             return out.to(x.dtype).reshape(orig_shape)
-        router_logits = _apply_grug_linear(self.router, x_flat.float())
+        router_logits = self._router_logits(x_flat)
         out = self.experts(
             hidden_states=routed_input,
             router_logits=router_logits,
@@ -950,7 +961,7 @@ class GrugMoeAttention(nn.Module):
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=cfg.max_seq_len,
-            rope_parameters={
+            rope_parameters=cfg.rope_parameters or {
                 "rope_theta": cfg.rope_theta,
                 "partial_rotary_factor": 0.5,
             },
