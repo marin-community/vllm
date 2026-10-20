@@ -3,6 +3,7 @@
 
 import contextlib
 import json
+import math
 import os
 import tempfile
 from dataclasses import replace
@@ -25,6 +26,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.grugmoe import (
     _ROUTER_COMBINE_WEIGHT_EPS,
     _ROUTER_COMBINE_WEIGHT_SUM,
@@ -149,7 +151,12 @@ def _reference_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
             F.linear(x_flat, module.latent_down_proj.weight),
             module.latent_norm,
         )
-    router_logits = F.linear(x_flat.float(), module.router.weight.float())
+    if cfg.is_hero:
+        router_logits = F.linear(
+            x_flat, module.router.weight.to(x_flat.dtype)
+        ).float()
+    else:
+        router_logits = F.linear(x_flat.float(), module.router.weight.float())
     _, top_indices = torch.topk(
         router_logits + module.router.bias.float(),
         k=cfg.num_experts_per_token + 1,
@@ -985,7 +992,8 @@ def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type():
     torch.testing.assert_close(global_capture.v, v)
 
 
-def test_grug_moe_attention_schedule_matches_training_architecture():
+@pytest.mark.parametrize("use_yarn", [False, True])
+def test_grug_moe_attention_schedule_matches_training_architecture(use_yarn):
     cfg = GrugMoeRuntimeConfig(
         vocab_size=32,
         hidden_dim=8,
@@ -1004,6 +1012,20 @@ def test_grug_moe_attention_schedule_matches_training_architecture():
         disable_pko=True,
         disable_long_rope=True,
     ).validate()
+
+    if use_yarn:
+        cfg = replace(
+            cfg,
+            max_seq_len=65536,
+            rope_parameters={
+                "rope_type": "yarn",
+                "rope_theta": cfg.rope_theta,
+                "partial_rotary_factor": 0.5,
+                "factor": 4.0,
+                "original_max_position_embeddings": 16384,
+                "attention_factor": 1.0 + 0.1 * math.log(4.0),
+            },
+        )
 
     short_layer = GrugMoeDecoderLayer(
         cfg,
@@ -1161,8 +1183,10 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_grug_moe_cuda_accepts_bf16_expert_weights():
+@pytest.mark.parametrize("hero_profile", [False, True])
+def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
     cfg = GrugMoeRuntimeConfig(
+        artifact_schema_version=2 if hero_profile else 1,
         vocab_size=64,
         hidden_dim=16,
         intermediate_dim=16,
@@ -1192,6 +1216,8 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights():
 
     with torch.no_grad():
         _fill_parameter(mlp.router.weight, -0.35, 0.4)
+        if hero_profile:
+            mlp.router.weight.copy_(mlp.router.weight.bfloat16().float())
         _fill_parameter(mlp.router.bias, 0.25, -0.15)
         routed_experts = mlp.experts.routed_experts
         _fill_parameter(
@@ -1426,3 +1452,96 @@ def test_grug_moe_registry_imports():
 
     assert model_cls is not None
     assert model_cls.__name__ == "GrugMoeForCausalLM"
+
+
+@pytest.mark.parametrize("rope_fused", [True, False])
+def test_hero_yarn_config_roundtrip_and_partial_rotation_at_65k(rope_fused):
+    scaling = {
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 16384,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "mscale": 1.0,
+        "attention_factor": 1.0 + 0.1 * math.log(4.0),
+    }
+    config = GrugMoeConfig(
+        vocab_size=32,
+        hidden_size=128,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=128,
+        max_position_embeddings=65536,
+        grugmoe_artifact_schema_version=2,
+        rope_fused=rope_fused,
+        rope_theta=10000.0,
+        rope_scaling=scaling,
+        partial_rotary_factor=0.5,
+    )
+    config = GrugMoeConfig.from_dict(config.to_dict())
+    cfg = GrugMoeRuntimeConfig.from_hf_config(config)
+    rotary = get_rope(
+        cfg.inferred_head_dim,
+        max_position=cfg.max_seq_len,
+        rope_parameters=cfg.rope_parameters,
+        is_neox_style=not cfg.rope_fused,
+        dtype=torch.float32,
+    )
+    positions = torch.tensor([0, 16383, 32767, 65535])
+    query = torch.linspace(-0.5, 0.5, 4 * 128).reshape(4, 128)
+    actual, actual_key = rotary.forward_native(positions, query, query)
+
+    # Independent complex rotation in float64. The production cache computes
+    # phases in float32; at 65K its phase quantization contributes up to 0.002.
+    rotary_dim = 64
+    indices = torch.arange(rotary_dim // 2, dtype=torch.float64)
+    low = max(
+        math.floor(
+            rotary_dim * math.log(16384 / (32 * 2 * math.pi)) / (2 * math.log(10000))
+        ),
+        0,
+    )
+    high = min(
+        math.ceil(
+            rotary_dim * math.log(16384 / (2 * math.pi)) / (2 * math.log(10000))
+        ),
+        rotary_dim - 1,
+    )
+    ramp = ((indices - low) / (high - low)).clamp(0, 1)
+    inverse_frequency = torch.pow(10000.0, -2 * indices / rotary_dim) * (
+        1 - ramp + ramp / 4
+    )
+    phase = positions.double()[:, None] * inverse_frequency[None, :]
+    rotated = query[:, :rotary_dim].double()
+    if rope_fused:
+        pairs = torch.complex(rotated[:, 0::2], rotated[:, 1::2])
+    else:
+        pairs = torch.complex(rotated[:, :32], rotated[:, 32:])
+    result = pairs * torch.polar(
+        torch.full_like(phase, scaling["attention_factor"]), phase
+    )
+    expected = query.double().clone()
+    if rope_fused:
+        expected[:, :rotary_dim] = torch.stack(
+            (result.real, result.imag), dim=-1
+        ).flatten(-2)
+    else:
+        expected[:, :rotary_dim] = torch.cat((result.real, result.imag), dim=-1)
+    torch.testing.assert_close(actual.double(), expected, atol=0.003, rtol=0)
+    torch.testing.assert_close(actual_key, actual)
+    torch.testing.assert_close(actual[:, 64:], query[:, 64:], atol=0, rtol=0)
+
+
+def test_hero_yarn_rejects_full_dimension_amplitude_rescaling():
+    # DeepSeek's all-dimension temperature convention would alter Hero's
+    # unrotated half; importing it silently must fail at the config boundary.
+    with pytest.raises(ValueError, match="partial Q/K amplitude"):
+        GrugMoeConfig(
+            max_position_embeddings=65536,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 16384,
+                "mscale_all_dim": 1.0,
+            },
+        )

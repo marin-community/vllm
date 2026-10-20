@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from types import SimpleNamespace
 from typing import Any
 
@@ -51,6 +52,73 @@ def grug_moe_rope_theta(config: Any) -> float:
     if hasattr(rope, "theta"):
         return float(rope.theta)
     return 10000.0
+
+
+def grug_moe_rope_parameters(config: Any) -> dict[str, Any]:
+    """Resolve Hero's partial RoPE without changing its amplitude convention."""
+    parameters = dict(getattr(config, "rope_parameters", None) or {})
+    scaling = dict(getattr(config, "rope_scaling", None) or {})
+    scaling_type = scaling.get("rope_type", scaling.get("type", "default"))
+    parameter_type = parameters.get("rope_type", parameters.get("type", "default"))
+    if scaling and parameter_type == "default":
+        parameters = scaling
+    elif scaling and any(
+        parameters.get(key, value) != value for key, value in scaling.items()
+    ):
+        raise ValueError("Conflicting GrugMoE rope_scaling and rope_parameters")
+    rope_type = parameters.get("rope_type", parameters.get("type", "default"))
+    if rope_type not in ("default", "yarn"):
+        raise ValueError("GrugMoE supports only default RoPE and explicit YaRN")
+    partial = parameters.get(
+        "partial_rotary_factor", getattr(config, "partial_rotary_factor", 0.5)
+    )
+    if partial != 0.5 or "rope_dim" in parameters:
+        raise ValueError("GrugMoE rotates exactly half of each attention head")
+    result = {
+        "rope_type": rope_type,
+        "rope_theta": grug_moe_rope_theta(config),
+        "partial_rotary_factor": 0.5,
+    }
+    if rope_type == "default":
+        if parameters.get("factor", 1.0) != 1.0 or scaling_type != "default":
+            raise ValueError("Non-default GrugMoE RoPE requires an explicit rope_type")
+        return result
+
+    factor = float(parameters["factor"])
+    original = int(parameters["original_max_position_embeddings"])
+    beta_fast = float(parameters.get("beta_fast", 32))
+    beta_slow = float(parameters.get("beta_slow", 1))
+    mscale = float(parameters.get("mscale", 1.0))
+    amplitude = 1.0 + 0.1 * mscale * math.log(factor)
+    explicit_amplitude = float(parameters.get("attention_factor", amplitude))
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (factor, beta_fast, beta_slow, mscale, amplitude)
+        )
+        or factor < 1
+        or original <= 0
+        or not beta_fast > beta_slow > 0
+        or amplitude <= 0
+        or not math.isclose(explicit_amplitude, amplitude, rel_tol=1e-12, abs_tol=1e-12)
+        or parameters.get("mscale_all_dim", 0.0) not in (None, 0.0)
+        or parameters.get("truncate", True) is not True
+    ):
+        raise ValueError(
+            "YaRN parameters must preserve Hero's partial Q/K amplitude convention"
+        )
+    maximum = int(getattr(config, "max_position_embeddings", original * factor))
+    if maximum > original * factor:
+        raise ValueError("GrugMoE context exceeds the pinned YaRN cache extent")
+    result.update(
+        factor=factor,
+        original_max_position_embeddings=original,
+        beta_fast=beta_fast,
+        beta_slow=beta_slow,
+        mscale=mscale,
+        attention_factor=explicit_amplitude,
+    )
+    return result
 
 
 class GrugMoeConfig(PretrainedConfig):
@@ -202,8 +270,15 @@ class GrugMoeConfig(PretrainedConfig):
             grugmoe_artifact_schema_version
         )
         self.rope = rope
-        self.rope_parameters = rope_parameters
-        self.rope_scaling = rope_scaling
+        self.rope_parameters = grug_moe_rope_parameters(
+            SimpleNamespace(
+                rope_theta=rope_theta,
+                rope_parameters=rope_parameters,
+                rope_scaling=rope_scaling,
+                partial_rotary_factor=kwargs.get("partial_rotary_factor", 0.5),
+                max_position_embeddings=max_position_embeddings,
+            )
+        )
         self.rope_theta = rope_theta
         self.use_cache = use_cache
 
@@ -280,4 +355,5 @@ __all__ = [
     "GrugMoeConfig",
     "grug_moe_layer_types",
     "grug_moe_rope_theta",
+    "grug_moe_rope_parameters",
 ]
