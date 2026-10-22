@@ -489,7 +489,14 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
         "sliding_attention",
         "full_attention",
     ]
-    assert runtime_config == _tiny_hero_config()
+    assert runtime_config == replace(
+        _tiny_hero_config(),
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5,
+        },
+    )
     assert vllm_config.model_config.is_hybrid is True
     assert vllm_config.model_config.has_inner_state is True
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
