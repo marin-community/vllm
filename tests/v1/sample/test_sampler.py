@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -23,6 +25,34 @@ DEVICES = [
     for i in range(1 if current_platform.device_count() == 1 else 2)
 ]
 MAX_NUM_PROMPT_TOKENS = 64
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("batch_size", [1, 130])
+def test_logprobs_preserve_small_tails_beside_dominant_token(
+    device, dtype, batch_size
+):
+    vocab_size = 128256
+    logits = torch.full((batch_size, vocab_size), -100.0, device=device, dtype=dtype)
+    indices = torch.arange(0, vocab_size, 1024, device=device)
+    logits[:, indices] = -17.0
+    logits[:, 0] = 0.0
+
+    logprobs = Sampler.compute_logprobs(logits)
+    tail_count = indices.numel() - 1
+    normalizer = math.log1p(
+        tail_count * math.exp(-17) + (vocab_size - tail_count - 1) * math.exp(-100)
+    )
+    torch.testing.assert_close(
+        logprobs[:, 0],
+        torch.full((batch_size,), -normalizer, device=device, dtype=torch.float32),
+        rtol=0,
+        atol=1e-10,
+    )
+    mass = logprobs.double().exp().sum(dim=-1)
+    torch.testing.assert_close(mass, torch.ones_like(mass), rtol=0, atol=1e-8)
+    assert torch.all(logprobs.topk(128).values.double().exp().sum(dim=-1) <= 1 + 1e-8)
 
 
 def _create_fake_logits(batch_size: int, vocab_size: int) -> torch.Tensor:

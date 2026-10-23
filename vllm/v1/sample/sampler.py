@@ -16,6 +16,7 @@ from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 _SAMPLING_EPS = 1e-5
+_LOGPROB_NORMALIZATION_ROWS = 64
 
 
 class Sampler(nn.Module):
@@ -304,7 +305,16 @@ class Sampler(nn.Module):
 
     @staticmethod
     def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
-        return logits.log_softmax(dim=-1, dtype=torch.float32)
+        # Float32 reductions can lose small tails beside a dominant token,
+        # producing probabilities whose sum exceeds one even on CUDA.
+        # Bound the float64 temporary during large prompt-prefill batches.
+        logprobs = torch.empty_like(logits, dtype=torch.float32)
+        for start in range(0, logits.shape[0], _LOGPROB_NORMALIZATION_ROWS):
+            stop = start + _LOGPROB_NORMALIZATION_ROWS
+            logprobs[start:stop].copy_(
+                logits[start:stop].log_softmax(dim=-1, dtype=torch.float64)
+            )
+        return logprobs
 
     @staticmethod
     def gather_logprobs(
