@@ -214,7 +214,15 @@ def _configure_headless_dp_rank(
 
 
 def _run_headless_multiproc_executors(vllm_config: VllmConfig) -> NoReturn:
-    """Launch follower executors without scheduler cores or engine handshakes."""
+    """Launch follower executors without scheduler cores or engine handshakes.
+
+    Native 0.30 launches one follower even with multiple node-local DP ranks.
+    Keep one executor and identity/device shard per rank. Native per-rank CLI
+    launches could do this externally, but move the same rank/lifecycle work to
+    the deployment. Remove when native headless launch handles local DP ranks;
+    verify headless DP identities, GPU slices and the multi-node serving gate.
+    https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/entrypoints/cli/serve.py#L225
+    """
     parallel_config = vllm_config.parallel_config
     context = get_mp_context()
     processes = []

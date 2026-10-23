@@ -74,6 +74,9 @@ try:
             to adjust worker ranks after we create all workers.
             """
             if self.rpc_rank in rank_mapping:
+                # Native 0.30 remaps only RPC rank, but initialize_from_config
+                # indexes KV caches by global_rank. Remove when native remaps
+                # both; verify remapped KV selection and distributed Ray serving.
                 new_rank = rank_mapping[self.rpc_rank]
                 self.rpc_rank = new_rank
                 self.global_rank = new_rank

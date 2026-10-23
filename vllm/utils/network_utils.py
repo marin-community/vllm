@@ -130,7 +130,16 @@ def join_host_port(host: str, port: int) -> str:
 
 
 def resolve_ipv4_host(host: str, port: int) -> str:
-    """Resolve hostnames before handing them to native network clients."""
+    """Resolve hostnames before handing them to native network clients.
+
+    Torch 2.14.1 TCPStore resolves names in C++, so a Python getaddrinfo patch
+    cannot constrain its address family. IPv4-only deployments opt in here;
+    native get_ip() already chooses an IPv4 node address. Remove this adapter
+    when TCPStore exposes an address-family option or all configured endpoints
+    are numeric. Verify real TCPStore startup and cross-node DP rendezvous;
+    tests/test_env_override_ipv4.py exercises the hostname-to-store boundary.
+    https://github.com/pytorch/pytorch/blob/v2.14.1/torch/csrc/distributed/c10d/socket.cpp
+    """
     if not force_ipv4_enabled():
         return host
     try:

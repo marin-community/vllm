@@ -1,4 +1,10 @@
-"""Emit C date macros from the frozen source timestamp for Rust dependencies."""
+"""Emit C date macros from the frozen source timestamp for Rust dependencies.
+
+Mimalloc still embedded wall-clock time through sccache 0.8.1 after the OpenSSL
+epoch and Rust1.99 symbol layout were fixed. Remove when native date macros
+honor SOURCE_DATE_EPOCH through the cache; compare uncached frontend binaries
+and complete wheels. The measured reproduction is linked in README.md.
+"""
 
 from __future__ import annotations
 

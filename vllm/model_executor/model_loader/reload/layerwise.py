@@ -186,7 +186,9 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         # Buffer loaded weights, track loading progress
         num_loaded, ret = get_numel_loaded(original_loader, bound_args)
         if ret is False:
-            # Expert loaders report False for weights owned by another rank.
+            # Native 0.30 queues even rejected remote-rank expert weights.
+            # Keep only local weights; remove when upstream honors False here.
+            # Verify test_online_loader_releases_rejected_weight and DP/EP sync.
             return ret
         loaded_weight = bound_args.arguments.get("loaded_weight")
         if (
@@ -195,8 +197,12 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             and loaded_weight.untyped_storage().nbytes()
             > loaded_weight.numel() * loaded_weight.element_size()
         ):
-            # A small view into an IPC bucket would otherwise retain the entire
-            # bucket until this layer has received every local weight.
+            # Native 0.30 retains the full IPC allocation through a tiny view
+            # until the layer is complete. Clone just that view. Remove when
+            # native buffering releases packed storage; verify
+            # test_online_loader_does_not_pin_cuda_bucket and repeated IPC sync.
+            # Both fixes compare against upstream ced6857a's same function:
+            # https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/model_executor/model_loader/reload/layerwise.py#L187
             bound_args.arguments["loaded_weight"] = loaded_weight.clone()
         info.loaded_weights.append((param_name, bound_args))
         info.load_numel += num_loaded

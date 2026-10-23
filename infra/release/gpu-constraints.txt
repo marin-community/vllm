@@ -11,7 +11,7 @@ annotated-doc==0.0.5
 annotated-types==0.8.0
 anthropic==1.11.0
 anyio==4.15.1
-apache-tvm-ffi==0.1.12
+apache-tvm-ffi==0.1.11
 astor==0.8.1
 attrs==26.1.0
 blake3==1.0.10
@@ -183,9 +183,9 @@ supervisor==4.3.0
 sympy==1.14.0
 tabulate==0.10.0
 tiktoken==0.14.0
-tilelang==0.1.14
-tokenizers==0.23.2
-tokenspeed-mla==0.1.9
+tilelang==0.1.12
+tokenizers==0.22.2
+tokenspeed-mla==0.1.8
 tokenspeed-triton==3.8.10.post20260920
 torch==2.14.1+cu132
 torch-c-dlpack-ext==0.1.5
@@ -193,7 +193,7 @@ torchaudio==2.11.0+cpu
 torchcodec==0.17.0+cu132
 torchvision==0.29.1+cu132
 tqdm==4.70.1
-transformers==5.18.0
+transformers==5.12.1
 triton==3.8.0
 truststore==0.10.4
 typer==0.27.2

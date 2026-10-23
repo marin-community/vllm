@@ -71,6 +71,11 @@ logger = init_logger(__name__)
 
 def draft_requires_dp_sync(method: str, is_moe: bool) -> bool:
     """Keep established DP coordination except for dense EAGLE3 drafters."""
+    # Native 0.30 coordinates every draft across target DP ranks, although a
+    # dense EAGLE3 replica needs no MoE collective and may draft independently:
+    # https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/spec_decode/llm_base_proposer.py
+    # Remove when native coordination follows the draft's collective needs;
+    # verify unequal per-rank request counts with dense and MoE draft models.
     return method != "eagle3" or is_moe
 
 

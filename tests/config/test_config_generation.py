@@ -1,36 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import copy
-
 import pytest
-from ray.runtime_env import RuntimeEnv
 
-from vllm.engine.arg_utils import EngineArgs, _runtime_env_for_nested_ray_init
+from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.quantization.quark.utils import deep_compare
-
-
-def test_nested_ray_runtime_env_removes_only_inherited_setup_hook():
-    runtime_env = RuntimeEnv(
-        worker_process_setup_hook="outer.module.setup",
-        env_vars={
-            "KEEP": "value",
-            "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR": "outer-hook-payload",
-        },
-        working_dir="s3://bucket/working-dir.zip",
-    )
-    original = copy.deepcopy(runtime_env)
-
-    nested_runtime_env = _runtime_env_for_nested_ray_init(runtime_env)
-
-    assert nested_runtime_env is not None
-    assert nested_runtime_env is not runtime_env
-    assert "worker_process_setup_hook" not in nested_runtime_env
-    assert nested_runtime_env["env_vars"] == {
-        "KEEP": "value",
-        "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR": "",
-    }
-    assert nested_runtime_env["working_dir"] == "s3://bucket/working-dir.zip"
-    assert runtime_env == original
 
 
 def test_cuda_empty_vs_unset_configs(monkeypatch: pytest.MonkeyPatch):

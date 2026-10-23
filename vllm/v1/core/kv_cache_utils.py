@@ -2215,6 +2215,12 @@ def _co_locate_eagle3_layers(
     kv_cache_spec: dict[str, KVCacheSpec],
     groups: list[KVCacheGroupSpec],
 ) -> None:
+    # Native 0.30 llm_base_proposer selects one KV cache gid for draft layers;
+    # uniform-page grouping can spread a hybrid target's EAGLE3 layers across
+    # several compatible groups. Co-locate only equal specs without changing
+    # page layouts. Remove when native drafting handles multiple cache groups;
+    # verify the existing draft-group regression and real EAGLE3 decode/capture.
+    # https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/spec_decode/llm_base_proposer.py
     speculative_config = vllm_config.speculative_config
     if speculative_config is None or speculative_config.method != "eagle3":
         return

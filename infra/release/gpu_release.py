@@ -20,6 +20,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import tomllib
+
 if __package__:
     from .release_common import (
         RELEASE_REPOSITORY,
@@ -79,6 +81,58 @@ REQUIRED_RUNTIME_GATES = (
     SPARSE_NCCL_GATE,
     SERVE_GATE,
 )
+
+# Coverage for the CUDA/compiler, Pixtral and package-bound workarounds in the
+# 0.30 port. Test removal and retain new causal evidence before extending it.
+# https://github.com/marin-community/vllm/blob/2e5249991b94a79d5d80ad363e8bb0ac30d304a6/infra/release/README.md#gpu-build-configuration
+VERIFIED_WORKAROUND_ABI = {
+    "upstream_base": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+    "torch_version": "2.14.1+cu132",
+    "cuda_toolkit_version": "13.2.2",
+    "cuda_compiler_version": "13.2.86",
+}
+VERIFIED_WORKAROUND_BUILD_IMAGES = {
+    "x86_64": (
+        "pytorch/manylinux2_28-builder:cuda13.2@sha256:"
+        "313d3fa7551f14335d7d3196fb00b94acd97550faf81923b610dfac87dd028af"
+    ),
+    "aarch64": (
+        "pytorch/manylinuxaarch64-builder:cuda13.2@sha256:"
+        "b6294ee66020334c6cb80c4392b2cf88b0722a49ac30ada9ed2126c9c453384d"
+    ),
+}
+VERIFIED_WORKAROUND_DEPENDENCIES = {
+    "torch": "2.14.1+cu132",
+    "torchvision": "0.29.1+cu132",
+    "torchaudio": "2.11.0+cpu",
+    "apache-tvm-ffi": "0.1.11",
+    "tilelang": "0.1.12",
+    "tokenspeed-mla": "0.1.8",
+    # Native JIT/linker paths and the paired compiler/kernel interface.
+    "flashinfer-python": "0.6.18.post1",
+    "flashinfer-cubin": "0.6.18.post1",
+    # Match the actual Marin/MSRL runtime. Native 0.30 Pixtral imports,
+    # rotary construction and grid positions work with this API; the 5.17+
+    # branch is removed rather than carried into the wheel.
+    "transformers": "5.12.1",
+    "tokenizers": "0.22.2",
+    "nvidia-cudnn-frontend": "1.30.0",
+    "nvidia-cutlass-dsl": "4.7.1",
+    "setuptools": "80.10.2",
+    # CMake stale-tool-path detection and native SCM/Rust tag discovery.
+    "cmake": "4.4.4",
+    "ninja": "1.13.2",
+    "setuptools-scm": "10.3.4",
+    "setuptools-rust": "1.13.0",
+    "cuda-toolkit": "13.2.2",
+    "nvidia-cuda-nvcc": "13.2.86",
+    "nvidia-cuda-cccl": "13.2.86",
+    "nvidia-cuda-crt": "13.2.86",
+    "nvidia-cuda-nvrtc": "13.2.86",
+    "nvidia-nvvm": "13.2.86",
+    "nvidia-nccl-cu13": "2.30.7",
+    "uvloop": "0.23.0",
+}
 
 
 def _expand_wheel_tag(tag: str) -> set[str]:
@@ -628,7 +682,59 @@ def finalize_release(
     return released
 
 
+def require_verified_workaround_inputs(config: dict[str, Any]) -> None:
+    """Reject uncovered dependency changes before starting a wheel build."""
+    actual_abi = {name: config[name] for name in VERIFIED_WORKAROUND_ABI}
+    if actual_abi != VERIFIED_WORKAROUND_ABI:
+        raise ReleaseError(
+            f"unverified workaround ABI: {actual_abi}; test removal and record "
+            "new necessity evidence before extending coverage"
+        )
+    root = Path(__file__).resolve().parents[2]
+    # The actual installer selects sccache in Dockerfile. Check its download and
+    # extraction versions rather than introduce a second build configuration.
+    dockerfile = (root / "docker/Dockerfile").read_text()
+    sccache_versions = set(re.findall(r"sccache-v([\d.]+)-", dockerfile))
+    sccache_versions.update(
+        re.findall(r"sccache/releases/download/v([\d.]+)/", dockerfile)
+    )
+    if sccache_versions != {"0.8.1"}:
+        raise ReleaseError("unverified sccache input for retained compiler workarounds")
+    rust = tomllib.loads((root / "rust-toolchain.toml").read_text())
+    if rust["toolchain"]["channel"] != "1.99.0":
+        raise ReleaseError("unverified Rust toolchain for retained build workarounds")
+    compiler = load_json(Path(__file__).with_name("cuda-compiler-inputs.json"))
+    if compiler["compiler_version"] != config["cuda_compiler_version"]:
+        raise ReleaseError("compiler wheel inputs disagree with workaround coverage")
+    for architecture in config["platforms"]:
+        if (
+            config["platforms"][architecture]["build_base_image"]
+            != VERIFIED_WORKAROUND_BUILD_IMAGES.get(architecture)
+        ):
+            raise ReleaseError(
+                f"unverified {architecture} builder image for compiler overlay; "
+                "test removal and record necessity before extending coverage"
+            )
+        text = Path(__file__).with_name(_constraints_filename(architecture)).read_text()
+        pins = dict(re.findall(r"(?m)^([\w.-]+)\s*==\s*([^\s;#]+)", text))
+        selected = {
+            name: pins.get(name) for name in VERIFIED_WORKAROUND_DEPENDENCIES
+        }
+        if selected != VERIFIED_WORKAROUND_DEPENDENCIES:
+            raise ReleaseError(
+                f"unverified {architecture} workaround dependencies: {selected}; "
+                "test removal and record new necessity evidence before "
+                "extending coverage"
+            )
+        if any(
+            item["version"] != config["cuda_compiler_version"]
+            for item in compiler["platforms"][architecture]
+        ):
+            raise ReleaseError("unverified compiler wheel cohort")
+
+
 def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    require_verified_workaround_inputs(config)
     includes = []
     for architecture, platform in config["platforms"].items():
         includes.append(
