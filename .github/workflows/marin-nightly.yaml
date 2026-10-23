@@ -111,6 +111,10 @@ jobs:
 
       - name: Serve and gate on one H100
         id: iris
+        # Iris forwards the submitter's CoreWeave keys to the target cluster.
+        env:
+          CW_KEY_ID: ${{ secrets.CW_ACCESS_KEY_ID }}
+          CW_KEY_SECRET: ${{ secrets.CW_SECRET_ACCESS_KEY }}
         # --gpu is gated behind --enable-extra-resources by iris. --no-sync stops iris from
         # syncing the bundled workspace; run_h100.sh builds its own venv. Iris excludes
         # tests/ by default, so --include restores the test suite for the GPU gate.
