@@ -418,7 +418,10 @@ jobs:
       - name: Validate the built wheel on ${{ matrix.hardware }}
         id: iris
         continue-on-error: true
+        # Iris forwards the submitter's CoreWeave keys to the target cluster.
         env:
+          CW_KEY_ID: ${{ secrets.CW_ACCESS_KEY_ID }}
+          CW_KEY_SECRET: ${{ secrets.CW_SECRET_ACCESS_KEY }}
           JOB_NAME: vllm-release-${{ matrix.hardware }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
           MODEL: Qwen/Qwen3-0.6B
         run: |
