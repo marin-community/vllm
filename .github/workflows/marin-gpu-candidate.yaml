@@ -401,8 +401,9 @@ jobs:
           project_id: hai-gcp-models
 
       - name: Install the Iris client
+        # This floor has --include for test files excluded from bundles by default (marin#10286).
         run: |
-          uv tool install --prerelease allow "marin-core>=0.2.46.dev202607131620"
+          uv tool install --prerelease allow "marin-core>=0.2.206.dev39408141072"
           echo "$(uv tool dir)/marin-core/bin" >> "$GITHUB_PATH"
 
       - name: Locate this run's wheel artifact
@@ -418,7 +419,8 @@ jobs:
       - name: Validate the built wheel on ${{ matrix.hardware }}
         id: iris
         continue-on-error: true
-        # Iris forwards the submitter's CoreWeave keys to the target cluster.
+        # Iris forwards the submitter's CoreWeave keys to the target cluster. Iris excludes
+        # tests/ from bundles by default, so --include adds the source tests back.
         env:
           CW_KEY_ID: ${{ secrets.CW_ACCESS_KEY_ID }}
           CW_KEY_SECRET: ${{ secrets.CW_SECRET_ACCESS_KEY }}
@@ -441,6 +443,7 @@ jobs:
             --disk 200GB \
             --env-vars GH_TOKEN "$GH_TOKEN" \
             --no-sync \
+            --include 'validation-source/tests/**/*' \
             --max-retries 0 \
             --timeout 2400 \
             -- uv run --no-project --python 3.12 python \
