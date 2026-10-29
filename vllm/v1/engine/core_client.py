@@ -6,6 +6,7 @@ import queue
 import sys
 import uuid
 import weakref
+import zlib
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Sequence
@@ -1545,11 +1546,17 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
-        if (eng_index := request.data_parallel_rank) is None and (
-            eng_index := get_late_interaction_engine_index(
+        eng_index = request.data_parallel_rank
+        if eng_index is None:
+            eng_index = get_late_interaction_engine_index(
                 request.pooling_params, len(self.core_engines)
             )
-        ) is None:
+        if eng_index is None and request.session_id:
+            # Keep a conversation's prefix cache local across API processes.
+            eng_index = zlib.crc32(request.session_id.encode("utf-8")) % len(
+                self.core_engines
+            )
+        if eng_index is None:
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
