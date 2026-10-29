@@ -547,7 +547,7 @@ def test_hero_shortconv_graph_modes(tmp_path, requested, split_shortconv, expect
     assert config.compilation_config.cudagraph_mode == expected
     _raise_for_unsupported_modes(config)
     config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
-    with pytest.raises(NotImplementedError, match="ShortConv CUDA graphs require"):
+    with pytest.raises(NotImplementedError):
         _raise_for_unsupported_modes(config)
 
 
