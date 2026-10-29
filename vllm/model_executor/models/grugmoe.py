@@ -784,8 +784,6 @@ class GrugMoeShortConv(MambaBase, nn.Module):
             [num_decodes, num_prefill_tokens],
             dim=0,
         )
-        pieces: list[torch.Tensor] = []
-
         if attn_metadata.num_prefills > 0:
             assert attn_metadata.state_indices_tensor_p is not None
             prefill_output = causal_conv1d_fn(
@@ -801,23 +799,19 @@ class GrugMoeShortConv(MambaBase, nn.Module):
                     attn_metadata if attn_metadata.nums_dict is not None else None
                 ),
             ).transpose(0, 1)[:num_prefill_tokens]
-            pieces.append(prefill_output)
+            output[num_decodes:num_actual_tokens].copy_(prefill_output)
 
         if num_decodes > 0:
             assert attn_metadata.state_indices_tensor_d is not None
-            decode_output = torch.empty_like(decode)
-            decode_output = causal_conv1d_update(
+            causal_conv1d_update(
                 decode.contiguous(),
                 conv_state,
                 conv_weight,
                 None,
                 activation=None,
                 conv_state_indices=attn_metadata.state_indices_tensor_d,
-                out=decode_output,
+                out=output[:num_decodes],
             )
-            pieces.insert(0, decode_output)
-
-        output[:num_actual_tokens] = torch.vstack(pieces)
         if num_actual_tokens < output.shape[0]:
             output[num_actual_tokens:].zero_()
 
