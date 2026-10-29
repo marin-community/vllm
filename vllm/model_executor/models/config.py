@@ -468,9 +468,16 @@ class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
         from vllm.config import CUDAGraphMode
 
         compilation_config = vllm_config.compilation_config
+        if (
+            compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+            and "vllm::grug_moe_short_conv"
+            in (compilation_config.splitting_ops or [])
+        ):
+            return
         if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             logger.warning_once(
-                "GrugMoE ShortConv does not support CUDA graphs; "
+                "GrugMoE ShortConv requires PIECEWISE CUDA graphs with "
+                "vllm::grug_moe_short_conv excluded through splitting_ops; "
                 "overriding cudagraph_mode to NONE."
             )
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
