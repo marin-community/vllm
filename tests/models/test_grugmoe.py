@@ -502,6 +502,55 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
 
+@pytest.mark.parametrize(
+    ("requested", "split_shortconv", "expected"),
+    [
+        ("NONE", False, CUDAGraphMode.NONE),
+        ("PIECEWISE", False, CUDAGraphMode.NONE),
+        ("PIECEWISE", True, CUDAGraphMode.PIECEWISE),
+        ("FULL", True, CUDAGraphMode.NONE),
+        ("FULL_AND_PIECEWISE", True, CUDAGraphMode.NONE),
+    ],
+)
+def test_hero_shortconv_graph_modes(tmp_path, requested, split_shortconv, expected):
+    GrugMoeConfig(
+        grugmoe_artifact_schema_version=2,
+        architectures=["GrugMoeForCausalLM"],
+        vocab_size=32,
+        hidden_size=16,
+        moe_intermediate_size=6,
+        shared_expert_intermediate_size=5,
+        num_experts=4,
+        num_experts_per_tok=2,
+        latent_dim=8,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        local_kv_heads=1,
+        global_kv_heads=2,
+        head_dim=4,
+        max_position_embeddings=128,
+        sliding_window=128,
+        global_every=1,
+        sconv=True,
+    ).save_pretrained(tmp_path)
+    config = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        compilation_config={
+            "mode": 3,
+            "cudagraph_mode": requested,
+            "splitting_ops": ["vllm::grug_moe_short_conv"] if split_shortconv else [],
+        },
+    ).create_engine_config()
+    assert config.compilation_config.cudagraph_mode == expected
+    _raise_for_unsupported_modes(config)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    with pytest.raises(NotImplementedError, match="ShortConv CUDA graphs require"):
+        _raise_for_unsupported_modes(config)
+
+
 def test_grug_moe_config_rejects_noncanonical_layer_types():
     with pytest.raises(
         ValueError,
@@ -616,6 +665,7 @@ def _minimal_vllm_config_for_mode_check(
     )
     return SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=tensor_parallel_size),
+        model_config=None,
         lora_config=None,
         quant_config=quant_config,
     )
