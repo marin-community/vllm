@@ -1190,6 +1190,47 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hero_grug_moe_sconv_padded_decode_zeros_inactive_rows():
+    prefix = "hero.sconv.padding"
+    module = GrugMoeShortConv(2, 4, torch.bfloat16, None, prefix).cuda()
+    module.weight.data.fill_(1)
+    module.kv_cache = (torch.zeros(2, 3, 2, device="cuda", dtype=torch.bfloat16),)
+    metadata = ShortConvAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_reqs=1,
+        query_start_loc_p=None,
+        has_initial_states_p=None,
+        state_indices_tensor_p=torch.empty(0, device="cuda", dtype=torch.int32),
+        state_indices_tensor_d=torch.tensor([1], device="cuda", dtype=torch.int32),
+        num_accepted_tokens=None,
+        query_start_loc_d=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        block_idx_last_scheduled_token_prev_step=None,
+        num_computed_tokens_p=None,
+        seq_lens=torch.tensor([1], device="cuda"),
+    )
+    for value, expected in ((2.0, 2.0), (3.0, 5.0)):
+        hidden = torch.full((4, 2), float("nan"), device="cuda", dtype=torch.bfloat16)
+        hidden[0].fill_(value)
+        output = torch.full_like(hidden, float("nan"))
+        with set_forward_context(
+            {prefix: metadata}, get_current_vllm_config(), num_tokens=4
+        ):
+            torch.ops.vllm.grug_moe_short_conv(hidden, output, prefix)
+        torch.testing.assert_close(
+            output[0], torch.full_like(output[0], expected), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            output[1:], torch.zeros_like(output[1:]), rtol=0, atol=0
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("hero_profile", [False, True])
 def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
     cfg = GrugMoeRuntimeConfig(

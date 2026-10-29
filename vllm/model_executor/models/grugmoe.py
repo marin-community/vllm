@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -829,6 +829,8 @@ class GrugMoeShortConv(MambaBase, nn.Module):
             pieces.insert(0, decode_output)
 
         output[:num_actual_tokens] = torch.vstack(pieces)
+        if num_actual_tokens < output.shape[0]:
+            output[num_actual_tokens:].zero_()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         output = torch.empty_like(hidden_states)
@@ -1267,6 +1269,21 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
 def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
     is_tpu = current_platform.is_tpu()
+    model_config = vllm_config.model_config
+    if (
+        not is_tpu
+        and model_config is not None
+        and getattr(model_config.hf_text_config, "sconv", False)
+    ):
+        compilation = vllm_config.compilation_config
+        if compilation.cudagraph_mode != CUDAGraphMode.NONE and (
+            compilation.cudagraph_mode != CUDAGraphMode.PIECEWISE
+            or "vllm::grug_moe_short_conv" not in (compilation.splitting_ops or [])
+        ):
+            raise NotImplementedError(
+                "GrugMoE ShortConv CUDA graphs require PIECEWISE mode with "
+                "vllm::grug_moe_short_conv excluded through splitting_ops"
+            )
     if vllm_config.lora_config is not None:
         raise NotImplementedError("GrugMoE does not support LoRA")
     quant_config = vllm_config.quant_config
