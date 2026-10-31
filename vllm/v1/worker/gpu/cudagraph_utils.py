@@ -155,6 +155,33 @@ class CudaGraphManager:
         self.compilation_config = vllm_config.compilation_config
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
+        if self.compilation_config.cudagraph_local_dp:
+            parallel = vllm_config.parallel_config
+            required_splits = {
+                "vllm::moe_forward",
+                "vllm::moe_forward_shared",
+                "vllm::grug_moe_experts_out",
+                "vllm::grug_moe_short_conv",
+            }
+            if (
+                cudagraph_mode != CUDAGraphMode.PIECEWISE
+                or parallel.tensor_parallel_size != 1
+                or parallel.pipeline_parallel_size != 1
+                or parallel.data_parallel_size <= 1
+                or not parallel.enable_expert_parallel
+                or parallel.all2all_backend != "allgather_reducescatter"
+                or parallel.enable_dbo
+                or vllm_config.speculative_config is not None
+                or vllm_config.lora_config is not None
+                or not required_splits.issubset(
+                    self.compilation_config.splitting_ops or []
+                )
+            ):
+                raise ValueError(
+                    "cudagraph_local_dp requires PIECEWISE TP1/PP1 GrugMoE "
+                    "with AG/RS expert parallelism and buffered MoE/ShortConv "
+                    "excluded from graphs; DBO, speculation and LoRA are unsupported"
+                )
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
         # DBO supports FULL CUDA graphs only.

@@ -647,6 +647,13 @@ class CompilationConfig:
     Warning: This flag is new and subject to change in addition
     more modes may be added.
     """
+    cudagraph_local_dp: bool = False
+    """Pad each DP rank independently for PIECEWISE CUDA graphs.
+
+    Currently requires TP1/PP1 GrugMoE with AG/RS expert parallelism,
+    caller-owned expert outputs and MoE/ShortConv outside the graphs.
+    Full graphs, DBO, speculative decoding and LoRA are unsupported.
+    """
     cudagraph_num_of_warmups: int = 0
     """Number of warmup runs for cudagraph.
     It means the first several runs will be treated as warmup runs.

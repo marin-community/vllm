@@ -28,7 +28,8 @@ class DPSyncState:
     """
 
     # Per-rank token counts, for the forward context. All entries hold the
-    # agreed padded count, unless `eager`, where nothing was padded.
+    # agreed padded counts (global or per-rank), unless `eager`, where nothing
+    # was padded.
     num_tokens_across_dp: torch.Tensor
     # Agreed uniform decode length. None means the ranks disagreed, which is an
     # answer, not "unknown".
@@ -65,13 +66,14 @@ def sync_cudagraph_and_dp_padding(
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
-    tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
+    tensor = torch.zeros(7, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
     tensor[4][dp_rank] = int(allow_ubatching)
     tensor[5][dp_rank] = num_reqs
+    tensor[6][dp_rank] = desired_batch_desc.num_tokens
     if should_skip_dp_coordination():
         tensor[:] = tensor[:, dp_rank, None].clone()
     else:
@@ -176,6 +178,18 @@ def sync_cudagraph_and_dp_padding(
         "cudagraph_manager should only be None during profile run, "
         "where synced_cg_mode must be NONE across all DP ranks"
     )
+    if cudagraph_manager.compilation_config.cudagraph_local_dp:
+        assert synced_cg_mode == CUDAGraphMode.PIECEWISE
+        assert torch.all(cg_mode_across_dp == CUDAGraphMode.PIECEWISE.value)
+        assert desired_batch_desc.num_ubatches == 1
+        # MoE communication stays outside every graph. The existing CPU
+        # exchange carries each rank's chosen bucket without another collective.
+        return desired_batch_desc, DPSyncState(
+            num_tokens_across_dp=tensor[6],
+            uniform_token_count=synced_uniform_token_count,
+            eager=False,
+            num_reqs=int(num_reqs_across_dp.max()),
+        )
     synced_num_tokens = int(num_tokens_across_dp.max().item())
 
     # Varlen decode graphs are selected by the query-length bound, so ranks must agree
@@ -284,6 +298,11 @@ def dispatch_cg_and_sync_dp(
         return batch_desc, None
 
     if dp_sync is not None:
+        if (
+            cudagraph_manager is not None
+            and cudagraph_manager.compilation_config.cudagraph_local_dp
+        ):
+            raise ValueError("cudagraph_local_dp does not support reusing DP sync")
         assert dp_sync.num_tokens_across_dp[dp_rank] == num_tokens, (
             "reusing a DP sync taken over a different batch"
         )
