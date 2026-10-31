@@ -647,6 +647,9 @@ class GrugMoeMLP(nn.Module):
             router=moe_router,
             router_logits_dtype=torch.float32,
         )
+        self.buffer_expert_output = "vllm::grug_moe_experts_out" in (
+            get_current_vllm_config().compilation_config.splitting_ops or []
+        )
 
     def _routed_input(self, x_flat: torch.Tensor) -> torch.Tensor:
         if self.latent_down_proj is None or self.latent_norm is None:
@@ -711,12 +714,46 @@ class GrugMoeMLP(nn.Module):
             out = self._forward_torch_reference(x_flat, routed_input)
             return out.to(x.dtype).reshape(orig_shape)
         router_logits = _apply_grug_linear(self.router, x_flat.float())
-        out = self.experts(
-            hidden_states=routed_input,
-            router_logits=router_logits,
-        )
+        if self.buffer_expert_output:
+            # The next graph must receive the same allocation on every replay.
+            out = torch.empty_like(routed_input)
+            torch.ops.vllm.grug_moe_experts_out(
+                routed_input, router_logits, out, self.experts.layer_name
+            )
+        else:
+            out = self.experts(
+                hidden_states=routed_input,
+                router_logits=router_logits,
+            )
         out = self._expand_routed_output(out)
         return out.to(x.dtype).reshape(orig_shape)
+
+
+def _grug_moe_experts_out(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    output.copy_(layer(hidden_states=hidden_states, router_logits=router_logits))
+
+
+def _grug_moe_experts_out_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="grug_moe_experts_out",
+    op_func=_grug_moe_experts_out,
+    mutates_args=["hidden_states", "output"],
+    fake_impl=_grug_moe_experts_out_fake,
+)
 
 
 class GrugMoeShortConv(MambaBase, nn.Module):
