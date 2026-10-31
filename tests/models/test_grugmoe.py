@@ -1390,9 +1390,10 @@ def test_grug_moe_tiny_decoder_layer_matches_reference_math():
 def test_grug_xsa_correction_and_gate_match_reference_math(logical_kv_cache):
     cfg = replace(
         _tiny_config(),
+        artifact_schema_version=2,
         num_kv_heads=2,
         local_kv_heads=1,
-        global_kv_heads=1,
+        global_kv_heads=2,
         logical_kv_cache=logical_kv_cache,
     ).validate()
     attn = GrugMoeAttention(
