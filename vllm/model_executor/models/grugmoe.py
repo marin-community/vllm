@@ -3,7 +3,7 @@
 """Correctness-first GPU and TPU implementation of Marin GrugMoE."""
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Any
 
@@ -216,6 +216,7 @@ class GrugMoeRuntimeConfig:
     num_kv_heads: int = 16
     local_kv_heads: int | None = None
     global_kv_heads: int | None = None
+    logical_kv_cache: bool = False
     head_dim: int | None = None
     max_seq_len: int = 4096
     sliding_window: int = 4096
@@ -889,6 +890,10 @@ class GrugMoeAttention(nn.Module):
         self.kv_size = cfg.num_kv_heads * self.head_dim
         self.use_rope = use_rope
         self.logical_kv_heads = cfg.logical_kv_heads(is_global=is_global)
+        self.cache_kv_heads = (
+            self.logical_kv_heads if cfg.logical_kv_cache else cfg.num_kv_heads
+        )
+        self.cache_kv_size = self.cache_kv_heads * self.head_dim
         self.qk_mult_scale = qk_mult_scale
 
         self.q_proj = ReplicatedLinear(
@@ -960,7 +965,7 @@ class GrugMoeAttention(nn.Module):
             cfg.num_heads,
             self.head_dim,
             self.head_dim**-0.5,
-            num_kv_heads=cfg.num_kv_heads,
+            num_kv_heads=self.cache_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=sliding_window,
@@ -976,7 +981,7 @@ class GrugMoeAttention(nn.Module):
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         value_heads = value_states.view(
-            num_tokens, self.cfg.num_kv_heads, self.head_dim
+            num_tokens, self.cache_kv_heads, self.head_dim
         )
         aligned_value = _align_kv_heads(value_heads, self.cfg.num_heads)
         attn_heads = attn_output.view(num_tokens, self.cfg.num_heads, self.head_dim)
@@ -1005,12 +1010,12 @@ class GrugMoeAttention(nn.Module):
         k = k.view(num_tokens, self.cfg.num_kv_heads, self.head_dim)
         v = v.view(num_tokens, self.cfg.num_kv_heads, self.head_dim)
         if self.logical_kv_heads != self.cfg.num_kv_heads:
-            k = _align_kv_heads(k[:, : self.logical_kv_heads], self.cfg.num_kv_heads)
-            v = _align_kv_heads(v[:, : self.logical_kv_heads], self.cfg.num_kv_heads)
+            k = _align_kv_heads(k[:, : self.logical_kv_heads], self.cache_kv_heads)
+            v = _align_kv_heads(v[:, : self.logical_kv_heads], self.cache_kv_heads)
         k = _rms_norm(k)
         q = q.reshape(num_tokens, self.q_size)
-        k = k.reshape(num_tokens, self.kv_size)
-        v = v.reshape(num_tokens, self.kv_size)
+        k = k.reshape(num_tokens, self.cache_kv_size)
+        v = v.reshape(num_tokens, self.cache_kv_size).contiguous()
         if self.use_rope:
             q, k = self.rotary_emb(positions, q, k)
         q = q * self.cfg.qk_mult * self.qk_mult_scale
@@ -1146,6 +1151,14 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         if hf_config is None:
             hf_config = vllm_config.model_config.hf_config
         self.config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
+        additional_config = vllm_config.additional_config
+        if isinstance(additional_config, dict):
+            logical_kv_cache = additional_config.get("grug_logical_kv_cache", False)
+            if not isinstance(logical_kv_cache, bool):
+                raise ValueError("grug_logical_kv_cache must be a boolean")
+            if logical_kv_cache and get_tensor_model_parallel_world_size() != 1:
+                raise NotImplementedError("Logical GrugMoE KV cache requires TP=1")
+            self.config = replace(self.config, logical_kv_cache=logical_kv_cache)
         if not self.config.disable_pko:
             raise NotImplementedError(
                 "GrugMoE does not support Partial Key Offset; export a checkpoint "

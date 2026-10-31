@@ -930,8 +930,11 @@ def test_grug_moe_routed_experts_keep_model_dtype():
     assert layer.shared_expert.gate_proj.weight.dtype == torch.bfloat16
 
 
-def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type():
-    cfg = replace(_tiny_hero_config(), sconv=False)
+@pytest.mark.parametrize("logical_kv_cache", [False, True])
+def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type(logical_kv_cache):
+    cfg = replace(
+        _tiny_hero_config(), sconv=False, logical_kv_cache=logical_kv_cache
+    )
     q = torch.arange(16, dtype=torch.float32).view(1, 16) + 1
     k = torch.tensor(
         [[[1.0, 2.0, 3.0, 4.0], [9.0, 8.0, 7.0, 6.0]]]
@@ -969,13 +972,14 @@ def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type():
         k.view(1, 2, 4)[:, :1],
         SimpleNamespace(variance_epsilon=1e-6, weight=torch.ones(4)),
     )
+    local_cache_heads = 1 if logical_kv_cache else 2
     torch.testing.assert_close(
-        local_capture.k.view(1, 2, 4),
-        expected_local_k_head.expand(1, 2, 4),
+        local_capture.k.view(1, local_cache_heads, 4),
+        expected_local_k_head.expand(1, local_cache_heads, 4),
     )
     torch.testing.assert_close(
-        local_capture.v.view(1, 2, 4),
-        v.view(1, 2, 4)[:, :1].expand(1, 2, 4),
+        local_capture.v.view(1, local_cache_heads, 4),
+        v.view(1, 2, 4)[:, :1].expand(1, local_cache_heads, 4),
     )
     assert local_capture.v.is_contiguous()
     assert not torch.equal(
@@ -1382,8 +1386,15 @@ def test_grug_moe_tiny_decoder_layer_matches_reference_math():
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_grug_xsa_correction_and_gate_match_reference_math():
-    cfg = _tiny_config()
+@pytest.mark.parametrize("logical_kv_cache", [False, True])
+def test_grug_xsa_correction_and_gate_match_reference_math(logical_kv_cache):
+    cfg = replace(
+        _tiny_config(),
+        num_kv_heads=2,
+        local_kv_heads=1,
+        global_kv_heads=1,
+        logical_kv_cache=logical_kv_cache,
+    ).validate()
     attn = GrugMoeAttention(
         cfg,
         cache_config=None,
@@ -1408,7 +1419,8 @@ def test_grug_xsa_correction_and_gate_match_reference_math():
     with torch.no_grad():
         attn.attn_gate.weight.copy_(gate_weight)
 
-    actual = attn.apply_xsa(hidden_states, attn_output, value_states)
+    cached_values = value_states if logical_kv_cache else value_states.repeat(1, 2)
+    actual = attn.apply_xsa(hidden_states, attn_output, cached_values)
 
     aligned_value = value_states.view(2, 1, 2).expand(2, 2, 2)
     attn_heads = attn_output.view(2, 2, 2)
