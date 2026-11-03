@@ -136,6 +136,31 @@ publishes no GPU release. The temporary artifacts remain available for 14 days;
 rerun the failed jobs in that workflow to retry. There is no separate GPU
 promotion dispatch or reuse of another qualification run.
 
+## Hero online FP8
+
+Hero uses the same `GrugMoeForCausalLM` implementation as Snowball. Load a BF16
+Hero Hugging Face artifact with `--dtype bfloat16 --quantization fp8`, TP=1,
+and expert parallelism. For an existing Hero launch, retain its DP/EP layout
+and add `--quantization fp8`.
+
+Online FP8 includes Hero's latent down/up projections, routed experts and
+multiple shared experts. The QB router stays FP32, with Hero's existing BF16
+rounding before expert selection. Norms, ShortConv state and the KV cache
+retain their existing precision. Serialized FP8 checkpoints are unsupported.
+
+The fork's model suite checks BF16 weight loading and numerical agreement for
+Hero's latent and shared experts at one and seven input tokens, using
+FP8-representable weight/input ratios to isolate loading from rounding error:
+
+```bash
+.venv/bin/python -m pytest tests/models/test_grugmoe.py \
+  -k hero_online_fp8_latent_and_shared -v
+```
+
+These layer checks do not qualify full Hero generation, RL score agreement or
+memory capacity. Run the model-level qualification for the chosen Hero
+artifact and serving layout before adopting an FP8 wheel for RL.
+
 ## TPU wheel pairs
 
 The TPU lane uses the same `main` source lineage and builds a separate vLLM
