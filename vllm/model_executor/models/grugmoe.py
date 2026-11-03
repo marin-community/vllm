@@ -1281,7 +1281,10 @@ def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
             )
         )
     ):
-        raise NotImplementedError("GrugMoE does not support quantization")
+        raise NotImplementedError(
+            "GrugMoE supports only online FP8 quantization on GPU "
+            "and unquantized execution on TPU"
+        )
     if not is_tpu and parallel_config.tensor_parallel_size != 1:
         raise NotImplementedError(
             "GrugMoE expert-parallel GPU serving requires tensor_parallel_size=1"

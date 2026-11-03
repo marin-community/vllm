@@ -673,7 +673,7 @@ def test_grug_moe_quantization_platform_support(
     if supported:
         _raise_for_unsupported_modes(fake_config)
     else:
-        with pytest.raises(NotImplementedError, match="does not support quantization"):
+        with pytest.raises(NotImplementedError, match="supports only online FP8"):
             _raise_for_unsupported_modes(fake_config)
 
 
