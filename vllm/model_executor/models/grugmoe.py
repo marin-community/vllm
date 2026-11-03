@@ -36,6 +36,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -597,7 +598,7 @@ class GrugMoeMLP(nn.Module):
             cfg.num_experts,
             bias=True,
             params_dtype=torch.float32,
-            quant_config=quant_config,
+            quant_config=None if isinstance(quant_config, Fp8Config) else quant_config,
             disable_tp=True,
             skip_bias_add=True,
             prefix=f"{prefix}.router",
@@ -1271,7 +1272,14 @@ def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
         raise NotImplementedError("GrugMoE does not support LoRA")
     quant_config = vllm_config.quant_config
     if quant_config is not None and (
-        not is_tpu or quant_config.get_name() != _UNQUANTIZED_METHOD
+        (is_tpu and quant_config.get_name() != _UNQUANTIZED_METHOD)
+        or (
+            not is_tpu
+            and (
+                not isinstance(quant_config, Fp8Config)
+                or quant_config.is_checkpoint_fp8_serialized
+            )
+        )
     ):
         raise NotImplementedError("GrugMoE does not support quantization")
     if not is_tpu and parallel_config.tensor_parallel_size != 1:

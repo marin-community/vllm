@@ -26,6 +26,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.grugmoe import (
     _ROUTER_COMBINE_WEIGHT_EPS,
@@ -608,11 +609,16 @@ def _minimal_vllm_config_for_mode_check(
     *,
     tensor_parallel_size=1,
     quantization_method=None,
+    is_checkpoint_fp8_serialized=False,
 ):
     quant_config = (
         None
         if quantization_method is None
-        else SimpleNamespace(get_name=lambda: quantization_method)
+        else (
+            Fp8Config(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
+            if quantization_method == "fp8"
+            else SimpleNamespace(get_name=lambda: quantization_method)
+        )
     )
     return SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=tensor_parallel_size),
@@ -641,22 +647,26 @@ def test_grug_moe_preserves_gpu_tensor_parallel_restriction(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("is_tpu", "quantization_method", "supported"),
+    ("is_tpu", "quantization_method", "serialized", "supported"),
     [
-        (True, "unquantized", True),
-        (True, "fp8", False),
-        (False, "unquantized", False),
+        (True, "unquantized", False, True),
+        (True, "fp8", False, False),
+        (False, "unquantized", False, False),
+        (False, "fp8", False, True),
+        (False, "fp8", True, False),
     ],
 )
-def test_grug_moe_tpu_accepts_only_unquantized_backend(
+def test_grug_moe_quantization_platform_support(
     monkeypatch,
     is_tpu,
     quantization_method,
+    serialized,
     supported,
 ):
     fake_config = _minimal_vllm_config_for_mode_check(
         tensor_parallel_size=8 if is_tpu else 1,
         quantization_method=quantization_method,
+        is_checkpoint_fp8_serialized=serialized,
     )
     _patch_grug_parallel_runtime(monkeypatch, fake_config, is_tpu=is_tpu)
 
@@ -1251,6 +1261,61 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
     assert actual.dtype == torch.bfloat16
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_grug_moe_online_fp8_matches_bf16_reference(monkeypatch):
+    cfg = replace(
+        _tiny_config(),
+        hidden_dim=64,
+        intermediate_dim=64,
+        num_heads=4,
+        head_dim=16,
+    ).validate()
+    reference = GrugMoeMLP(cfg, params_dtype=torch.bfloat16).cuda()
+    with torch.no_grad():
+        _fill_parameter(reference.router.weight, -0.1, 0.1)
+        _fill_parameter(reference.router.bias, 0.2, -0.2)
+        experts = reference.experts.routed_experts
+        _fill_parameter(experts.w13_weight[:, : cfg.intermediate_dim], -0.15, 0.15)
+        _fill_parameter(experts.w13_weight[:, cfg.intermediate_dim :], 0.12, -0.12)
+        _fill_parameter(experts.w2_weight, -0.1, 0.1)
+
+    x = torch.linspace(-0.6, 0.7, 3 * cfg.hidden_dim, device="cuda").reshape(
+        3, cfg.hidden_dim
+    ).to(torch.bfloat16)
+    expected = _reference_moe(x, reference)
+
+    monkeypatch.setattr(
+        get_current_vllm_config(),
+        "model_config",
+        SimpleNamespace(dtype=torch.bfloat16),
+    )
+    quantized = GrugMoeMLP(
+        cfg,
+        params_dtype=torch.bfloat16,
+        quant_config=Fp8Config(),
+        prefix="model.layers.0.mlp",
+    )
+    with torch.no_grad():
+        quantized.router.weight.copy_(reference.router.weight.cpu())
+        quantized.router.bias.copy_(reference.router.bias.cpu())
+        params_dict = dict(quantized.named_parameters())
+        for projection, weight in (
+            ("gate_proj", experts.w13_weight[:, : cfg.intermediate_dim]),
+            ("up_proj", experts.w13_weight[:, cfg.intermediate_dim :]),
+            ("down_proj", experts.w2_weight),
+        ):
+            _try_load_grug_expert_weight(
+                f"experts.{projection}.weight", weight, params_dict
+            )
+    quantized.cuda()
+
+    init_workspace_manager(torch.device("cuda"))
+    with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
+        actual = quantized(x)
+
+    torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
 
 
 def test_grug_moe_router_selects_logical_expert_ids():
