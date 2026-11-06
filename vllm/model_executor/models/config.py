@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
@@ -462,7 +463,16 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
 class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        if not getattr(vllm_config.model_config.hf_text_config, "sconv", False):
+        hf_config = vllm_config.model_config.hf_text_config
+        priorities = vllm_config.kernel_config.ir_op_priority
+        if (
+            current_platform.is_cuda()
+            and getattr(hf_config, "grugmoe_artifact_schema_version", 1) == 1
+            and not priorities.rms_norm
+        ):
+            # Match training: multiply the weight before the BF16 rounding.
+            priorities.rms_norm = ["vllm_c"]
+        if not getattr(hf_config, "sconv", False):
             return
 
         from vllm.config import CUDAGraphMode
