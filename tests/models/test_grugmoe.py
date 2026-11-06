@@ -6,12 +6,14 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Iterable
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+import torch.utils.deterministic
 from torch import nn
 from transformers import AutoConfig
 
@@ -56,6 +58,7 @@ from vllm.model_executor.models.registry import ModelRegistry
 from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
+from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -66,6 +69,11 @@ def single_rank_model_parallel():
     os.close(fd)
     try:
         with ensure_current_vllm_config():
+            # Tiny CPU math fixtures need plain expert weights. SM100's auto
+            # backend packs/pads them for its GPU kernel. Use the serving
+            # recipe's Triton backend for these small-shape checks.
+            if torch.cuda.is_available():
+                get_current_vllm_config().kernel_config.moe_backend = "triton"
             init_distributed_environment(
                 world_size=1,
                 rank=0,
@@ -561,6 +569,59 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
     assert vllm_config.model_config.is_hybrid is True
     assert vllm_config.model_config.has_inner_state is True
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize(
+    "additional_config,quantization,cache_dtype,global_heads",
+    [
+        ({}, None, "auto", 6),
+        ({"grug_logical_kv_cache": True}, None, "auto", 6),
+        ({"grug_logical_kv_cache": False}, None, "auto", 12),
+        ({}, "fp8", "auto", 6),
+        ({}, None, "fp8", 12),
+    ],
+)
+def test_hero_native_gqa_uses_distinct_cache_heads(
+    tmp_path, additional_config, quantization, cache_dtype, global_heads
+):
+    # Keep the checkpoint's head geometry with inexpensive projections and experts.
+    GrugMoeConfig(
+        architectures=["GrugMoeForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_hidden_layers=2,
+        num_attention_heads=48,
+        num_key_value_heads=12,
+        local_kv_heads=12,
+        global_kv_heads=6,
+        head_dim=128,
+        max_position_embeddings=4096,
+        sliding_window=128,
+        grugmoe_artifact_schema_version=2,
+    ).save_pretrained(tmp_path)
+    vllm_config = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        quantization=quantization,
+        kv_cache_dtype=cache_dtype,
+        additional_config=additional_config,
+    ).create_engine_config()
+    with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16):
+        model = GrugMoeModel(vllm_config=vllm_config)
+        specs = [
+            layer.self_attn.attn.get_kv_cache_spec(vllm_config)
+            for layer in model.layers
+        ]
+    assert [spec.num_kv_heads for spec in specs] == [12, global_heads]
+    assert specs[1].page_size_bytes == (
+        2 * vllm_config.cache_config.block_size * global_heads * 128
+        * (1 if cache_dtype == "fp8" else 2)
+    )
 
 
 @pytest.mark.parametrize(
@@ -1064,8 +1125,11 @@ def test_grug_moe_routed_experts_keep_model_dtype():
     assert layer.shared_expert.gate_proj.weight.dtype == torch.bfloat16
 
 
-def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type():
-    cfg = replace(_tiny_hero_config(), sconv=False)
+@pytest.mark.parametrize("logical_kv_cache", [False, True])
+def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type(logical_kv_cache):
+    cfg = replace(
+        _tiny_hero_config(), sconv=False, logical_kv_cache=logical_kv_cache
+    )
     q = torch.arange(16, dtype=torch.float32).view(1, 16) + 1
     k = torch.tensor(
         [[[1.0, 2.0, 3.0, 4.0], [9.0, 8.0, 7.0, 6.0]]]
@@ -1103,13 +1167,14 @@ def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type():
         k.view(1, 2, 4)[:, :1],
         SimpleNamespace(variance_epsilon=1e-6, weight=torch.ones(4)),
     )
+    local_cache_heads = 1 if logical_kv_cache else 2
     torch.testing.assert_close(
-        local_capture.k.view(1, 2, 4),
-        expected_local_k_head.expand(1, 2, 4),
+        local_capture.k.view(1, local_cache_heads, 4),
+        expected_local_k_head.expand(1, local_cache_heads, 4),
     )
     torch.testing.assert_close(
-        local_capture.v.view(1, 2, 4),
-        v.view(1, 2, 4)[:, :1].expand(1, 2, 4),
+        local_capture.v.view(1, local_cache_heads, 4),
+        v.view(1, 2, 4)[:, :1].expand(1, local_cache_heads, 4),
     )
     assert local_capture.v.is_contiguous()
     assert not torch.equal(
@@ -1221,7 +1286,10 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
     )
     request_b = torch.tensor([[10.0, 4.0], [20.0, 8.0]], device="cuda")
     prefill = torch.vstack((request_a, request_b))
-    for profiling_metadata in (None, {}):
+    profiling_cases: tuple[dict[str, ShortConvAttentionMetadata] | None, ...] = (
+        None, {}
+    )
+    for profiling_metadata in profiling_cases:
         # V1 omits all metadata; V2's profiling pass omits Mamba groups from
         # its dictionary. Neither pass may consume or mutate request history.
         with set_forward_context(
@@ -1269,44 +1337,62 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
         torch.vstack((expected_a, expected_b)),
     )
 
-    decode = torch.tensor([[4.0, -4.0], [30.0, 12.0]], device="cuda")
+    decode = torch.tensor([[4.0, -4.0], [30.0, 12.0], [5.0, -5.0]], device="cuda")
     decode_metadata = ShortConvAttentionMetadata(
         num_prefills=0,
         num_prefill_tokens=0,
-        num_decodes=2,
-        num_decode_tokens=2,
-        num_reqs=2,
+        num_decodes=3,
+        num_decode_tokens=3,
+        num_reqs=3,
         query_start_loc_p=None,
         has_initial_states_p=None,
         state_indices_tensor_p=torch.empty(0, device="cuda", dtype=torch.int32),
-        state_indices_tensor_d=torch.tensor([1, 2], device="cuda", dtype=torch.int32),
+        state_indices_tensor_d=torch.tensor(
+            [1, 2, 0], device="cuda", dtype=torch.int32
+        ),
         num_accepted_tokens=None,
-        query_start_loc_d=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+        query_start_loc_d=torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32),
         block_idx_last_scheduled_token=None,
         block_idx_first_scheduled_token_p=None,
         block_idx_last_computed_token=None,
         block_idx_last_scheduled_token_prev_step=None,
         num_computed_tokens_p=None,
-        seq_lens=torch.tensor([4, 3], device="cuda"),
+        seq_lens=torch.tensor([4, 3, 1], device="cuda"),
     )
-    with set_forward_context(
-        {prefix: decode_metadata},
-        get_current_vllm_config(),
-        num_tokens=decode.shape[0],
-    ):
-        decode_output = module(decode)
+    original_decode = decode.clone()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
+    try:
+        # Make an unwritten null row fail reliably instead of reading allocator data.
+        torch.use_deterministic_algorithms(True)
+        torch.utils.deterministic.fill_uninitialized_memory = True
+        with set_forward_context(
+            {prefix: decode_metadata},
+            get_current_vllm_config(),
+            num_tokens=decode.shape[0],
+        ):
+            decode_output = module(decode)
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        torch.utils.deterministic.fill_uninitialized_memory = fill_uninitialized
 
     expected_decode = torch.vstack(
         (
             _causal_depthwise_reference(torch.vstack((request_a, decode[:1])), weight)[
                 -1:
             ],
-            _causal_depthwise_reference(torch.vstack((request_b, decode[1:])), weight)[
+            _causal_depthwise_reference(torch.vstack((request_b, decode[1:2])), weight)[
                 -1:
             ],
+            decode[2:],
         )
     )
     torch.testing.assert_close(decode_output, expected_decode)
+    torch.testing.assert_close(decode, original_decode, rtol=0, atol=0)
+    torch.testing.assert_close(
+        module.kv_cache[0][0], torch.zeros_like(module.kv_cache[0][0]), rtol=0, atol=0
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1482,6 +1568,22 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    padding_rows = 5
+    padded = F.pad(x, (0, 0, 0, padding_rows))
+    is_padding = torch.arange(padded.shape[0], device=x.device) >= x.shape[0]
+    with set_forward_context(
+        None,
+        get_current_vllm_config(),
+        num_tokens=padded.shape[0],
+        is_padding=is_padding,
+    ):
+        clean = quantized(padded.clone())[: x.shape[0]].clone()
+        poisoned = padded.clone()
+        poisoned[x.shape[0] :] = 32
+        repeated = quantized(poisoned)[: x.shape[0]]
+
+    torch.testing.assert_close(repeated, clean, rtol=0, atol=0)
+
 
 def test_grug_moe_router_selects_logical_expert_ids():
     router = GrugMoeRouter(
@@ -1524,6 +1626,7 @@ def test_grug_moe_expert_weights_load_into_fused_moe_layout(split: bool):
         ("up_proj", up_weight),
         ("down_proj", down_weight),
     ):
+        shards: Iterable[tuple[str, torch.Tensor]]
         if split:
             shards = (
                 (f"experts.{expert_id}.{projection}.weight", weight[expert_id])
@@ -1645,8 +1748,16 @@ def test_grug_moe_tiny_decoder_layer_matches_reference_math():
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_grug_xsa_correction_and_gate_match_reference_math():
-    cfg = _tiny_config()
+@pytest.mark.parametrize("logical_kv_cache", [False, True])
+def test_grug_xsa_correction_and_gate_match_reference_math(logical_kv_cache):
+    cfg = replace(
+        _tiny_config(),
+        artifact_schema_version=2,
+        num_kv_heads=2,
+        local_kv_heads=1,
+        global_kv_heads=2,
+        logical_kv_cache=logical_kv_cache,
+    ).validate()
     attn = GrugMoeAttention(
         cfg,
         cache_config=None,
@@ -1671,7 +1782,8 @@ def test_grug_xsa_correction_and_gate_match_reference_math():
     with torch.no_grad():
         attn.attn_gate.weight.copy_(gate_weight)
 
-    actual = attn.apply_xsa(hidden_states, attn_output, value_states)
+    cached_values = value_states if logical_kv_cache else value_states.repeat(1, 2)
+    actual = attn.apply_xsa(hidden_states, attn_output, cached_values)
 
     aligned_value = value_states.view(2, 1, 2).expand(2, 2, 2)
     attn_heads = attn_output.view(2, 2, 2)

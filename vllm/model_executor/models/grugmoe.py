@@ -3,9 +3,9 @@
 """Correctness-first GPU and TPU implementation of Marin GrugMoE."""
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +20,9 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    _get_padding_mask,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -218,6 +221,7 @@ class GrugMoeRuntimeConfig:
     num_kv_heads: int = 16
     local_kv_heads: int | None = None
     global_kv_heads: int | None = None
+    logical_kv_cache: bool = False
     head_dim: int | None = None
     max_seq_len: int = 4096
     sliding_window: int = 4096
@@ -558,7 +562,11 @@ class GrugMoeRouter(BaseRouter):
         *,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del hidden_states, input_ids
+        del input_ids
+        padding = _get_padding_mask(hidden_states.shape[0])
+        if padding is not None:
+            # Tensor-wide FP8 scales must not include stale graph padding.
+            hidden_states.masked_fill_(padding[:, None], 0)
         _, selected = torch.topk(
             router_logits.float() + self.bias.float(),
             k=self.top_k + 1,
@@ -570,6 +578,9 @@ class GrugMoeRouter(BaseRouter):
         )
         denom = topk_weights.sum(dim=-1, keepdim=True) + _ROUTER_COMBINE_WEIGHT_EPS
         topk_weights = topk_weights * (_ROUTER_COMBINE_WEIGHT_SUM / denom)
+        if padding is not None:
+            topk_weights.masked_fill_(padding[:, None], 0)
+        # Keep valid IDs so the native expert kernel writes padding scratch rows.
         topk_ids = selected.to(torch.int32 if indices_type is None else indices_type)
         return topk_weights, topk_ids
 
@@ -717,7 +728,7 @@ class GrugMoeMLP(nn.Module):
         # TPU functional_call replaces registered parameters with sharded
         # tensors. Keep the non-Module custom router bound to that current
         # bias rather than the CPU Parameter captured during construction.
-        self.experts.router.bias = self.router.bias
+        cast(GrugMoeRouter, self.experts.router).bias = self.router.bias
         routed_input = self._routed_input(x_flat)
         if not x_flat.is_cuda and not current_platform.is_tpu():
             out = self._forward_torch_reference(x_flat, routed_input)
@@ -817,15 +828,15 @@ class GrugMoeShortConv(MambaBase, nn.Module):
 
         if num_decodes > 0:
             assert attn_metadata.state_indices_tensor_d is not None
-            decode_output = torch.empty_like(decode)
+            # The kernel skips null rows, which still reach FP8 activation scaling.
+            decode_output = decode.contiguous().clone()
             decode_output = causal_conv1d_update(
-                decode.contiguous(),
+                decode_output,
                 conv_state,
                 conv_weight,
                 None,
                 activation=None,
                 conv_state_indices=attn_metadata.state_indices_tensor_d,
-                out=decode_output,
             )
             pieces.insert(0, decode_output)
 
@@ -903,6 +914,10 @@ class GrugMoeAttention(nn.Module):
         self.kv_size = cfg.num_kv_heads * self.head_dim
         self.use_rope = use_rope
         self.logical_kv_heads = cfg.logical_kv_heads(is_global=is_global)
+        self.cache_kv_heads = (
+            self.logical_kv_heads if cfg.logical_kv_cache else cfg.num_kv_heads
+        )
+        self.cache_kv_size = self.cache_kv_heads * self.head_dim
         self.qk_mult_scale = qk_mult_scale
 
         self.q_proj = ReplicatedLinear(
@@ -974,7 +989,7 @@ class GrugMoeAttention(nn.Module):
             cfg.num_heads,
             self.head_dim,
             self.head_dim**-0.5,
-            num_kv_heads=cfg.num_kv_heads,
+            num_kv_heads=self.cache_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=sliding_window,
@@ -990,7 +1005,7 @@ class GrugMoeAttention(nn.Module):
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         value_heads = value_states.view(
-            num_tokens, self.cfg.num_kv_heads, self.head_dim
+            num_tokens, self.cache_kv_heads, self.head_dim
         )
         aligned_value = _align_kv_heads(value_heads, self.cfg.num_heads)
         attn_heads = attn_output.view(num_tokens, self.cfg.num_heads, self.head_dim)
@@ -1019,12 +1034,12 @@ class GrugMoeAttention(nn.Module):
         k = k.view(num_tokens, self.cfg.num_kv_heads, self.head_dim)
         v = v.view(num_tokens, self.cfg.num_kv_heads, self.head_dim)
         if self.logical_kv_heads != self.cfg.num_kv_heads:
-            k = _align_kv_heads(k[:, : self.logical_kv_heads], self.cfg.num_kv_heads)
-            v = _align_kv_heads(v[:, : self.logical_kv_heads], self.cfg.num_kv_heads)
+            k = _align_kv_heads(k[:, : self.logical_kv_heads], self.cache_kv_heads)
+            v = _align_kv_heads(v[:, : self.logical_kv_heads], self.cache_kv_heads)
         k = _rms_norm(k)
         q = q.reshape(num_tokens, self.q_size)
-        k = k.reshape(num_tokens, self.kv_size)
-        v = v.reshape(num_tokens, self.kv_size)
+        k = k.reshape(num_tokens, self.cache_kv_size)
+        v = v.reshape(num_tokens, self.cache_kv_size).contiguous()
         if self.use_rope:
             q, k = self.rotary_emb(positions, q, k)
         q = q * self.cfg.qk_mult * self.qk_mult_scale
@@ -1160,6 +1175,29 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         if hf_config is None:
             hf_config = vllm_config.model_config.hf_config
         self.config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
+        additional_config = vllm_config.additional_config
+        if isinstance(additional_config, dict):
+            unquantized_kv = vllm_config.cache_config.cache_dtype in (
+                "auto", "float16", "bfloat16"
+            )
+            logical_kv_cache = additional_config.get(
+                "grug_logical_kv_cache",
+                current_platform.is_cuda() and unquantized_kv,
+            )
+            if not isinstance(logical_kv_cache, bool):
+                raise ValueError("grug_logical_kv_cache must be a boolean")
+            if logical_kv_cache and not current_platform.is_cuda():
+                raise NotImplementedError(
+                    "Logical GrugMoE KV caching is supported on CUDA"
+                )
+            if logical_kv_cache and not unquantized_kv:
+                raise NotImplementedError(
+                    "Logical GrugMoE KV caching requires unquantized KV storage"
+                )
+            self.config = replace(
+                self.config,
+                logical_kv_cache=logical_kv_cache,
+            )
         if not self.config.disable_pko:
             raise NotImplementedError(
                 "GrugMoE does not support Partial Key Offset; export a checkpoint "
@@ -1345,10 +1383,10 @@ def _try_load_grug_expert_weight(
     split_expert_id = None
     parts = name.rsplit(".", 3)
     if len(parts) == 4:
-        prefix, expert_id, projection, suffix = parts
+        prefix, expert_id_text, projection, suffix = parts
         if (
             prefix.rsplit(".", 1)[-1] == "experts"
-            and expert_id.isdecimal()
+            and expert_id_text.isdecimal()
             and projection in {"gate_proj", "down_proj", "up_proj"}
             and suffix == "weight"
         ):
@@ -1357,7 +1395,7 @@ def _try_load_grug_expert_weight(
                     f"Split Grug expert weight must be 2D, got "
                     f"{loaded_weight.ndim}D for {name!r}"
                 )
-            split_expert_id = int(expert_id)
+            split_expert_id = int(expert_id_text)
             name = f"{prefix}.{projection}.weight"
 
     for weight_name, param_name, shard_id in _EXPERT_WEIGHT_MAPPING:
@@ -1375,6 +1413,7 @@ def _try_load_grug_expert_weight(
             raise ValueError(
                 f"Grug expert parameter {mapped_name!r} has no FusedMoE weight_loader"
             )
+        expert_weights: Iterable[tuple[int, torch.Tensor]]
         if split_expert_id is not None:
             expert_weights = ((split_expert_id, loaded_weight),)
         else:
