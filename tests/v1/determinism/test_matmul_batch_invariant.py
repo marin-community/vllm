@@ -9,9 +9,12 @@ item doesn't change based on other items in the batch).
 
 import pytest
 import torch
-from utils import skip_unsupported
+from utils import skip_if_not_cuda, skip_unsupported
 
-from vllm.model_executor.determinism.batch_invariant import matmul_batch_invariant
+from vllm.model_executor.determinism.batch_invariant import (
+    linear_batch_invariant,
+    matmul_batch_invariant,
+)
 from vllm.model_executor.determinism.batch_invariant_configs import (
     _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS,
     _get_tuned_matmul_arch_family,
@@ -134,3 +137,71 @@ def test_matmul_batch_invariance_across_tuned_m_buckets(m, transpose_b):
     batch_output = matmul_batch_invariant(a, b)
 
     assert torch.equal(single_output[0], batch_output[0])
+
+
+@skip_if_not_cuda
+@pytest.mark.parametrize("batched", [False, True], ids=["linear", "batched"])
+def test_fp32_router_projection_preserves_trained_weight_precision(batched):
+    # Router updates need not remain representable in BF16 or TF32. A one-hot
+    # activation makes the selected FP32 weight column an exact independent oracle.
+    x = torch.zeros((17, 2048), device="cuda", dtype=torch.bfloat16)
+    x[:, 1023] = 1
+    weight = torch.ones((256, 2048), device="cuda", dtype=torch.float32)
+    weight[:, 1023] += torch.arange(1, 257, device="cuda") * 2**-15
+    expected = weight[:, 1023].expand(17, -1)
+
+    if batched:
+        actual = matmul_batch_invariant(x.float()[None], weight.t()[None])
+        expected = expected[None]
+    else:
+        actual = linear_batch_invariant(x.float(), weight)
+
+    assert torch.equal(actual, expected)
+
+
+@skip_if_not_cuda
+@pytest.mark.parametrize("seed", [0, 20261020])
+@pytest.mark.parametrize("rounded_weights", [False, True], ids=["fp32", "bf16"])
+def test_fp32_router_projection_is_exact_across_batches_and_cuda_graphs(
+    seed, rounded_weights
+):
+    torch.manual_seed(seed)
+    rows = torch.randn((129, 2048), device="cuda", dtype=torch.bfloat16).float()
+    weight = torch.randn((256, 2048), device="cuda", dtype=torch.float32)
+    if rounded_weights:
+        weight = weight.bfloat16().float()
+    needle = rows[64:65].clone()
+    singleton = linear_batch_invariant(needle, weight)
+
+    for size in (2, 16, 17, 64, 129):
+        batch = rows[:size].clone()
+        position = size // 2
+        batch[position] = needle[0]
+        output = linear_batch_invariant(batch, weight)
+        assert torch.equal(output[position], singleton[0])
+        reordered = linear_batch_invariant(batch.flip(0), weight)
+        assert torch.equal(reordered, output.flip(0))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    for size in (1, 17):
+        batch = rows[:size].clone()
+        batch[0] = needle[0]
+        expected = linear_batch_invariant(batch, weight)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                linear_batch_invariant(batch, weight)
+        torch.cuda.current_stream().wait_stream(stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = linear_batch_invariant(batch, weight)
+        graph.replay()
+        assert torch.equal(captured, expected)
+        assert torch.equal(captured[0], singleton[0])
+
+        batch.copy_(batch.flip(0))
+        graph.replay()
+        assert torch.equal(captured, expected.flip(0))
+        assert torch.equal(captured[-1], singleton[0])
