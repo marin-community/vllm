@@ -72,6 +72,11 @@ jobs:
       - name: Check the GrugMoE delta resolves against this base
         run: .venv/bin/python infra/ci/delta_smoke.py
 
+      - name: Test speculative draft parallel configuration
+        run: |
+          uv pip install pytest
+          .venv/bin/python -m pytest infra/ci/tests/test_speculative_expert_parallel.py -v
+
   release-metadata:
     runs-on: ubuntu-latest
     timeout-minutes: 10

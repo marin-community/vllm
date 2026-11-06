@@ -1551,6 +1551,8 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
+                if not self.draft_model_config.is_moe:
+                    self.draft_parallel_config.enable_expert_parallel = False
 
         if self.index_share_for_mtp_iteration is not None:
             if self.method != "mtp" or self.draft_model_config is None:
