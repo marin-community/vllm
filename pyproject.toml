@@ -211,6 +211,7 @@ include = [
     "vllm/transformers_utils/configs/grugmoe.py",
     "tests/models/test_grugmoe.py",
     "tests/models/test_grugmoe_logical_kv.py",
+    "tests/models/test_grugmoe_tensor_parallel.py",
     "tests/kernels/moe/test_fp8_dp_ep_scales.py",
     "vllm/model_executor/model_loader/reload/layerwise.py",
     "tests/model_executor/model_loader/test_reload.py",

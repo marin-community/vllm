@@ -12,7 +12,10 @@ PAGE_SIZE = 32
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
-@pytest.mark.parametrize("query_heads,kv_heads", [(20, 5), (48, 6)])
+@pytest.mark.parametrize(
+    "query_heads,kv_heads",
+    [(20, 5), (48, 6), (48, 12), (24, 3), (24, 6), (8, 1), (8, 2)],
+)
 @pytest.mark.parametrize("batch,length", [(1, 2049), (4, 8208)])
 @torch.inference_mode()
 def test_native_gqa_decode_matches_reference(
