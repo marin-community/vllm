@@ -1826,7 +1826,6 @@ def _write_hero_config(path, **fields) -> None:
                 "num_key_value_heads": 2,
                 "local_kv_heads": 1,
                 "global_kv_heads": 2,
-                # FlexAttention, which serves float32, needs heads of 16 or more.
                 "head_dim": 16,
                 "max_position_embeddings": 128,
                 "sliding_window": 8,
