@@ -1906,6 +1906,8 @@ def test_log_scaling_is_identical_across_prefill_chunking_prefix_cache_and_decod
 ):
     # apply_model sends a function to the engine-core process.
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    # flashinfer's sampler JIT-compiles with nvcc, which the CI image lacks.
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
     _write_hero_config(tmp_path / "on", **_LOG_SCALING_FIELDS)
     _write_hero_config(
         tmp_path / "off",
