@@ -1929,6 +1929,8 @@ def test_log_scaling_is_identical_across_prefill_chunking_prefix_cache_and_decod
             skip_tokenizer_init=True,
             load_format="dummy",
             dtype="float32",
+            # FlexAttention, the default for float32, recompiles per layer mask.
+            attention_backend="TRITON_ATTN",
             max_model_len=128,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=True,
