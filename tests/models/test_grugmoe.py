@@ -1759,6 +1759,8 @@ def test_log_scaling_scales_each_global_query_by_its_own_position():
     k = torch.linspace(1.0, 2.0, 4 * 8).view(4, 8)
     positions = torch.tensor([0, 3, 4, 7])
 
+    layer_names = iter(range(100))
+
     def captured_q(module_cfg, is_global, rows):
         module = GrugMoeAttention(
             module_cfg,
@@ -1768,7 +1770,7 @@ def test_log_scaling_scales_each_global_query_by_its_own_position():
             use_rope=False,
             qk_mult_scale=1.0,
             is_global=is_global,
-            prefix=f"log_scaling.{is_global}.{rows}",
+            prefix=f"log_scaling.{next(layer_names)}",
         )
         module.q_proj = _FixedProjection(q[rows])
         module.k_proj = _FixedProjection(k[rows])
@@ -1824,7 +1826,8 @@ def _write_hero_config(path, **fields) -> None:
                 "num_key_value_heads": 2,
                 "local_kv_heads": 1,
                 "global_kv_heads": 2,
-                "head_dim": 4,
+                # FlexAttention, which serves float32, needs heads of 16 or more.
+                "head_dim": 16,
                 "max_position_embeddings": 128,
                 "sliding_window": 8,
                 "global_every": 3,
