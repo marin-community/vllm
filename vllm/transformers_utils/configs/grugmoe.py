@@ -10,6 +10,7 @@ from transformers.configuration_utils import PretrainedConfig
 # Snowball used a fixed interval. Hero exports write the interval into config.
 _FULL_ATTENTION_INTERVAL = 4
 _HERO_ARTIFACT_SCHEMA_VERSION = 2
+_HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION = 3
 _SUPPORTED_SCONV_SITES = frozenset({"k", "attn", "mlp"})
 
 
@@ -285,6 +286,7 @@ class GrugMoeConfig(PretrainedConfig):
         if self.grugmoe_artifact_schema_version not in (
             1,
             _HERO_ARTIFACT_SCHEMA_VERSION,
+            _HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION,
         ):
             raise ValueError(
                 "unsupported grugmoe_artifact_schema_version="
