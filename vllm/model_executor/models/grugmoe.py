@@ -13,7 +13,12 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -24,7 +29,12 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     _get_padding_mask,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    LinearBase,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -46,6 +56,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.config import GrugMoeForCausalLMConfig
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     extract_layer_index,
@@ -54,6 +65,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.grugmoe import (
@@ -151,8 +163,8 @@ def get_grug_moe_runtime_info(
     attention_backend = first_layer.self_attn.attn.attn_backend.get_name()
     pp_group = get_pp_group()
     return {
-        "tp_size": int(moe_parallel_config.tp_size),
-        "tp_rank": int(moe_parallel_config.tp_rank),
+        "tp_size": get_tensor_model_parallel_world_size(),
+        "tp_rank": get_tensor_model_parallel_rank(),
         "pp_size": int(pp_group.world_size),
         "pp_rank": int(pp_group.rank_in_group),
         "start_layer": int(grug_model.start_layer),
@@ -503,31 +515,31 @@ class GrugMoeDenseMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_proj = ReplicatedLinear(
+        self.gate_proj = ColumnParallelLinear(
             hidden_dim,
             intermediate_dim,
             bias=False,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            disable_tp=True,
+            disable_tp=current_platform.is_tpu(),
             prefix=f"{prefix}.gate_proj",
         )
-        self.up_proj = ReplicatedLinear(
+        self.up_proj = ColumnParallelLinear(
             hidden_dim,
             intermediate_dim,
             bias=False,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            disable_tp=True,
+            disable_tp=current_platform.is_tpu(),
             prefix=f"{prefix}.up_proj",
         )
-        self.down_proj = ReplicatedLinear(
+        self.down_proj = RowParallelLinear(
             intermediate_dim,
             hidden_dim,
             bias=False,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            disable_tp=True,
+            disable_tp=current_platform.is_tpu(),
             prefix=f"{prefix}.down_proj",
         )
 
@@ -585,7 +597,7 @@ class GrugMoeRouter(BaseRouter):
         return topk_weights, topk_ids
 
 
-def _apply_grug_linear(layer: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor:
+def _apply_grug_linear(layer: LinearBase, x: torch.Tensor) -> torch.Tensor:
     """Apply a Grug projection without adding its separately handled bias."""
     output, _ = layer(x)
     return output
@@ -619,6 +631,8 @@ class GrugMoeMLP(nn.Module):
             global_num_experts=cfg.num_experts,
             bias=self.router.bias,
         )
+        # EP ranks consume the full latent vector. Replicated projections avoid
+        # a gather before the experts and a second output reduction afterward.
         self.latent_down_proj = (
             ReplicatedLinear(
                 cfg.hidden_dim,
@@ -894,6 +908,49 @@ direct_register_custom_op(
 )
 
 
+class GrugMoeKVParallelLinear(ColumnParallelLinear):
+    """Slice distinct checkpoint heads before the core TP weight loader."""
+
+    def __init__(
+        self,
+        cfg: GrugMoeRuntimeConfig,
+        logical_kv_heads: int,
+        params_dtype: torch.dtype,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        tp_size = 1 if current_platform.is_tpu() else (
+            get_tensor_model_parallel_world_size()
+        )
+        # Keep TP1's projection and online FP8 quantization unchanged. TP
+        # shards need only the heads consumed by their native GQA group.
+        self.output_heads = logical_kv_heads if tp_size > 1 else cfg.num_kv_heads
+        self.checkpoint_channels = self.output_heads * cfg.inferred_head_dim
+        super().__init__(
+            cfg.hidden_dim,
+            self.checkpoint_channels,
+            bias=False,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            disable_tp=current_platform.is_tpu(),
+            prefix=prefix,
+        )
+
+    def weight_loader(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        if self.tp_size > 1:
+            loaded_weight = loaded_weight[: self.checkpoint_channels]
+        super().weight_loader(param, loaded_weight)
+
+    def weight_loader_v2(
+        self, param: BasevLLMParameter, loaded_weight: torch.Tensor
+    ) -> None:
+        if self.tp_size > 1:
+            loaded_weight = loaded_weight[: self.checkpoint_channels]
+        super().weight_loader_v2(param, loaded_weight)
+
+
 class GrugMoeAttention(nn.Module):
     def __init__(
         self,
@@ -909,60 +966,73 @@ class GrugMoeAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.cfg = cfg
-        self.head_dim = cfg.inferred_head_dim
-        self.q_size = cfg.num_heads * self.head_dim
-        self.kv_size = cfg.num_kv_heads * self.head_dim
-        self.use_rope = use_rope
+        self.tp_size = (
+            1 if current_platform.is_tpu()
+            else get_tensor_model_parallel_world_size()
+        )
+        self.tp_rank = (
+            0 if current_platform.is_tpu() else get_tensor_model_parallel_rank()
+        )
+        if cfg.num_heads % self.tp_size or cfg.num_kv_heads % self.tp_size:
+            raise ValueError(
+                "GrugMoE query and stored KV heads must be divisible by TP size"
+            )
+        self.num_heads = cfg.num_heads // self.tp_size
         self.logical_kv_heads = cfg.logical_kv_heads(is_global=is_global)
+        if self.tp_size > 1 and (
+            not cfg.logical_kv_cache or self.logical_kv_heads % self.tp_size
+        ):
+            raise ValueError(
+                "GrugMoE tensor parallelism requires compact logical KV caching "
+                "and a TP size that divides each layer's distinct KV heads"
+            )
+        projection_heads = (
+            self.logical_kv_heads if self.tp_size > 1 else cfg.num_kv_heads
+        )
+        self.num_kv_heads = projection_heads // self.tp_size
+        self.head_dim = cfg.inferred_head_dim
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.use_rope = use_rope
         self.cache_kv_heads = (
             self.logical_kv_heads if cfg.logical_kv_cache else cfg.num_kv_heads
-        )
+        ) // self.tp_size
         self.cache_kv_size = self.cache_kv_heads * self.head_dim
         self.qk_mult_scale = qk_mult_scale
 
-        self.q_proj = ReplicatedLinear(
+        self.q_proj = ColumnParallelLinear(
             cfg.hidden_dim,
-            self.q_size,
+            cfg.num_heads * self.head_dim,
             bias=False,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            disable_tp=True,
+            disable_tp=current_platform.is_tpu(),
             prefix=f"{prefix}.q_proj",
         )
-        self.k_proj = ReplicatedLinear(
-            cfg.hidden_dim,
-            self.kv_size,
-            bias=False,
-            params_dtype=params_dtype,
-            quant_config=quant_config,
-            disable_tp=True,
+        self.k_proj = GrugMoeKVParallelLinear(
+            cfg, self.logical_kv_heads, params_dtype, quant_config,
             prefix=f"{prefix}.k_proj",
         )
-        self.v_proj = ReplicatedLinear(
-            cfg.hidden_dim,
-            self.kv_size,
-            bias=False,
-            params_dtype=params_dtype,
-            quant_config=quant_config,
-            disable_tp=True,
+        self.v_proj = GrugMoeKVParallelLinear(
+            cfg, self.logical_kv_heads, params_dtype, quant_config,
             prefix=f"{prefix}.v_proj",
         )
-        self.o_proj = ReplicatedLinear(
-            self.q_size,
+        self.o_proj = RowParallelLinear(
+            cfg.num_heads * self.head_dim,
             cfg.hidden_dim,
             bias=False,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            disable_tp=True,
+            disable_tp=current_platform.is_tpu(),
             prefix=f"{prefix}.o_proj",
         )
-        self.attn_gate = ReplicatedLinear(
+        self.attn_gate = ColumnParallelLinear(
             cfg.hidden_dim,
             cfg.num_heads,
             bias=False,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            disable_tp=True,
+            disable_tp=current_platform.is_tpu(),
             prefix=f"{prefix}.attn_gate",
         )
         self.sconv_k = (
@@ -976,6 +1046,8 @@ class GrugMoeAttention(nn.Module):
             if cfg.is_hero and cfg.sconv and "k" in cfg.sconv_sites
             else None
         )
+        if self.sconv_k is not None and self.tp_size > 1:
+            self.sconv_k.weight.weight_loader = self._load_sconv_k_weight
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=cfg.max_seq_len,
@@ -986,7 +1058,7 @@ class GrugMoeAttention(nn.Module):
             is_neox_style=not cfg.rope_fused,
         )
         self.attn = Attention(
-            cfg.num_heads,
+            self.num_heads,
             self.head_dim,
             self.head_dim**-0.5,
             num_kv_heads=self.cache_kv_heads,
@@ -995,6 +1067,13 @@ class GrugMoeAttention(nn.Module):
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=AttentionType.DECODER,
+        )
+
+    def _load_sconv_k_weight(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        default_weight_loader(
+            param, loaded_weight.narrow(1, self.tp_rank * self.kv_size, self.kv_size)
         )
 
     def apply_xsa(
@@ -1007,8 +1086,8 @@ class GrugMoeAttention(nn.Module):
         value_heads = value_states.view(
             num_tokens, self.cache_kv_heads, self.head_dim
         )
-        aligned_value = _align_kv_heads(value_heads, self.cfg.num_heads)
-        attn_heads = attn_output.view(num_tokens, self.cfg.num_heads, self.head_dim)
+        aligned_value = _align_kv_heads(value_heads, self.num_heads)
+        attn_heads = attn_output.view(num_tokens, self.num_heads, self.head_dim)
 
         dot = torch.sum(attn_heads * aligned_value, dim=-1, keepdim=True)
         value_norm_sq = torch.sum(aligned_value * aligned_value, dim=-1, keepdim=True)
@@ -1030,10 +1109,10 @@ class GrugMoeAttention(nn.Module):
             k = self.sconv_k(k)
 
         num_tokens = hidden_states.shape[0]
-        q = _rms_norm(q.view(num_tokens, self.cfg.num_heads, self.head_dim))
-        k = k.view(num_tokens, self.cfg.num_kv_heads, self.head_dim)
-        v = v.view(num_tokens, self.cfg.num_kv_heads, self.head_dim)
-        if self.logical_kv_heads != self.cfg.num_kv_heads:
+        q = _rms_norm(q.view(num_tokens, self.num_heads, self.head_dim))
+        k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+        v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+        if self.tp_size == 1 and self.logical_kv_heads != self.cfg.num_kv_heads:
             k = _align_kv_heads(k[:, : self.logical_kv_heads], self.cache_kv_heads)
             v = _align_kv_heads(v[:, : self.logical_kv_heads], self.cache_kv_heads)
         k = _rms_norm(k)
@@ -1203,6 +1282,15 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 "GrugMoE does not support Partial Key Offset; export a checkpoint "
                 "with disable_pko=true"
             )
+        if (
+            current_platform.is_cuda()
+            and vllm_config.parallel_config.tensor_parallel_size > 1
+            and not self.config.logical_kv_cache
+        ):
+            raise ValueError(
+                "Hero tensor parallelism requires compact KV storage; use "
+                "unquantized KV storage and grug_logical_kv_cache=true"
+            )
         self.params_dtype = vllm_config.model_config.dtype
         self.quant_config = vllm_config.quant_config
 
@@ -1340,10 +1428,39 @@ def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
             "GrugMoE supports only online FP8 quantization on GPU "
             "and unquantized execution on TPU"
         )
-    if not is_tpu and parallel_config.tensor_parallel_size != 1:
-        raise NotImplementedError(
-            "GrugMoE expert-parallel GPU serving requires tensor_parallel_size=1"
+    tp_size = parallel_config.tensor_parallel_size
+    if not is_tpu and tp_size != 1:
+        hf_config = None if model_config is None else model_config.hf_text_config
+        is_hero = (
+            hf_config is not None
+            and getattr(hf_config, "grugmoe_artifact_schema_version", 1)
+            == _HERO_ARTIFACT_SCHEMA_VERSION
         )
+        if not is_hero:
+            raise NotImplementedError(
+                "GrugMoE GPU serving outside Hero requires tensor_parallel_size=1"
+            )
+        if tp_size not in (2, 6):
+            raise NotImplementedError(
+                f"Hero GPU serving supports TP1, TP2 and TP6; got TP{tp_size}. "
+                "Choose a supported size that divides all six global KV heads."
+            )
+        if model_config.dtype != torch.bfloat16 or quant_config is not None:
+            raise NotImplementedError(
+                "Hero TP2/TP6 currently requires BF16 weights and execution; "
+                "use dtype=bfloat16 without quantization, or TP1 for online FP8"
+            )
+        compilation = vllm_config.compilation_config
+        if compilation.cudagraph_mode.has_piecewise_cudagraphs() and {
+            "vllm::moe_forward", "vllm::moe_forward_shared",
+        }.intersection(compilation.splitting_ops or []):
+            # A split MoE can return a fresh buffer that a replayed graph
+            # still reads at its captured address.
+            raise NotImplementedError(
+                "Hero TP2/TP6 MoE operations must remain inside CUDA graphs. "
+                "Remove vllm::moe_forward and vllm::moe_forward_shared from "
+                "splitting_ops; keep vllm::grug_moe_short_conv split."
+            )
     if (
         not is_tpu
         and parallel_config.tensor_parallel_size
@@ -1466,7 +1583,12 @@ class GrugMoeForCausalLM(
             hf_config = vllm_config.model_config.hf_config
         cfg = GrugMoeRuntimeConfig.from_hf_config(hf_config)
         return MambaStateShapeCalculator.short_conv_state_shape(
-            tp_world_size=vllm_config.parallel_config.tensor_parallel_size,
+            # GPU output convolutions run after the TP reduction. Preserve
+            # the existing TPU cache sizing.
+            tp_world_size=(
+                vllm_config.parallel_config.tensor_parallel_size
+                if current_platform.is_tpu() else 1
+            ),
             intermediate_size=cfg.hidden_dim,
             conv_kernel=cfg.sconv_kernel,
         )
@@ -1478,6 +1600,37 @@ class GrugMoeForCausalLM(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         _raise_for_unsupported_modes(vllm_config)
+        if (
+            current_platform.is_cuda()
+            and vllm_config.parallel_config.tensor_parallel_size == 2
+        ):
+            from vllm.distributed.device_communicators.cuda_communicator import (
+                CudaCommunicator,
+            )
+
+            # Configs can cross process/node boundaries after the early check.
+            GrugMoeForCausalLMConfig.verify_tp2_all_reduce_config(vllm_config)
+            communicator = get_tp_group().device_communicator
+            if (
+                not isinstance(communicator, CudaCommunicator)
+                or communicator.pynccl_comm is None
+                or communicator.pynccl_comm.disabled
+                or any(backend is not None for backend in (
+                    communicator.ca_comm, communicator.fi_ar_comm,
+                    communicator.fi_pcie_ipc_ar_comm, communicator.symm_mem_comm,
+                    communicator.qr_comm, communicator.aiter_ar_comm,
+                ))
+            ):
+                raise RuntimeError(
+                    "Hero TP2 did not initialize the qualified NCCL communicator. "
+                    "Apply the required TP2 settings on every node and restart."
+                )
+            logger.info(
+                "Hero TP2 rank %d: verified native NCCL all-reduce; "
+                "custom/FlashInfer/symmetric-memory reductions and "
+                "all-reduce/RMSNorm fusion disabled.",
+                get_tensor_model_parallel_rank(),
+            )
         hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
         if hf_config is None:
             hf_config = vllm_config.model_config.hf_config

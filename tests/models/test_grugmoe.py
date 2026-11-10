@@ -809,12 +809,38 @@ def _patch_grug_parallel_runtime(monkeypatch, fake_config, *, is_tpu):
     )
 
 
-def test_grug_moe_preserves_gpu_tensor_parallel_restriction(monkeypatch):
-    fake_config = _minimal_vllm_config_for_mode_check(tensor_parallel_size=8)
-    _patch_grug_parallel_runtime(monkeypatch, fake_config, is_tpu=False)
+@pytest.mark.parametrize("schema,tp_size", [(1, 2), (2, 3), (2, 4), (2, 12)])
+def test_grug_gpu_tp_rejects_unqualified_layouts(monkeypatch, schema, tp_size):
+    """The new Hero modes must not enable unsupported or duplicated layouts."""
+    config = _minimal_vllm_config_for_mode_check(tensor_parallel_size=tp_size)
+    config.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(grugmoe_artifact_schema_version=schema),
+        dtype=torch.bfloat16,
+    )
+    _patch_grug_parallel_runtime(monkeypatch, config, is_tpu=False)
+    with pytest.raises(
+        NotImplementedError, match="requires tensor_parallel_size=1|TP1, TP2 and TP6"
+    ):
+        _raise_for_unsupported_modes(config)
 
-    with pytest.raises(NotImplementedError, match="tensor_parallel_size=1"):
-        _raise_for_unsupported_modes(fake_config)
+
+def test_hero_tp_rejects_split_moe_with_unstable_graph_inputs(monkeypatch):
+    """Reject the TP replay configuration that produced stale reads and NaNs."""
+    config = _minimal_vllm_config_for_mode_check(tensor_parallel_size=2)
+    config.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(grugmoe_artifact_schema_version=2, sconv=True),
+        dtype=torch.bfloat16,
+    )
+    config.compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        splitting_ops=["vllm::grug_moe_short_conv", "vllm::moe_forward"],
+    )
+    _patch_grug_parallel_runtime(monkeypatch, config, is_tpu=False)
+    with pytest.raises(NotImplementedError, match="MoE operations"):
+        _raise_for_unsupported_modes(config)
+    # Native MoE capture must stay usable with the required ShortConv split.
+    config.compilation_config.splitting_ops.remove("vllm::moe_forward")
+    _raise_for_unsupported_modes(config)
 
 
 @pytest.mark.parametrize(

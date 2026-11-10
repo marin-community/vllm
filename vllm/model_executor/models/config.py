@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
@@ -462,7 +463,42 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
 
 class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
+    def verify_tp2_all_reduce_config(vllm_config: "VllmConfig") -> None:
+        """Require the qualified Hero TP2 recipe before serving requests."""
+        if (
+            not current_platform.is_cuda()
+            or vllm_config.parallel_config.tensor_parallel_size != 2
+            or getattr(
+                vllm_config.model_config.hf_text_config,
+                "grugmoe_artifact_schema_version", 1,
+            ) != 2
+        ):
+            return
+        if (
+            vllm_config.parallel_config.disable_custom_all_reduce
+            and vllm_config.compilation_config.pass_config.fuse_allreduce_rms is False
+            and not vllm_config.compilation_config.pass_config.enable_sp
+            and not vllm_config.compilation_config.pass_config.fuse_gemm_comms
+            and not envs.VLLM_ALLREDUCE_USE_FLASHINFER
+            and not envs.VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC
+            and not envs.VLLM_ALLREDUCE_USE_SYMM_MEM
+            and not envs.VLLM_USE_NCCL_SYMM_MEM
+        ):
+            return
+        raise ValueError(
+            "Hero TP2 requires native NCCL all-reduce for cache correctness. "
+            "On every node, set VLLM_ALLREDUCE_USE_FLASHINFER=0 "
+            "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=0 "
+            "VLLM_ALLREDUCE_USE_SYMM_MEM=0 VLLM_USE_NCCL_SYMM_MEM=0; "
+            "pass --disable-custom-all-reduce and set "
+            "pass_config.fuse_allreduce_rms=false, pass_config.enable_sp=false "
+            "and pass_config.fuse_gemm_comms=false in --compilation-config "
+            "(merge this into the existing PIECEWISE/ShortConv configuration)."
+        )
+
+    @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        GrugMoeForCausalLMConfig.verify_tp2_all_reduce_config(vllm_config)
         hf_config = vllm_config.model_config.hf_text_config
         priorities = vllm_config.kernel_config.ir_op_priority
         if (
