@@ -116,8 +116,10 @@ upstream base, build settings, builder image, wheel contents, and SHA-256. Schem
 uses the final release tag throughout, including each qualification record's
 `release_tag` and wheel URL.
 
-Qualification installs the x86_64 wheel on one H100 in `cw-rno2a` and the
-aarch64 wheel on one GB200 in `cw-us-east-08a`. Both jobs check the
+Qualification installs the x86_64 wheel on one interactive-priority H100 in
+`cw-us-east-02a` and the aarch64 wheel on one production-priority GB200 in
+`cw-us-east-08a`. Placement and priority come from each platform's validation
+configuration. Both jobs check the
 `vllm._C_stable_libtorch` extension and GrugMoE model implementation, allocate
 through cuMem, and serve `Qwen/Qwen3-0.6B` against the hardware's smoke-test
 spec. The H100 job also checks sparse NCCL weight transfer and runs the fork's

@@ -662,6 +662,7 @@ def validation_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
                 "hardware": validation["gpu"],
                 "gpu_resource": validation["gpu_resource"],
                 "target_cluster": validation["target_cluster"],
+                "priority": validation["priority"],
                 "cpu": validation["cpu"],
                 "memory": validation["memory"],
             }

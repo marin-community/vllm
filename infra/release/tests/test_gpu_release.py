@@ -356,6 +356,7 @@ def test_validation_matrix_projects_iris_resources_from_release_config():
                 "hardware": platform["validation"]["gpu"],
                 "gpu_resource": platform["validation"]["gpu_resource"],
                 "target_cluster": platform["validation"]["target_cluster"],
+                "priority": platform["validation"]["priority"],
                 "cpu": platform["validation"]["cpu"],
                 "memory": platform["validation"]["memory"],
             }

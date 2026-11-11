@@ -431,7 +431,7 @@ jobs:
           set -o pipefail
           iris --cluster marin job run \
             --target-cluster "${{ matrix.target_cluster }}" \
-            --priority interactive \
+            --priority "${{ matrix.priority }}" \
             --job-name "$JOB_NAME" \
             --user "$JOB_USER" \
             --task-image "$TASK_IMAGE" \
