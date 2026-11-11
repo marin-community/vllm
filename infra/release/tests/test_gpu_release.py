@@ -27,7 +27,6 @@ from infra.release.gpu_release import (
     inspect_wheel,
     validate_build,
     validate_wheel_fragment,
-    validation_matrix,
     verify_release_assets,
 )
 from infra.release.release_common import ReleaseError, load_json, sha256_file
@@ -344,24 +343,26 @@ def test_build_rejects_cross_arch_source_mismatch(tmp_path):
         )
 
 
-def test_validation_matrix_projects_iris_resources_from_release_config():
-    config = load_json(CONFIG_PATH)
+def test_validation_matrix_cli_keeps_hardware_priority_policy():
+    # This JSON is the GitHub Actions matrix that controls real Iris scheduling.
+    output = subprocess.check_output(
+        [
+            sys.executable,
+            str(REPOSITORY_ROOT / "infra/release/gpu_release.py"),
+            "validation-matrix",
+            "--config",
+            str(CONFIG_PATH),
+        ],
+        text=True,
+    )
+    matrix = json.loads(output)
 
-    matrix = validation_matrix(config)
-
-    assert matrix == {
-        "include": [
-            {
-                "architecture": architecture,
-                "hardware": platform["validation"]["gpu"],
-                "gpu_resource": platform["validation"]["gpu_resource"],
-                "target_cluster": platform["validation"]["target_cluster"],
-                "priority": platform["validation"]["priority"],
-                "cpu": platform["validation"]["cpu"],
-                "memory": platform["validation"]["memory"],
-            }
-            for architecture, platform in config["platforms"].items()
-        ]
+    assert {
+        (item["hardware"], item["target_cluster"], item["priority"])
+        for item in matrix["include"]
+    } == {
+        ("H100", "cw-us-east-02a", "interactive"),
+        ("GB200", "cw-us-east-08a", "production"),
     }
 
 
