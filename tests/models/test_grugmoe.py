@@ -16,6 +16,7 @@ from torch import nn
 from transformers import AutoConfig
 
 from tests.utils import ensure_current_vllm_config
+from vllm import LLM, SamplingParams
 from vllm.config import (
     CUDAGraphMode,
     get_current_vllm_config,
@@ -48,6 +49,7 @@ from vllm.model_executor.models.grugmoe import (
     GrugMoeRouter,
     GrugMoeRuntimeConfig,
     GrugMoeShortConv,
+    _log_scaling_factor,
     _raise_for_unsupported_modes,
     _try_load_grug_expert_weight,
     get_grug_moe_runtime_info,
@@ -265,6 +267,7 @@ class _CaptureAttention(nn.Module):
     def __init__(self, q_size: int) -> None:
         super().__init__()
         self.q_size = q_size
+        self.q: torch.Tensor | None = None
         self.k: torch.Tensor | None = None
         self.v: torch.Tensor | None = None
 
@@ -274,6 +277,7 @@ class _CaptureAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
+        self.q = q
         self.k = k
         self.v = v
         return torch.zeros(q.shape[0], self.q_size, dtype=q.dtype)
@@ -454,10 +458,15 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 @pytest.mark.parametrize(
     ("schema", "priority", "single_round"),
-    [(1, None, True), (1, ["native"], False), (2, None, False)],
+    [
+        (1, None, True),
+        (1, ["native"], False),
+        (2, None, False),
+        (2, ["vllm_c"], True),
+    ],
 )
 def test_grug_moe_norm_defaults_follow_training_rounding(
-    tmp_path, schema, priority, single_round,
+    tmp_path, schema, priority, single_round
 ):
     GrugMoeConfig(
         architectures=["GrugMoeForCausalLM"],
@@ -1782,3 +1791,267 @@ def test_hero_yarn_rejects_full_dimension_amplitude_rescaling():
                 "mscale_all_dim": 1.0,
             },
         )
+
+
+def _log_scaled_hero_config(n_floor: int, alpha: float, power: float):
+    return replace(
+        _tiny_hero_config(),
+        artifact_schema_version=3,
+        sconv=False,
+        log_scaling_n_floor=n_floor,
+        log_scaling_alpha=alpha,
+        log_scaling_power=power,
+    ).validate()
+
+
+def test_log_scaling_factor_matches_the_training_model():
+    # Marin's hero values: floor 65536, slope 0.1, power 2 give 1.296 at 262144.
+    cfg = _log_scaled_hero_config(65536, 0.1, 2.0)
+    visible_keys = torch.tensor([1, 65536, 131072, 262144])
+
+    factor = _log_scaling_factor(visible_keys, cfg)
+
+    expected = torch.tensor([1.0, 1.0, 1.143433966251171, 1.2964769927807063])
+    torch.testing.assert_close(factor, expected, rtol=1e-6, atol=0)
+
+
+def test_log_scaling_scales_each_global_query_by_its_own_position():
+    cfg = _log_scaled_hero_config(4, 0.5, 2.0)
+    q = torch.linspace(-1.0, 1.0, 4 * 16).view(4, 16)
+    k = torch.linspace(1.0, 2.0, 4 * 8).view(4, 8)
+    positions = torch.tensor([0, 3, 4, 7])
+
+    layer_names = iter(range(100))
+
+    def captured_q(module_cfg, is_global, rows):
+        module = GrugMoeAttention(
+            module_cfg,
+            cache_config=None,
+            params_dtype=torch.float32,
+            sliding_window=None if is_global else module_cfg.sliding_window,
+            use_rope=False,
+            qk_mult_scale=1.0,
+            is_global=is_global,
+            prefix=f"log_scaling.{next(layer_names)}",
+        )
+        module.q_proj = _FixedProjection(q[rows])
+        module.k_proj = _FixedProjection(k[rows])
+        module.v_proj = _FixedProjection(k[rows])
+        capture = _CaptureAttention(module.q_size)
+        module.attn = capture
+        module(positions[rows], torch.zeros(len(positions[rows]), cfg.hidden_dim))
+        assert capture.q is not None
+        return capture.q
+
+    all_rows = slice(None)
+    off = replace(
+        cfg,
+        log_scaling_n_floor=None,
+        log_scaling_alpha=None,
+        log_scaling_power=None,
+    ).validate()
+    # A query that sees n keys is scaled by (1 + 0.5 ln(max(n / 4, 1)))^2.
+    factor = torch.tensor(
+        [1.0, 1.0, (1 + 0.5 * math.log(5 / 4)) ** 2, (1 + 0.5 * math.log(2)) ** 2]
+    )
+    torch.testing.assert_close(
+        captured_q(cfg, True, all_rows),
+        captured_q(off, True, all_rows) * factor[:, None],
+    )
+    torch.testing.assert_close(
+        captured_q(cfg, False, all_rows), captured_q(off, False, all_rows)
+    )
+    # The factor depends only on a token's own position, so a decode step or a
+    # later prefill chunk gets the same query as the whole prompt at once.
+    torch.testing.assert_close(
+        captured_q(cfg, True, slice(3, 4)), captured_q(cfg, True, all_rows)[3:]
+    )
+
+
+def _write_hero_config(path, **fields) -> None:
+    path.mkdir()
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["GrugMoeForCausalLM"],
+                "model_type": "grug_moe",
+                "vocab_size": 64,
+                "hidden_size": 16,
+                "moe_intermediate_size": 6,
+                "shared_expert_intermediate_size": 5,
+                "num_shared_experts": 2,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "latent_dim": 8,
+                "num_hidden_layers": 5,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "local_kv_heads": 1,
+                "global_kv_heads": 2,
+                "head_dim": 32,
+                "max_position_embeddings": 128,
+                "sliding_window": 8,
+                "global_every": 3,
+                "rope_fused": True,
+                "sconv": False,
+                "grugmoe_artifact_schema_version": 2,
+                **fields,
+            }
+        )
+    )
+
+
+_LOG_SCALING_FIELDS = {
+    "grugmoe_artifact_schema_version": 3,
+    "log_scaling_n_floor": 8,
+    "log_scaling_alpha": 0.5,
+    "log_scaling_power": 2.0,
+}
+
+
+@pytest.mark.parametrize(
+    "log_scaling",
+    [
+        dict(log_scaling_n_floor=8, log_scaling_alpha=0.5, log_scaling_power=2.0),
+        # Schema 3 always carries the fields; null turns log scaling off.
+        dict(log_scaling_n_floor=None, log_scaling_alpha=None, log_scaling_power=None),
+    ],
+)
+def test_schema_3_config_loads_log_scaling(tmp_path, log_scaling):
+    _write_hero_config(
+        tmp_path / "model", grugmoe_artifact_schema_version=3, **log_scaling
+    )
+
+    cfg = GrugMoeRuntimeConfig.from_hf_config(
+        get_config(tmp_path / "model", trust_remote_code=False)
+    )
+
+    assert cfg.is_hero
+    assert {name: getattr(cfg, name) for name in log_scaling} == log_scaling
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        # Log scaling without schema 3 would load on a wheel that ignores it.
+        {**_LOG_SCALING_FIELDS, "grugmoe_artifact_schema_version": 2},
+        {**_LOG_SCALING_FIELDS, "log_scaling_power": None},
+    ],
+)
+def test_log_scaling_requires_schema_3_and_all_three_fields(tmp_path, fields):
+    _write_hero_config(tmp_path / "model", **fields)
+    hf_config = get_config(tmp_path / "model", trust_remote_code=False)
+
+    with pytest.raises(ValueError, match="log scaling|log_scaling"):
+        GrugMoeRuntimeConfig.from_hf_config(hf_config)
+
+
+def _scale_dummy_weights(model: nn.Module) -> None:
+    # Dummy weights lie in [-1e-3, 1e-3]; widen them so attention, and with it
+    # the query scale, moves the logits well above float32 noise.
+    with torch.no_grad():
+        for param in model.parameters():
+            param.mul_(300.0)
+
+
+def _target_logprobs(output) -> list[float]:
+    return [
+        next(iter(entry.values())).logprob
+        for entry in output.prompt_logprobs[1:]
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_log_scaling_is_identical_across_prefill_chunking_prefix_cache_and_decode(
+    tmp_path, monkeypatch
+):
+    # apply_model sends a function to the engine-core process.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    # flashinfer's sampler JIT-compiles with nvcc, which the CI image lacks.
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    _write_hero_config(tmp_path / "on", **_LOG_SCALING_FIELDS)
+    _write_hero_config(
+        tmp_path / "off",
+        grugmoe_artifact_schema_version=3,
+        log_scaling_n_floor=None,
+        log_scaling_alpha=None,
+        log_scaling_power=None,
+    )
+    generator = torch.Generator().manual_seed(0)
+    prompt = torch.randint(0, 64, (40,), generator=generator).tolist()
+    greedy = SamplingParams(temperature=0.0, max_tokens=8, logprobs=0, detokenize=False)
+    scored = SamplingParams(
+        temperature=0.0, max_tokens=1, prompt_logprobs=0, detokenize=False
+    )
+
+    def engine(model_dir, max_num_batched_tokens):
+        llm = LLM(
+            model=str(model_dir),
+            skip_tokenizer_init=True,
+            load_format="dummy",
+            dtype="float32",
+            # FlexAttention, the default for float32, recompiles per layer mask.
+            attention_backend="TRITON_ATTN",
+            max_model_len=128,
+            max_num_batched_tokens=max_num_batched_tokens,
+            enable_prefix_caching=True,
+            gpu_memory_utilization=0.2,
+        )
+        llm.apply_model(_scale_dummy_weights)
+        return llm
+
+    llm = engine(tmp_path / "on", 128)
+    decoded = llm.generate({"prompt_token_ids": prompt}, greedy)[0].outputs[0]
+    sequence = prompt + list(decoded.token_ids[:-1])
+    decode_logprobs = [
+        entry[token].logprob
+        for token, entry in zip(decoded.token_ids, decoded.logprobs)
+    ]
+    whole = _target_logprobs(
+        llm.generate({"prompt_token_ids": sequence}, scored)[0]
+    )
+    # Its prompt starts with full blocks cached by the requests above.
+    cached = llm.generate(
+        {"prompt_token_ids": prompt + [decoded.token_ids[0]]}, greedy
+    )[0]
+    del llm
+    cleanup_dist_env_and_memory()
+
+    llm = engine(tmp_path / "on", 16)
+    chunked = _target_logprobs(llm.generate({"prompt_token_ids": sequence}, scored)[0])
+    del llm
+    cleanup_dist_env_and_memory()
+
+    llm = engine(tmp_path / "off", 128)
+    unscaled = _target_logprobs(llm.generate({"prompt_token_ids": sequence}, scored)[0])
+    del llm
+    cleanup_dist_env_and_memory()
+
+    tolerance = {"rtol": 0, "atol": 1e-4}
+    # whole[j - 1] scores token j from the query at position j - 1.
+    torch.testing.assert_close(
+        torch.tensor(whole[len(prompt) - 1 :]),
+        torch.tensor(decode_logprobs[:-1]),
+        **tolerance,
+    )
+    torch.testing.assert_close(torch.tensor(chunked), torch.tensor(whole), **tolerance)
+    assert cached.num_cached_tokens > 0
+    assert list(cached.outputs[0].token_ids[:7]) == list(decoded.token_ids[1:])
+    torch.testing.assert_close(
+        torch.tensor(
+            [
+                entry[token].logprob
+                for token, entry in zip(
+                    cached.outputs[0].token_ids[:7], cached.outputs[0].logprobs
+                )
+            ]
+        ),
+        torch.tensor(decode_logprobs[1:]),
+        **tolerance,
+    )
+    # Queries at positions below the floor of 8 keys are unscaled; later ones
+    # are not, so the comparison above is sensitive to the factor.
+    torch.testing.assert_close(
+        torch.tensor(whole[:8]), torch.tensor(unscaled[:8]), **tolerance
+    )
+    assert (torch.tensor(whole[9:]) - torch.tensor(unscaled[9:])).abs().max() > 1e-2

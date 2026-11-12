@@ -80,6 +80,7 @@ _ROUTER_COMBINE_WEIGHT_SUM = 2.5
 _ROUTER_COMBINE_WEIGHT_EPS = 1e-9
 _UNQUANTIZED_METHOD = "unquantized"
 _HERO_ARTIFACT_SCHEMA_VERSION = 2
+_HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION = 3
 _SUPPORTED_SCONV_SITES = frozenset({"k", "attn", "mlp"})
 
 
@@ -226,6 +227,9 @@ class GrugMoeRuntimeConfig:
     initializer_std: float = 0.02
     qk_mult: float = 1.0
     qk_mult_long_scale: float = 1.0
+    log_scaling_n_floor: int | None = None
+    log_scaling_alpha: float | None = None
+    log_scaling_power: float | None = None
     disable_pko: bool = True
     disable_long_rope: bool = True
     rope_fused: bool = False
@@ -306,6 +310,15 @@ class GrugMoeRuntimeConfig:
             qk_mult_long_scale=float(
                 _config_attr(config, ("qk_mult_long_scale",), 1.0)
             ),
+            log_scaling_n_floor=_optional(
+                int, _config_attr(config, ("log_scaling_n_floor",))
+            ),
+            log_scaling_alpha=_optional(
+                float, _config_attr(config, ("log_scaling_alpha",))
+            ),
+            log_scaling_power=_optional(
+                float, _config_attr(config, ("log_scaling_power",))
+            ),
             disable_pko=bool(_config_attr(config, ("disable_pko",), True)),
             disable_long_rope=bool(_config_attr(config, ("disable_long_rope",), True)),
             rope_fused=bool(_config_attr(config, ("rope_fused",), False)),
@@ -338,7 +351,10 @@ class GrugMoeRuntimeConfig:
 
     @property
     def is_hero(self) -> bool:
-        return self.artifact_schema_version == _HERO_ARTIFACT_SCHEMA_VERSION
+        return self.artifact_schema_version in (
+            _HERO_ARTIFACT_SCHEMA_VERSION,
+            _HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION,
+        )
 
     @property
     def expert_dim(self) -> int:
@@ -353,6 +369,7 @@ class GrugMoeRuntimeConfig:
         if self.artifact_schema_version not in (
             1,
             _HERO_ARTIFACT_SCHEMA_VERSION,
+            _HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION,
         ):
             raise ValueError(
                 "unsupported grugmoe_artifact_schema_version="
@@ -381,6 +398,27 @@ class GrugMoeRuntimeConfig:
                     ", ".join(hero_fields)
                     + " require grugmoe_artifact_schema_version=2"
                 )
+        log_scaling = (
+            self.log_scaling_n_floor,
+            self.log_scaling_alpha,
+            self.log_scaling_power,
+        )
+        if len({field is None for field in log_scaling}) != 1:
+            raise ValueError(
+                "log_scaling_n_floor, log_scaling_alpha and log_scaling_power "
+                "must be set together"
+            )
+        log_scaling_schema = _HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION
+        if (
+            self.log_scaling_n_floor is not None
+            and self.artifact_schema_version != log_scaling_schema
+        ):
+            raise ValueError(
+                "log scaling requires grugmoe_artifact_schema_version="
+                f"{_HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION}"
+            )
+        if self.log_scaling_n_floor is not None and min(log_scaling) <= 0:
+            raise ValueError("log scaling fields must be positive")
         if self.vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
         if self.hidden_dim <= 0:
@@ -451,6 +489,21 @@ class GrugMoeRuntimeConfig:
             )
         _ = self.attention_layer_types
         return self
+
+
+def _optional(cast: Any, value: Any) -> Any:
+    return None if value is None else cast(value)
+
+
+def _log_scaling_factor(
+    visible_keys: torch.Tensor, cfg: GrugMoeRuntimeConfig
+) -> torch.Tensor:
+    """``(1 + alpha * ln(max(n / n_floor, 1))) ** power`` in float32, as in Marin."""
+    assert cfg.log_scaling_n_floor is not None
+    assert cfg.log_scaling_alpha is not None and cfg.log_scaling_power is not None
+    ratio = visible_keys.to(torch.float32) / cfg.log_scaling_n_floor
+    factor = 1.0 + cfg.log_scaling_alpha * torch.log(torch.clamp(ratio, min=1.0))
+    return factor if cfg.log_scaling_power == 1.0 else factor**cfg.log_scaling_power
 
 
 class GrugMoeGatedNorm(nn.Module):
@@ -904,6 +957,7 @@ class GrugMoeAttention(nn.Module):
         self.use_rope = use_rope
         self.logical_kv_heads = cfg.logical_kv_heads(is_global=is_global)
         self.qk_mult_scale = qk_mult_scale
+        self.log_scaling = is_global and cfg.log_scaling_n_floor is not None
 
         self.q_proj = ReplicatedLinear(
             cfg.hidden_dim,
@@ -1028,6 +1082,16 @@ class GrugMoeAttention(nn.Module):
         if self.use_rope:
             q, k = self.rotary_emb(positions, q, k)
         q = q * self.cfg.qk_mult * self.qk_mult_scale
+        if self.log_scaling:
+            # Scale Q before the kernel so every backend keeps its scalar softmax
+            # scale. A token at 0-based position p sees p + 1 keys in its request,
+            # in prefill, chunked prefill and decode alike. Round the factor to
+            # Q's dtype as the training model does.
+            factor = _log_scaling_factor(positions + 1, self.cfg)
+            q = (
+                q.view(num_tokens, self.cfg.num_heads, self.head_dim)
+                * factor.to(q.dtype)[:, None, None]
+            ).reshape(num_tokens, self.q_size)
 
         attn_output = self.attn(q, k, v)
         attn_output = self.apply_xsa(hidden_states, attn_output, v)
