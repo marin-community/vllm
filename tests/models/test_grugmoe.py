@@ -219,6 +219,9 @@ def _fill_parameter(param: torch.Tensor, start: float, end: float) -> None:
 
 def _process_moe_weights(module: GrugMoeMLP) -> None:
     routed_experts = module.experts.routed_experts
+    # The CPU reference reads logical weights, before GPU-specific packing.
+    if routed_experts.w13_weight.device.type == "cpu":
+        return
     routed_experts.quant_method.process_weights_after_loading(routed_experts)
 
 
@@ -1346,9 +1349,10 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
             -0.25,
         )
         _fill_parameter(routed_experts.w2_weight, -0.1, 0.2)
+        # FlashInfer packs weights in place; the oracle needs the logical layout.
+        expected = _reference_moe(x, mlp)
         _process_moe_weights(mlp)
 
-    expected = _reference_moe(x, mlp)
     # The fused-MoE kernels allocate through the workspace manager, which a real run
     # installs in GPUModelRunner.__init__. This test drives the layer directly, so it
     # has to do the same setup itself.
@@ -1930,6 +1934,8 @@ def test_log_scaling_is_identical_across_prefill_chunking_prefix_cache_and_decod
             dtype="float32",
             # FlexAttention, the default for float32, recompiles per layer mask.
             attention_backend="TRITON_ATTN",
+            # FlashInfer's SM100 MoE kernel does not support float32.
+            moe_backend="triton",
             max_model_len=128,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=True,
