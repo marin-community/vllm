@@ -39,11 +39,13 @@ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
 from vllm.model_executor.model_loader.reload.meta import materialize_layer
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.grugmoe import (
     _ROUTER_COMBINE_WEIGHT_EPS,
     _ROUTER_COMBINE_WEIGHT_SUM,
     GrugMoeAttention,
     GrugMoeDecoderLayer,
+    GrugMoeDenseMLP,
     GrugMoeGatedNorm,
     GrugMoeMLP,
     GrugMoeModel,
@@ -59,6 +61,7 @@ from vllm.model_executor.models.registry import ModelRegistry
 from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
+from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -1580,6 +1583,136 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
         repeated = quantized(poisoned)[: x.shape[0]]
 
     torch.testing.assert_close(repeated, clean, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="requires CUDA with FP8 support",
+)
+@pytest.mark.parametrize("num_tokens", [1, 7])
+def test_hero_online_fp8_latent_and_shared_experts_match_bf16(num_tokens, monkeypatch):
+    cfg = replace(
+        _tiny_hero_config(),
+        hidden_dim=128,
+        latent_dim=64,
+        intermediate_dim=64,
+        shared_expert_intermediate_dim=64,
+        head_dim=32,
+    ).validate()
+    monkeypatch.setattr(
+        get_current_vllm_config(), "model_config", SimpleNamespace(dtype=torch.bfloat16)
+    )
+    modules = []
+    # Online loaders record the construction device and materialize weights there.
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        for profile, quant_config in (("reference", None), ("fp8", Fp8Config())):
+            modules.append(
+                nn.ModuleDict(
+                    {
+                        "mlp": GrugMoeMLP(
+                            cfg, quant_config=quant_config, prefix=f"{profile}.mlp"
+                        ),
+                        "shared_experts": nn.ModuleList(
+                            GrugMoeDenseMLP(
+                                cfg.hidden_dim,
+                                cfg.shared_expert_intermediate_dim,
+                                torch.bfloat16,
+                                quant_config=quant_config,
+                                prefix=f"{profile}.shared_experts.{index}",
+                            )
+                            for index in range(cfg.num_shared_experts)
+                        ),
+                    }
+                )
+            )
+    reference, quantized = modules
+    with torch.no_grad():
+        powers = torch.tensor([1, 2, 4, 8], device="cuda", dtype=torch.bfloat16)
+        for index, (name, parameter) in enumerate(reference.named_parameters()):
+            if name == "mlp.latent_norm.weight":
+                parameter.fill_(1)
+            elif name == "mlp.router.weight":
+                _fill_parameter(parameter, -0.1, 0.1)
+            elif name == "mlp.router.bias":
+                _fill_parameter(parameter, 0.2, -0.2)
+            else:
+                rows = torch.arange(parameter.shape[-2], device="cuda") // 16
+                columns = torch.arange(parameter.shape[-1], device="cuda") // 16
+                pattern = powers[(rows[:, None] + 2 * columns + index) % 4]
+                parameter.copy_(pattern / 128)
+        # Distinguish gate/up halves, latent inputs and routed expert IDs.
+        experts = reference["mlp"].experts.routed_experts
+        experts.w13_weight[:, cfg.intermediate_dim :].mul_(2)
+        experts.w13_weight[:, :, :16].mul_(2)
+        for expert_id in range(cfg.num_experts):
+            experts.w13_weight[expert_id].mul_(2**expert_id / 8)
+            experts.w2_weight[expert_id].mul_(2**-expert_id)
+        reference["mlp"].router.weight.copy_(
+            reference["mlp"].router.weight.bfloat16().float()
+        )
+
+        # The 7:2 input blocks scale exactly to FP8 values 448:128. Negative rows
+        # exercise the other routed experts; unequal blocks expose misloaded axes.
+        inputs = torch.tensor([7 / 32, 2 / 32], device="cuda", dtype=torch.bfloat16)
+        blocks = (torch.arange(cfg.hidden_dim, device="cuda") // 16) % 2
+        x = inputs[blocks].repeat(num_tokens, 1)
+        x[1::2].mul_(-4)
+        routed_expected = _reference_moe(x, reference["mlp"])
+        shared_expected = [
+            _reference_dense_mlp(x, expert) for expert in reference["shared_experts"]
+        ]
+        expected = sum(shared_expected, routed_expected)
+
+        params_dict = dict(quantized.named_parameters())
+        for name, weight in reference.named_parameters():
+            if name == "mlp.experts.routed_experts.w13_weight":
+                for projection, shard in (
+                    ("gate_proj", weight[:, : cfg.intermediate_dim]),
+                    ("up_proj", weight[:, cfg.intermediate_dim :]),
+                ):
+                    _try_load_grug_expert_weight(
+                        f"mlp.experts.{projection}.weight", shard, params_dict
+                    )
+            elif name == "mlp.experts.routed_experts.w2_weight":
+                _try_load_grug_expert_weight(
+                    "mlp.experts.down_proj.weight", weight, params_dict
+                )
+            else:
+                parameter = params_dict[name]
+                loader = getattr(parameter, "weight_loader", default_weight_loader)
+                loader(parameter, weight)
+
+    init_workspace_manager(torch.device("cuda"))
+    with set_forward_context(None, get_current_vllm_config(), num_tokens=num_tokens):
+        actual = quantized["mlp"](x)
+        torch.testing.assert_close(
+            actual.float(), routed_expected.float(), atol=5e-2, rtol=5e-2
+        )
+        for expert, reference_output in zip(
+            quantized["shared_experts"], shared_expected
+        ):
+            shared = expert(x)
+            torch.testing.assert_close(
+                shared.float(),
+                reference_output.float(),
+                atol=5e-2,
+                rtol=5e-2,
+            )
+            actual = actual + shared
+
+    assert quantized["mlp"].router.weight.dtype == torch.float32
+    fp8_weights = [
+        quantized["mlp"].latent_down_proj.weight,
+        quantized["mlp"].latent_up_proj.weight,
+        quantized["mlp"].experts.routed_experts.w13_weight,
+        quantized["mlp"].experts.routed_experts.w2_weight,
+    ]
+    for expert in quantized["shared_experts"]:
+        fp8_weights.extend(
+            (expert.gate_proj.weight, expert.up_proj.weight, expert.down_proj.weight)
+        )
+    assert all(weight.dtype == torch.float8_e4m3fn for weight in fp8_weights)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
 
 
 def test_grug_moe_router_selects_logical_expert_ids():

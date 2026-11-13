@@ -136,6 +136,34 @@ publishes no GPU release. The temporary artifacts remain available for 14 days;
 rerun the failed jobs in that workflow to retry. There is no separate GPU
 promotion dispatch or reuse of another qualification run.
 
+## Hero online FP8
+
+For an existing Hero `vllm serve` launch with BF16 Hugging Face weights, use
+`--dtype bfloat16 --quantization fp8`. Retain the launch's DP/EP settings.
+The GPU implementation requires TP=1 and does not load serialized
+FP8 checkpoints.
+
+Online FP8 covers attention, gated-norm, latent and shared-expert projections,
+plus routed experts. QB router weights and bias stay FP32; Hero rounds router
+outputs to BF16 before FP32 expert selection.
+KV-cache precision is selected separately by `--kv-cache-dtype`; its `auto`
+default follows the model dtype. `--quantization fp8` does not enable an FP8
+KV cache.
+
+The fork's model suite checks BF16 weight loading and numerical agreement for
+Hero's latent, routed and shared experts at one and seven input tokens. Distinct
+power-of-two weights and representable input blocks expose loading mistakes while
+limiting FP8 rounding:
+
+```bash
+.venv/bin/python -m pytest tests/models/test_grugmoe.py \
+  -k hero_online_fp8_latent_and_shared -v
+```
+
+These checks cover loading and individual-layer GPU computation. They do not
+qualify full Hero generation, RL score agreement or memory capacity for an
+artifact and serving layout.
+
 ## TPU wheel pairs
 
 The TPU lane uses the same `main` source lineage and builds a separate vLLM
