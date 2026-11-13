@@ -2144,6 +2144,7 @@ def test_log_scaling_is_identical_across_prefill_chunking_prefix_cache_and_decod
         ({}, "fp8", "auto", 6),
         ({}, None, "fp8", 12),
     ],
+    ids=["auto-bf16", "explicit-native", "explicit-repeated", "fp8-weights", "fp8-kv"],
 )
 def test_hero_native_gqa_uses_distinct_cache_heads(
     tmp_path, schema, additional_config, quantization, cache_dtype, global_heads

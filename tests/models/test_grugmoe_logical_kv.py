@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright The Marin Authors
 
+"""Native decode kernels at the Snowball and Hero query/KV head geometries."""
+
 import pytest
 import torch
 
