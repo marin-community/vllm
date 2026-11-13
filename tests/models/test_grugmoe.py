@@ -59,6 +59,7 @@ from vllm.model_executor.models.registry import ModelRegistry
 from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
+from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -1085,8 +1086,11 @@ def test_grug_moe_routed_experts_keep_model_dtype():
     assert layer.shared_expert.gate_proj.weight.dtype == torch.bfloat16
 
 
-def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type():
-    cfg = replace(_tiny_hero_config(), sconv=False)
+@pytest.mark.parametrize("logical_kv_cache", [False, True])
+def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type(logical_kv_cache):
+    cfg = replace(
+        _tiny_hero_config(), sconv=False, logical_kv_cache=logical_kv_cache
+    )
     q = torch.arange(16, dtype=torch.float32).view(1, 16) + 1
     k = torch.tensor(
         [[[1.0, 2.0, 3.0, 4.0], [9.0, 8.0, 7.0, 6.0]]]
@@ -1124,13 +1128,14 @@ def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type():
         k.view(1, 2, 4)[:, :1],
         SimpleNamespace(variance_epsilon=1e-6, weight=torch.ones(4)),
     )
+    local_cache_heads = 1 if logical_kv_cache else 2
     torch.testing.assert_close(
-        local_capture.k.view(1, 2, 4),
-        expected_local_k_head.expand(1, 2, 4),
+        local_capture.k.view(1, local_cache_heads, 4),
+        expected_local_k_head.expand(1, local_cache_heads, 4),
     )
     torch.testing.assert_close(
-        local_capture.v.view(1, 2, 4),
-        v.view(1, 2, 4)[:, :1].expand(1, 2, 4),
+        local_capture.v.view(1, local_cache_heads, 4),
+        v.view(1, 2, 4)[:, :1].expand(1, local_cache_heads, 4),
     )
     assert local_capture.v.is_contiguous()
     assert not torch.equal(
@@ -1710,8 +1715,17 @@ def test_grug_moe_tiny_decoder_layer_matches_reference_math():
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_grug_xsa_correction_and_gate_match_reference_math():
+@pytest.mark.parametrize(
+    "logical_kv_cache", [None, False, True],
+    ids=["snowball", "hero-repeated", "hero-native"],
+)
+def test_grug_xsa_correction_and_gate_match_reference_math(logical_kv_cache):
     cfg = _tiny_config()
+    if logical_kv_cache is not None:
+        cfg = replace(
+            cfg, artifact_schema_version=2, num_kv_heads=2, local_kv_heads=1,
+            global_kv_heads=2, logical_kv_cache=logical_kv_cache,
+        ).validate()
     attn = GrugMoeAttention(
         cfg,
         cache_config=None,
@@ -1736,7 +1750,10 @@ def test_grug_xsa_correction_and_gate_match_reference_math():
     with torch.no_grad():
         attn.attn_gate.weight.copy_(gate_weight)
 
-    actual = attn.apply_xsa(hidden_states, attn_output, value_states)
+    cached_values = value_states
+    if logical_kv_cache is False:
+        cached_values = value_states[:, None, :].expand(2, 2, 2).reshape(2, 4)
+    actual = attn.apply_xsa(hidden_states, attn_output, cached_values)
 
     aligned_value = value_states.view(2, 1, 2).expand(2, 2, 2)
     attn_heads = attn_output.view(2, 2, 2)
@@ -1871,8 +1888,11 @@ def test_log_scaling_factor_matches_the_training_model():
     torch.testing.assert_close(factor, expected, rtol=1e-6, atol=0)
 
 
-def test_log_scaling_scales_each_global_query_by_its_own_position():
-    cfg = _log_scaled_hero_config(4, 0.5, 2.0)
+@pytest.mark.parametrize("logical_kv_cache", [False, True])
+def test_log_scaling_scales_each_global_query_by_its_own_position(logical_kv_cache):
+    cfg = replace(
+        _log_scaled_hero_config(4, 0.5, 2.0), logical_kv_cache=logical_kv_cache
+    )
     q = torch.linspace(-1.0, 1.0, 4 * 16).view(4, 16)
     k = torch.linspace(1.0, 2.0, 4 * 8).view(4, 8)
     positions = torch.tensor([0, 3, 4, 7])
@@ -2111,3 +2131,57 @@ def test_log_scaling_is_identical_across_prefill_chunking_prefix_cache_and_decod
         torch.tensor(whole[:8]), torch.tensor(unscaled[:8]), **tolerance
     )
     assert (torch.tensor(whole[9:]) - torch.tensor(unscaled[9:])).abs().max() > 1e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("schema", [2, 3])
+@pytest.mark.parametrize(
+    "additional_config,quantization,cache_dtype,global_heads",
+    [
+        ({}, None, "auto", 6),
+        ({"grug_logical_kv_cache": True}, None, "auto", 6),
+        ({"grug_logical_kv_cache": False}, None, "auto", 12),
+        ({}, "fp8", "auto", 6),
+        ({}, None, "fp8", 12),
+    ],
+)
+def test_hero_native_gqa_uses_distinct_cache_heads(
+    tmp_path, schema, additional_config, quantization, cache_dtype, global_heads
+):
+    # Keep the checkpoint's head geometry with inexpensive projections and experts.
+    GrugMoeConfig(
+        architectures=["GrugMoeForCausalLM"],
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_hidden_layers=2,
+        num_attention_heads=48,
+        num_key_value_heads=12,
+        local_kv_heads=12,
+        global_kv_heads=6,
+        head_dim=128,
+        max_position_embeddings=4096,
+        sliding_window=128,
+        grugmoe_artifact_schema_version=schema,
+    ).save_pretrained(tmp_path)
+    vllm_config = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        quantization=quantization,
+        kv_cache_dtype=cache_dtype,
+        additional_config=additional_config,
+    ).create_engine_config()
+    with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16):
+        model = GrugMoeModel(vllm_config=vllm_config)
+        specs = [
+            layer.self_attn.attn.get_kv_cache_spec(vllm_config)
+            for layer in model.layers
+        ]
+    assert [spec.num_kv_heads for spec in specs] == [12, global_heads]
+    assert specs[1].page_size_bytes == (
+        2 * vllm_config.cache_config.block_size * global_heads * 128
+        * (1 if cache_dtype == "fp8" else 2)
+    )
