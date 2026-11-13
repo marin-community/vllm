@@ -870,15 +870,15 @@ class GrugMoeShortConv(MambaBase, nn.Module):
 
         if num_decodes > 0:
             assert attn_metadata.state_indices_tensor_d is not None
-            decode_output = torch.empty_like(decode)
+            # The kernel skips null rows, which still reach FP8 activation scaling.
+            decode_output = decode.clone(memory_format=torch.contiguous_format)
             decode_output = causal_conv1d_update(
-                decode.contiguous(),
+                decode_output,
                 conv_state,
                 conv_weight,
                 None,
                 activation=None,
                 conv_state_indices=attn_metadata.state_indices_tensor_d,
-                out=decode_output,
             )
             pieces.insert(0, decode_output)
 

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+import torch.utils.deterministic
 from torch import nn
 from transformers import AutoConfig
 
@@ -1216,44 +1217,68 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
         torch.vstack((expected_a, expected_b)),
     )
 
-    decode = torch.tensor([[4.0, -4.0], [30.0, 12.0]], device="cuda")
+    decode = torch.tensor([[4.0, -4.0], [30.0, 12.0], [5.0, -5.0]], device="cuda")
     decode_metadata = ShortConvAttentionMetadata(
         num_prefills=0,
         num_prefill_tokens=0,
-        num_decodes=2,
-        num_decode_tokens=2,
-        num_reqs=2,
+        num_decodes=3,
+        num_decode_tokens=3,
+        num_reqs=3,
         query_start_loc_p=None,
         has_initial_states_p=None,
         state_indices_tensor_p=torch.empty(0, device="cuda", dtype=torch.int32),
-        state_indices_tensor_d=torch.tensor([1, 2], device="cuda", dtype=torch.int32),
+        state_indices_tensor_d=torch.tensor(
+            [1, 2, 0], device="cuda", dtype=torch.int32
+        ),
         num_accepted_tokens=None,
-        query_start_loc_d=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+        query_start_loc_d=torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32),
         block_idx_last_scheduled_token=None,
         block_idx_first_scheduled_token_p=None,
         block_idx_last_computed_token=None,
         block_idx_last_scheduled_token_prev_step=None,
         num_computed_tokens_p=None,
-        seq_lens=torch.tensor([4, 3], device="cuda"),
+        seq_lens=torch.tensor([4, 3, 1], device="cuda"),
     )
-    with set_forward_context(
-        {prefix: decode_metadata},
-        get_current_vllm_config(),
-        num_tokens=decode.shape[0],
-    ):
-        decode_output = module(decode)
+    original_decode = decode.clone()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
+    try:
+        # Make an unwritten null row fail reliably instead of reading allocator data.
+        torch.use_deterministic_algorithms(True)
+        torch.utils.deterministic.fill_uninitialized_memory = True
+        with set_forward_context(
+            {prefix: decode_metadata},
+            get_current_vllm_config(),
+            num_tokens=decode.shape[0],
+        ):
+            decode_output = module(decode)
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        torch.utils.deterministic.fill_uninitialized_memory = fill_uninitialized
 
     expected_decode = torch.vstack(
         (
             _causal_depthwise_reference(torch.vstack((request_a, decode[:1])), weight)[
                 -1:
             ],
-            _causal_depthwise_reference(torch.vstack((request_b, decode[1:])), weight)[
+            _causal_depthwise_reference(torch.vstack((request_b, decode[1:2])), weight)[
                 -1:
             ],
+            decode[2:],
         )
     )
     torch.testing.assert_close(decode_output, expected_decode)
+    torch.testing.assert_close(decode, original_decode, rtol=0, atol=0)
+    torch.testing.assert_close(
+        module.kv_cache[0][1], torch.vstack((request_a[1:], decode[:1])), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        module.kv_cache[0][2], torch.vstack((request_b, decode[1:2])), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        module.kv_cache[0][0], torch.zeros_like(module.kv_cache[0][0]), rtol=0, atol=0
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
