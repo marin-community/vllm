@@ -470,7 +470,6 @@ class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
         priorities = vllm_config.kernel_config.ir_op_priority
         if (
             current_platform.is_cuda()
-            and getattr(hf_config, "grugmoe_artifact_schema_version", 1) == 1
             and model_config.dtype == torch.bfloat16
             and model_config.quantization is None
             and not priorities.rms_norm

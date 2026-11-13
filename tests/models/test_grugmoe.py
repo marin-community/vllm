@@ -461,11 +461,16 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
     [
         (1, "bfloat16", None, False, None, True),
         (1, "bfloat16", None, False, ["native"], False),
-        (2, "bfloat16", None, False, None, False),
+        (2, "bfloat16", None, False, None, True),
         (2, "bfloat16", None, False, ["vllm_c"], True),
+        (2, "bfloat16", None, False, ["native"], False),
+        (3, "bfloat16", None, False, None, True),
+        (3, "bfloat16", None, False, ["native"], False),
         (1, "bfloat16", "fp8", False, None, False),
         (1, "bfloat16", "fp8", False, ["vllm_c"], True),
         (1, "bfloat16", None, True, None, False),
+        (2, "bfloat16", "fp8", False, None, False),
+        (3, "bfloat16", None, True, None, False),
         (1, "float16", None, False, None, False),
     ],
 )
@@ -481,6 +486,9 @@ def test_grug_moe_norm_selection_preserves_rounding(
         max_position_embeddings=128,
         sliding_window=128,
         grugmoe_artifact_schema_version=schema,
+        log_scaling_n_floor=65536 if schema == 3 else None,
+        log_scaling_alpha=0.1 if schema == 3 else None,
+        log_scaling_power=2.0 if schema == 3 else None,
         quantization_config=(
             {"quant_method": "fp8", "activation_scheme": "dynamic"}
             if checkpoint_fp8
