@@ -1429,6 +1429,23 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    padding_rows = 5
+    padded = F.pad(x, (0, 0, 0, padding_rows))
+    is_padding = torch.arange(padded.shape[0], device=x.device) >= x.shape[0]
+    with set_forward_context(
+        None,
+        get_current_vllm_config(),
+        num_tokens=padded.shape[0],
+        is_padding=is_padding,
+    ):
+        clean = quantized(padded.clone())[: x.shape[0]].clone()
+        poisoned = padded.clone()
+        poisoned[x.shape[0] :] = 32
+        repeated = quantized(poisoned)[: x.shape[0]]
+
+    torch.testing.assert_close(repeated, clean, rtol=0, atol=0)
+
 
 def test_grug_moe_router_selects_logical_expert_ids():
     router = GrugMoeRouter(

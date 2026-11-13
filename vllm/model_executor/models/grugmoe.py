@@ -20,6 +20,9 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    _get_padding_mask,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -611,7 +614,11 @@ class GrugMoeRouter(BaseRouter):
         *,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del hidden_states, input_ids
+        del input_ids
+        padding = _get_padding_mask(hidden_states.shape[0])
+        if padding is not None:
+            # Tensor-wide FP8 scales must not include stale graph padding.
+            hidden_states.masked_fill_(padding[:, None], 0)
         _, selected = torch.topk(
             router_logits.float() + self.bias.float(),
             k=self.top_k + 1,
@@ -623,6 +630,9 @@ class GrugMoeRouter(BaseRouter):
         )
         denom = topk_weights.sum(dim=-1, keepdim=True) + _ROUTER_COMBINE_WEIGHT_EPS
         topk_weights = topk_weights * (_ROUTER_COMBINE_WEIGHT_SUM / denom)
+        if padding is not None:
+            topk_weights.masked_fill_(padding[:, None], 0)
+        # Keep valid IDs so the native expert kernel writes padding scratch rows.
         topk_ids = selected.to(torch.int32 if indices_type is None else indices_type)
         return topk_weights, topk_ids
 
