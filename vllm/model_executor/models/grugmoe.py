@@ -879,6 +879,7 @@ class GrugMoeShortConv(MambaBase, nn.Module):
                 None,
                 activation=None,
                 conv_state_indices=attn_metadata.state_indices_tensor_d,
+                out=decode_output,
             )
             pieces.insert(0, decode_output)
 
