@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
+import torch
+
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
@@ -462,15 +465,34 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
 class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        if not getattr(vllm_config.model_config.hf_text_config, "sconv", False):
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_text_config
+        priorities = vllm_config.kernel_config.ir_op_priority
+        if (
+            current_platform.is_cuda()
+            and getattr(hf_config, "grugmoe_artifact_schema_version", 1) == 1
+            and model_config.dtype == torch.bfloat16
+            and model_config.quantization is None
+            and not priorities.rms_norm
+        ):
+            # Match training: multiply the weight before the BF16 rounding.
+            priorities.rms_norm = ["vllm_c"]
+        if not getattr(hf_config, "sconv", False):
             return
 
         from vllm.config import CUDAGraphMode
 
         compilation_config = vllm_config.compilation_config
+        if (
+            compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+            and "vllm::grug_moe_short_conv"
+            in (compilation_config.splitting_ops or [])
+        ):
+            return
         if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             logger.warning_once(
-                "GrugMoE ShortConv does not support CUDA graphs; "
+                "GrugMoE ShortConv requires PIECEWISE CUDA graphs with "
+                "vllm::grug_moe_short_conv excluded through splitting_ops; "
                 "overriding cudagraph_mode to NONE."
             )
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
