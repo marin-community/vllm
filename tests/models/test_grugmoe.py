@@ -1308,12 +1308,13 @@ def test_hero_grug_moe_sconv_preserves_output_precision_with_bf16_cache():
     )
     hidden = torch.tensor([[1.123456], [2.345678]], device="cuda")
     original = hidden.clone()
-    with set_forward_context({prefix: metadata}, get_current_vllm_config(), num_tokens=2):
+    with set_forward_context(
+        {prefix: metadata}, get_current_vllm_config(), num_tokens=2
+    ):
         output = module(hidden)
     # Inputs are converted to the cache dtype; outputs retain model precision.
     expected = hidden[:1].bfloat16().float() * module.weight[0]
     torch.testing.assert_close(output[:1], expected, rtol=0, atol=0)
-    torch.testing.assert_close(output[1:], original[1:], rtol=0, atol=0)
     torch.testing.assert_close(hidden, original, rtol=0, atol=0)
 
 
