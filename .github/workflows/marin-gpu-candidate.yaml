@@ -440,6 +440,7 @@ jobs:
             --memory "${{ matrix.memory }}" \
             --disk 200GB \
             --env-vars GH_TOKEN "$GH_TOKEN" \
+            --include 'validation-source/tests/**/*' \
             --no-sync \
             --max-retries 0 \
             --timeout 2400 \

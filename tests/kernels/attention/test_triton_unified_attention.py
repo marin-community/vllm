@@ -36,6 +36,61 @@ NUM_BLOCKS = [32768, 2048]
 SEQ_THRESHOLD_3D_VALUES = [0, 8]
 
 
+@pytest.mark.parametrize("cut", [2079, 2080])
+@torch.inference_mode()
+def test_sliding_window_empty_tile_preserves_chunk_invariance(cut: int) -> None:
+    """An all-masked leading tile must not change the softmax scale."""
+    length, window, block_size = 2112, 2048, 16
+    query = torch.full(
+        (length, 20, 128), 1.75, dtype=torch.bfloat16, device=DEVICE_TYPE
+    )
+    key = torch.full(
+        (length // block_size, block_size, 5, 128),
+        -100.0,
+        dtype=query.dtype,
+        device=query.device,
+    )
+    generator = torch.Generator(device=query.device).manual_seed(41)
+    value = torch.randn(
+        key.shape, generator=generator, device=query.device, dtype=query.dtype
+    )
+    table = torch.arange(key.shape[0], dtype=torch.int32, device=query.device)[None, :]
+    kv_lengths = torch.tensor([length], dtype=torch.int32, device=query.device)
+    outputs = []
+    for start in (0, cut):
+        q = query[start:].contiguous()
+        output = torch.empty_like(q)
+        unified_attention(
+            q=q,
+            k=key,
+            v=value,
+            out=output,
+            cu_seqlens_q=torch.tensor([0, len(q)], dtype=torch.int32, device=q.device),
+            max_seqlen_q=len(q),
+            seqused_k=kv_lengths,
+            max_seqlen_k=length,
+            softmax_scale=128**-0.5,
+            causal=True,
+            window_size=(window - 1, 0),
+            block_table=table,
+            softcap=0.0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+        )
+        outputs.append(output)
+    assert torch.equal(
+        outputs[0][cut:].contiguous().view(torch.uint8),
+        outputs[1].contiguous().view(torch.uint8),
+    )
+    # Constant finite QK scores give a uniform distribution over valid keys.
+    reference = value.flatten(0, 1)[cut - window + 1 : cut + 1].double().mean(0)
+    reference = reference.repeat_interleave(4, dim=0)
+    torch.testing.assert_close(
+        outputs[1][0].double(), reference, atol=1.5e-2, rtol=1e-2
+    )
+
+
 @triton.jit
 def _compute_clamped_mm_tile_bounds(
     output_ptr,

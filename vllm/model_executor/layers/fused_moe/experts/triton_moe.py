@@ -106,12 +106,17 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        # Defer activation quantization to apply() only when LoRA is active AND
-        # tokens are dispatched across ranks (DP+EP all2all).
-        return (
-            self._lora_context is not None
-            and self.quant_dtype is not None
-            and self.moe_config.moe_parallel_config.use_all2all_kernels
+        # Dynamic tensor scales differ across DP ranks. Gather BF16 inputs
+        # before quantizing so the scalar scale applies to every gathered token.
+        dynamic_tensor_fp8 = (
+            self.quant_config.use_fp8_w8a8
+            and not self.per_act_token_quant
+            and self.block_shape is None
+            and self.a1_scale is None
+        )
+        return self.moe_config.moe_parallel_config.use_all2all_kernels and (
+            dynamic_tensor_fp8
+            or (self._lora_context is not None and self.quant_dtype is not None)
         )
 
     @staticmethod
@@ -271,12 +276,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             torch.int8,
         ]
 
-        # We declared expects_unquantized_inputs (LoRA + DP/EP all2all), so the
-        # prepare step deferred activation quantization to this kernel:
-        # `hidden_states` arrives unquantized. Keep the unquantized tensor for
-        # the LoRA shrink input and quantize a copy here for the base GEMM
-        # (mirrors what the prepare step would have done, but after the
-        # all-gather so the layout matches the gathered topk_ids / token map).
+        # Quantize after dispatch when scales must cover all gathered tokens
+        # or LoRA needs the unquantized input in the gathered layout.
         lora_unquantized_hidden_states: torch.Tensor | None = None
         if self.expects_unquantized_inputs:
             assert a1q_scale is None

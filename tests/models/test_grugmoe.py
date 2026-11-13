@@ -12,11 +12,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+import torch.utils.deterministic
 from torch import nn
 from transformers import AutoConfig
 
 from tests.utils import ensure_current_vllm_config
-from vllm.config import CUDAGraphMode, get_current_vllm_config
+from vllm import LLM, SamplingParams
+from vllm.config import (
+    CUDAGraphMode,
+    get_current_vllm_config,
+    set_current_vllm_config,
+)
+from vllm.config.kernel import IrOpPriorityConfig, KernelConfig
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -26,7 +33,12 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+from vllm.model_executor.model_loader.reload.meta import materialize_layer
 from vllm.model_executor.models.grugmoe import (
     _ROUTER_COMBINE_WEIGHT_EPS,
     _ROUTER_COMBINE_WEIGHT_SUM,
@@ -38,11 +50,13 @@ from vllm.model_executor.models.grugmoe import (
     GrugMoeRouter,
     GrugMoeRuntimeConfig,
     GrugMoeShortConv,
+    _log_scaling_factor,
     _raise_for_unsupported_modes,
     _try_load_grug_expert_weight,
     get_grug_moe_runtime_info,
 )
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
@@ -254,6 +268,7 @@ class _CaptureAttention(nn.Module):
     def __init__(self, q_size: int) -> None:
         super().__init__()
         self.q_size = q_size
+        self.q: torch.Tensor | None = None
         self.k: torch.Tensor | None = None
         self.v: torch.Tensor | None = None
 
@@ -263,6 +278,7 @@ class _CaptureAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
+        self.q = q
         self.k = k
         self.v = v
         return torch.zeros(q.shape[0], self.q_size, dtype=q.dtype)
@@ -440,6 +456,72 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
     assert final_full_layer.self_attn.attn.sliding_window is None
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize(
+    ("schema", "dtype", "quantization", "checkpoint_fp8", "priority", "single_round"),
+    [
+        (1, "bfloat16", None, False, None, True),
+        (1, "bfloat16", None, False, ["native"], False),
+        (2, "bfloat16", None, False, None, False),
+        (2, "bfloat16", None, False, ["vllm_c"], True),
+        (1, "bfloat16", "fp8", False, None, False),
+        (1, "bfloat16", "fp8", False, ["vllm_c"], True),
+        (1, "bfloat16", None, True, None, False),
+        (1, "float16", None, False, None, False),
+    ],
+)
+def test_grug_moe_norm_selection_preserves_rounding(
+    tmp_path, schema, dtype, quantization, checkpoint_fp8, priority, single_round
+):
+    GrugMoeConfig(
+        architectures=["GrugMoeForCausalLM"],
+        vocab_size=32,
+        hidden_size=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        sliding_window=128,
+        grugmoe_artifact_schema_version=schema,
+        quantization_config=(
+            {"quant_method": "fp8", "activation_scheme": "dynamic"}
+            if checkpoint_fp8
+            else None
+        ),
+    ).save_pretrained(tmp_path)
+    config = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype=dtype,
+        quantization=quantization,
+        compilation_config={"mode": 3},
+        kernel_config=KernelConfig(
+            ir_op_priority=IrOpPriorityConfig(rms_norm=priority or [])
+        ),
+    ).create_engine_config()
+    dtype = config.model_config.dtype
+    inputs = torch.tensor(
+        [[-0.75, 0.25, 0.5, 1.0], [0.125, -0.375, 0.875, -1.25]],
+        dtype=dtype,
+        device="cuda",
+    )
+    eps = 1e-5
+    with (
+        set_current_vllm_config(config),
+        config.kernel_config.ir_op_priority.set_priority(),
+    ):
+        norm = RMSNorm(4, eps=eps, dtype=dtype).cuda()
+        with torch.no_grad():
+            norm.weight.copy_(torch.tensor([0.75, 1.25, 0.5, 1.5]))
+            actual = norm(inputs)
+        normalized = inputs.double() * torch.rsqrt(
+            inputs.double().square().mean(dim=-1, keepdim=True) + eps
+        )
+        if not single_round:
+            normalized = normalized.to(dtype).double()
+        expected = (normalized * norm.weight.double()).to(dtype)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -500,6 +582,55 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
     assert vllm_config.model_config.is_hybrid is True
     assert vllm_config.model_config.has_inner_state is True
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+
+
+@pytest.mark.parametrize(
+    ("requested", "split_shortconv", "expected"),
+    [
+        ("NONE", False, CUDAGraphMode.NONE),
+        ("PIECEWISE", False, CUDAGraphMode.NONE),
+        ("PIECEWISE", True, CUDAGraphMode.PIECEWISE),
+        ("FULL", True, CUDAGraphMode.NONE),
+        ("FULL_AND_PIECEWISE", True, CUDAGraphMode.NONE),
+    ],
+)
+def test_hero_shortconv_graph_modes(tmp_path, requested, split_shortconv, expected):
+    GrugMoeConfig(
+        grugmoe_artifact_schema_version=2,
+        architectures=["GrugMoeForCausalLM"],
+        vocab_size=32,
+        hidden_size=16,
+        moe_intermediate_size=6,
+        shared_expert_intermediate_size=5,
+        num_experts=4,
+        num_experts_per_tok=2,
+        latent_dim=8,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        local_kv_heads=1,
+        global_kv_heads=2,
+        head_dim=4,
+        max_position_embeddings=128,
+        sliding_window=128,
+        global_every=1,
+        sconv=True,
+    ).save_pretrained(tmp_path)
+    config = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        compilation_config={
+            "mode": 3,
+            "cudagraph_mode": requested,
+            "splitting_ops": ["vllm::grug_moe_short_conv"] if split_shortconv else [],
+        },
+    ).create_engine_config()
+    assert config.compilation_config.cudagraph_mode == expected
+    _raise_for_unsupported_modes(config)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    with pytest.raises(NotImplementedError):
+        _raise_for_unsupported_modes(config)
 
 
 def test_grug_moe_config_rejects_noncanonical_layer_types():
@@ -608,14 +739,20 @@ def _minimal_vllm_config_for_mode_check(
     *,
     tensor_parallel_size=1,
     quantization_method=None,
+    is_checkpoint_fp8_serialized=False,
 ):
     quant_config = (
         None
         if quantization_method is None
-        else SimpleNamespace(get_name=lambda: quantization_method)
+        else (
+            Fp8Config(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
+            if quantization_method == "fp8"
+            else SimpleNamespace(get_name=lambda: quantization_method)
+        )
     )
     return SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=tensor_parallel_size),
+        model_config=None,
         lora_config=None,
         quant_config=quant_config,
     )
@@ -641,29 +778,33 @@ def test_grug_moe_preserves_gpu_tensor_parallel_restriction(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("is_tpu", "quantization_method", "supported"),
+    ("is_tpu", "quantization_method", "serialized", "supported"),
     [
-        (True, "unquantized", True),
-        (True, "fp8", False),
-        (False, "unquantized", False),
+        (True, "unquantized", False, True),
+        (True, "fp8", False, False),
+        (False, "unquantized", False, False),
+        (False, "fp8", False, True),
+        (False, "fp8", True, False),
     ],
 )
-def test_grug_moe_tpu_accepts_only_unquantized_backend(
+def test_grug_moe_quantization_platform_support(
     monkeypatch,
     is_tpu,
     quantization_method,
+    serialized,
     supported,
 ):
     fake_config = _minimal_vllm_config_for_mode_check(
         tensor_parallel_size=8 if is_tpu else 1,
         quantization_method=quantization_method,
+        is_checkpoint_fp8_serialized=serialized,
     )
     _patch_grug_parallel_runtime(monkeypatch, fake_config, is_tpu=is_tpu)
 
     if supported:
         _raise_for_unsupported_modes(fake_config)
     else:
-        with pytest.raises(NotImplementedError, match="does not support quantization"):
+        with pytest.raises(NotImplementedError, match="supports only online FP8"):
             _raise_for_unsupported_modes(fake_config)
 
 
@@ -1149,44 +1290,68 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
         torch.vstack((expected_a, expected_b)),
     )
 
-    decode = torch.tensor([[4.0, -4.0], [30.0, 12.0]], device="cuda")
+    decode = torch.tensor([[4.0, -4.0], [30.0, 12.0], [5.0, -5.0]], device="cuda")
     decode_metadata = ShortConvAttentionMetadata(
         num_prefills=0,
         num_prefill_tokens=0,
-        num_decodes=2,
-        num_decode_tokens=2,
-        num_reqs=2,
+        num_decodes=3,
+        num_decode_tokens=3,
+        num_reqs=3,
         query_start_loc_p=None,
         has_initial_states_p=None,
         state_indices_tensor_p=torch.empty(0, device="cuda", dtype=torch.int32),
-        state_indices_tensor_d=torch.tensor([1, 2], device="cuda", dtype=torch.int32),
+        state_indices_tensor_d=torch.tensor(
+            [1, 2, 0], device="cuda", dtype=torch.int32
+        ),
         num_accepted_tokens=None,
-        query_start_loc_d=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+        query_start_loc_d=torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32),
         block_idx_last_scheduled_token=None,
         block_idx_first_scheduled_token_p=None,
         block_idx_last_computed_token=None,
         block_idx_last_scheduled_token_prev_step=None,
         num_computed_tokens_p=None,
-        seq_lens=torch.tensor([4, 3], device="cuda"),
+        seq_lens=torch.tensor([4, 3, 1], device="cuda"),
     )
-    with set_forward_context(
-        {prefix: decode_metadata},
-        get_current_vllm_config(),
-        num_tokens=decode.shape[0],
-    ):
-        decode_output = module(decode)
+    original_decode = decode.clone()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
+    try:
+        # Make an unwritten null row fail reliably instead of reading allocator data.
+        torch.use_deterministic_algorithms(True)
+        torch.utils.deterministic.fill_uninitialized_memory = True
+        with set_forward_context(
+            {prefix: decode_metadata},
+            get_current_vllm_config(),
+            num_tokens=decode.shape[0],
+        ):
+            decode_output = module(decode)
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        torch.utils.deterministic.fill_uninitialized_memory = fill_uninitialized
 
     expected_decode = torch.vstack(
         (
             _causal_depthwise_reference(torch.vstack((request_a, decode[:1])), weight)[
                 -1:
             ],
-            _causal_depthwise_reference(torch.vstack((request_b, decode[1:])), weight)[
+            _causal_depthwise_reference(torch.vstack((request_b, decode[1:2])), weight)[
                 -1:
             ],
+            decode[2:],
         )
     )
     torch.testing.assert_close(decode_output, expected_decode)
+    torch.testing.assert_close(decode, original_decode, rtol=0, atol=0)
+    torch.testing.assert_close(
+        module.kv_cache[0][1], torch.vstack((request_a[1:], decode[:1])), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        module.kv_cache[0][2], torch.vstack((request_b, decode[1:2])), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        module.kv_cache[0][0], torch.zeros_like(module.kv_cache[0][0]), rtol=0, atol=0
+    )
 
     # Decode A while B resumes prefill from its existing state. The output
     # keeps decode rows first even though the prefill kernel executes first.
@@ -1219,11 +1384,58 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
                 torch.vstack((request_a, decode[:1], next_a)), weight
             )[-1:],
             _causal_depthwise_reference(
-                torch.vstack((request_b, decode[1:], next_b)), weight
+                torch.vstack((request_b, decode[1:2], next_b)), weight
             )[-2:],
         )
     )
     torch.testing.assert_close(mixed_output, expected_mixed)
+    torch.testing.assert_close(mixed, torch.vstack((next_a, next_b)), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_hero_grug_moe_sconv_padded_decode_zeros_inactive_rows(dtype):
+    prefix = "hero.sconv.padding"
+    module = GrugMoeShortConv(2, 4, dtype, None, prefix).cuda()
+    module.weight.data.fill_(1)
+    module.weight.data[0].fill_(1.0625)
+    module.kv_cache = (torch.zeros(2, 3, 2, device="cuda", dtype=torch.bfloat16),)
+    metadata = ShortConvAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_reqs=1,
+        query_start_loc_p=None,
+        has_initial_states_p=None,
+        state_indices_tensor_p=torch.empty(0, device="cuda", dtype=torch.int32),
+        state_indices_tensor_d=torch.tensor([1], device="cuda", dtype=torch.int32),
+        num_accepted_tokens=None,
+        query_start_loc_d=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        block_idx_last_scheduled_token_prev_step=None,
+        num_computed_tokens_p=None,
+        seq_lens=torch.tensor([1], device="cuda"),
+    )
+    # Both operands fit BF16 exactly; their product needs FP32 output precision.
+    for value, expected in ((1.0625, 1.12890625), (1.125, 2.2578125)):
+        hidden = torch.full((4, 2), float("nan"), device="cuda", dtype=dtype)
+        hidden[0].fill_(value)
+        output = torch.full_like(hidden, float("nan"))
+        with set_forward_context(
+            {prefix: metadata}, get_current_vllm_config(), num_tokens=4
+        ):
+            torch.ops.vllm.grug_moe_short_conv(hidden, output, prefix)
+        torch.testing.assert_close(
+            output[0], torch.full_like(output[0], expected), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            output[1:], torch.zeros_like(output[1:]), rtol=0, atol=0
+        )
+
+
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1288,6 +1500,92 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
     assert actual.dtype == torch.bfloat16
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
+    cfg = replace(
+        _tiny_config(),
+        hidden_dim=64,
+        intermediate_dim=64,
+        num_heads=4,
+        head_dim=16,
+    ).validate()
+    monkeypatch.setattr(
+        get_current_vllm_config(),
+        "model_config",
+        SimpleNamespace(dtype=torch.bfloat16),
+    )
+    # Online weight loading captures this device before it quantizes the experts.
+    with torch.device("cuda"):
+        quantized = GrugMoeMLP(
+            cfg,
+            params_dtype=torch.bfloat16,
+            quant_config=Fp8Config(),
+            prefix="model.layers.0.mlp",
+        )
+        # Direct vLLM weights bypass Grug's checkpoint mapping.
+        reference = FusedMoEFactory(
+            num_experts=cfg.num_experts,
+            top_k=cfg.num_experts_per_token,
+            hidden_size=cfg.hidden_dim,
+            intermediate_size=cfg.intermediate_dim,
+            params_dtype=torch.bfloat16,
+            renormalize=False,
+            quant_config=Fp8Config(),
+            prefix="reference.experts",
+            router=GrugMoeRouter(
+                top_k=cfg.num_experts_per_token,
+                global_num_experts=cfg.num_experts,
+                bias=quantized.router.bias,
+            ),
+            router_logits_dtype=torch.float32,
+        )
+    with torch.no_grad():
+        _fill_parameter(quantized.router.weight, -0.1, 0.1)
+        _fill_parameter(quantized.router.bias, 0.2, -0.2)
+        experts = reference.routed_experts
+        materialize_layer(experts, get_layerwise_info(experts))
+        _fill_parameter(experts.w13_weight[:, : cfg.intermediate_dim], -0.15, 0.15)
+        _fill_parameter(experts.w13_weight[:, cfg.intermediate_dim :], 0.12, -0.12)
+        _fill_parameter(experts.w2_weight, -0.1, 0.1)
+        params_dict = dict(quantized.named_parameters())
+        for projection, weight in (
+            ("gate_proj", experts.w13_weight[:, : cfg.intermediate_dim]),
+            ("up_proj", experts.w13_weight[:, cfg.intermediate_dim :]),
+            ("down_proj", experts.w2_weight),
+        ):
+            _try_load_grug_expert_weight(
+                f"experts.{projection}.weight", weight, params_dict
+            )
+        experts.quant_method.process_weights_after_loading(experts)
+
+    x = torch.linspace(-0.6, 0.7, 3 * cfg.hidden_dim, device="cuda").reshape(
+        3, cfg.hidden_dim
+    ).to(torch.bfloat16)
+    init_workspace_manager(torch.device("cuda"))
+    with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
+        expected = reference(x, F.linear(x.float(), quantized.router.weight))
+        actual = quantized(x)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    padding_rows = 5
+    padded = F.pad(x, (0, 0, 0, padding_rows))
+    is_padding = torch.arange(padded.shape[0], device=x.device) >= x.shape[0]
+    with set_forward_context(
+        None,
+        get_current_vllm_config(),
+        num_tokens=padded.shape[0],
+        is_padding=is_padding,
+    ):
+        clean = quantized(padded.clone())[: x.shape[0]].clone()
+        poisoned = padded.clone()
+        poisoned[x.shape[0] :] = 32
+        repeated = quantized(poisoned)[: x.shape[0]]
+
+    torch.testing.assert_close(repeated, clean, rtol=0, atol=0)
 
 
 def test_grug_moe_router_selects_logical_expert_ids():
@@ -1589,3 +1887,267 @@ def test_hero_yarn_rejects_full_dimension_amplitude_rescaling():
                 "mscale_all_dim": 1.0,
             },
         )
+
+
+def _log_scaled_hero_config(n_floor: int, alpha: float, power: float):
+    return replace(
+        _tiny_hero_config(),
+        artifact_schema_version=3,
+        sconv=False,
+        log_scaling_n_floor=n_floor,
+        log_scaling_alpha=alpha,
+        log_scaling_power=power,
+    ).validate()
+
+
+def test_log_scaling_factor_matches_the_training_model():
+    # Marin's hero values: floor 65536, slope 0.1, power 2 give 1.296 at 262144.
+    cfg = _log_scaled_hero_config(65536, 0.1, 2.0)
+    visible_keys = torch.tensor([1, 65536, 131072, 262144])
+
+    factor = _log_scaling_factor(visible_keys, cfg)
+
+    expected = torch.tensor([1.0, 1.0, 1.143433966251171, 1.2964769927807063])
+    torch.testing.assert_close(factor, expected, rtol=1e-6, atol=0)
+
+
+def test_log_scaling_scales_each_global_query_by_its_own_position():
+    cfg = _log_scaled_hero_config(4, 0.5, 2.0)
+    q = torch.linspace(-1.0, 1.0, 4 * 16).view(4, 16)
+    k = torch.linspace(1.0, 2.0, 4 * 8).view(4, 8)
+    positions = torch.tensor([0, 3, 4, 7])
+
+    layer_names = iter(range(100))
+
+    def captured_q(module_cfg, is_global, rows):
+        module = GrugMoeAttention(
+            module_cfg,
+            cache_config=None,
+            params_dtype=torch.float32,
+            sliding_window=None if is_global else module_cfg.sliding_window,
+            use_rope=False,
+            qk_mult_scale=1.0,
+            is_global=is_global,
+            prefix=f"log_scaling.{next(layer_names)}",
+        )
+        module.q_proj = _FixedProjection(q[rows])
+        module.k_proj = _FixedProjection(k[rows])
+        module.v_proj = _FixedProjection(k[rows])
+        capture = _CaptureAttention(module.q_size)
+        module.attn = capture
+        module(positions[rows], torch.zeros(len(positions[rows]), cfg.hidden_dim))
+        assert capture.q is not None
+        return capture.q
+
+    all_rows = slice(None)
+    off = replace(
+        cfg,
+        log_scaling_n_floor=None,
+        log_scaling_alpha=None,
+        log_scaling_power=None,
+    ).validate()
+    # A query that sees n keys is scaled by (1 + 0.5 ln(max(n / 4, 1)))^2.
+    factor = torch.tensor(
+        [1.0, 1.0, (1 + 0.5 * math.log(5 / 4)) ** 2, (1 + 0.5 * math.log(2)) ** 2]
+    )
+    torch.testing.assert_close(
+        captured_q(cfg, True, all_rows),
+        captured_q(off, True, all_rows) * factor[:, None],
+    )
+    torch.testing.assert_close(
+        captured_q(cfg, False, all_rows), captured_q(off, False, all_rows)
+    )
+    # The factor depends only on a token's own position, so a decode step or a
+    # later prefill chunk gets the same query as the whole prompt at once.
+    torch.testing.assert_close(
+        captured_q(cfg, True, slice(3, 4)), captured_q(cfg, True, all_rows)[3:]
+    )
+
+
+def _write_hero_config(path, **fields) -> None:
+    path.mkdir()
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["GrugMoeForCausalLM"],
+                "model_type": "grug_moe",
+                "vocab_size": 64,
+                "hidden_size": 16,
+                "moe_intermediate_size": 6,
+                "shared_expert_intermediate_size": 5,
+                "num_shared_experts": 2,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "latent_dim": 8,
+                "num_hidden_layers": 5,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "local_kv_heads": 1,
+                "global_kv_heads": 2,
+                "head_dim": 32,
+                "max_position_embeddings": 128,
+                "sliding_window": 8,
+                "global_every": 3,
+                "rope_fused": True,
+                "sconv": False,
+                "grugmoe_artifact_schema_version": 2,
+                **fields,
+            }
+        )
+    )
+
+
+_LOG_SCALING_FIELDS = {
+    "grugmoe_artifact_schema_version": 3,
+    "log_scaling_n_floor": 8,
+    "log_scaling_alpha": 0.5,
+    "log_scaling_power": 2.0,
+}
+
+
+@pytest.mark.parametrize(
+    "log_scaling",
+    [
+        dict(log_scaling_n_floor=8, log_scaling_alpha=0.5, log_scaling_power=2.0),
+        # Schema 3 always carries the fields; null turns log scaling off.
+        dict(log_scaling_n_floor=None, log_scaling_alpha=None, log_scaling_power=None),
+    ],
+)
+def test_schema_3_config_loads_log_scaling(tmp_path, log_scaling):
+    _write_hero_config(
+        tmp_path / "model", grugmoe_artifact_schema_version=3, **log_scaling
+    )
+
+    cfg = GrugMoeRuntimeConfig.from_hf_config(
+        get_config(tmp_path / "model", trust_remote_code=False)
+    )
+
+    assert cfg.is_hero
+    assert {name: getattr(cfg, name) for name in log_scaling} == log_scaling
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        # Log scaling without schema 3 would load on a wheel that ignores it.
+        {**_LOG_SCALING_FIELDS, "grugmoe_artifact_schema_version": 2},
+        {**_LOG_SCALING_FIELDS, "log_scaling_power": None},
+    ],
+)
+def test_log_scaling_requires_schema_3_and_all_three_fields(tmp_path, fields):
+    _write_hero_config(tmp_path / "model", **fields)
+    hf_config = get_config(tmp_path / "model", trust_remote_code=False)
+
+    with pytest.raises(ValueError, match="log scaling|log_scaling"):
+        GrugMoeRuntimeConfig.from_hf_config(hf_config)
+
+
+def _scale_dummy_weights(model: nn.Module) -> None:
+    # Dummy weights lie in [-1e-3, 1e-3]; widen them so attention, and with it
+    # the query scale, moves the logits well above float32 noise.
+    with torch.no_grad():
+        for param in model.parameters():
+            param.mul_(300.0)
+
+
+def _target_logprobs(output) -> list[float]:
+    return [
+        next(iter(entry.values())).logprob
+        for entry in output.prompt_logprobs[1:]
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_log_scaling_is_identical_across_prefill_chunking_prefix_cache_and_decode(
+    tmp_path, monkeypatch
+):
+    # apply_model sends a function to the engine-core process.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    # flashinfer's sampler JIT-compiles with nvcc, which the CI image lacks.
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    _write_hero_config(tmp_path / "on", **_LOG_SCALING_FIELDS)
+    _write_hero_config(
+        tmp_path / "off",
+        grugmoe_artifact_schema_version=3,
+        log_scaling_n_floor=None,
+        log_scaling_alpha=None,
+        log_scaling_power=None,
+    )
+    generator = torch.Generator().manual_seed(0)
+    prompt = torch.randint(0, 64, (40,), generator=generator).tolist()
+    greedy = SamplingParams(temperature=0.0, max_tokens=8, logprobs=0, detokenize=False)
+    scored = SamplingParams(
+        temperature=0.0, max_tokens=1, prompt_logprobs=0, detokenize=False
+    )
+
+    def engine(model_dir, max_num_batched_tokens):
+        llm = LLM(
+            model=str(model_dir),
+            skip_tokenizer_init=True,
+            load_format="dummy",
+            dtype="float32",
+            # FlexAttention, the default for float32, recompiles per layer mask.
+            attention_backend="TRITON_ATTN",
+            max_model_len=128,
+            max_num_batched_tokens=max_num_batched_tokens,
+            enable_prefix_caching=True,
+            gpu_memory_utilization=0.2,
+        )
+        llm.apply_model(_scale_dummy_weights)
+        return llm
+
+    llm = engine(tmp_path / "on", 128)
+    decoded = llm.generate({"prompt_token_ids": prompt}, greedy)[0].outputs[0]
+    sequence = prompt + list(decoded.token_ids[:-1])
+    decode_logprobs = [
+        entry[token].logprob
+        for token, entry in zip(decoded.token_ids, decoded.logprobs)
+    ]
+    whole = _target_logprobs(
+        llm.generate({"prompt_token_ids": sequence}, scored)[0]
+    )
+    # Its prompt starts with full blocks cached by the requests above.
+    cached = llm.generate(
+        {"prompt_token_ids": prompt + [decoded.token_ids[0]]}, greedy
+    )[0]
+    del llm
+    cleanup_dist_env_and_memory()
+
+    llm = engine(tmp_path / "on", 16)
+    chunked = _target_logprobs(llm.generate({"prompt_token_ids": sequence}, scored)[0])
+    del llm
+    cleanup_dist_env_and_memory()
+
+    llm = engine(tmp_path / "off", 128)
+    unscaled = _target_logprobs(llm.generate({"prompt_token_ids": sequence}, scored)[0])
+    del llm
+    cleanup_dist_env_and_memory()
+
+    tolerance = {"rtol": 0, "atol": 1e-4}
+    # whole[j - 1] scores token j from the query at position j - 1.
+    torch.testing.assert_close(
+        torch.tensor(whole[len(prompt) - 1 :]),
+        torch.tensor(decode_logprobs[:-1]),
+        **tolerance,
+    )
+    torch.testing.assert_close(torch.tensor(chunked), torch.tensor(whole), **tolerance)
+    assert cached.num_cached_tokens > 0
+    assert list(cached.outputs[0].token_ids[:7]) == list(decoded.token_ids[1:])
+    torch.testing.assert_close(
+        torch.tensor(
+            [
+                entry[token].logprob
+                for token, entry in zip(
+                    cached.outputs[0].token_ids[:7], cached.outputs[0].logprobs
+                )
+            ]
+        ),
+        torch.tensor(decode_logprobs[1:]),
+        **tolerance,
+    )
+    # Queries at positions below the floor of 8 keys are unscaled; later ones
+    # are not, so the comparison above is sensitive to the factor.
+    torch.testing.assert_close(
+        torch.tensor(whole[:8]), torch.tensor(unscaled[:8]), **tolerance
+    )
+    assert (torch.tensor(whole[9:]) - torch.tensor(unscaled[9:])).abs().max() > 1e-2

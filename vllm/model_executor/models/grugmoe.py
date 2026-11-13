@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -20,6 +20,9 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    _get_padding_mask,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -36,6 +39,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -79,6 +83,7 @@ _ROUTER_COMBINE_WEIGHT_SUM = 2.5
 _ROUTER_COMBINE_WEIGHT_EPS = 1e-9
 _UNQUANTIZED_METHOD = "unquantized"
 _HERO_ARTIFACT_SCHEMA_VERSION = 2
+_HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION = 3
 _SUPPORTED_SCONV_SITES = frozenset({"k", "attn", "mlp"})
 
 
@@ -225,6 +230,9 @@ class GrugMoeRuntimeConfig:
     initializer_std: float = 0.02
     qk_mult: float = 1.0
     qk_mult_long_scale: float = 1.0
+    log_scaling_n_floor: int | None = None
+    log_scaling_alpha: float | None = None
+    log_scaling_power: float | None = None
     disable_pko: bool = True
     disable_long_rope: bool = True
     rope_fused: bool = False
@@ -305,6 +313,15 @@ class GrugMoeRuntimeConfig:
             qk_mult_long_scale=float(
                 _config_attr(config, ("qk_mult_long_scale",), 1.0)
             ),
+            log_scaling_n_floor=_optional(
+                int, _config_attr(config, ("log_scaling_n_floor",))
+            ),
+            log_scaling_alpha=_optional(
+                float, _config_attr(config, ("log_scaling_alpha",))
+            ),
+            log_scaling_power=_optional(
+                float, _config_attr(config, ("log_scaling_power",))
+            ),
             disable_pko=bool(_config_attr(config, ("disable_pko",), True)),
             disable_long_rope=bool(_config_attr(config, ("disable_long_rope",), True)),
             rope_fused=bool(_config_attr(config, ("rope_fused",), False)),
@@ -337,7 +354,10 @@ class GrugMoeRuntimeConfig:
 
     @property
     def is_hero(self) -> bool:
-        return self.artifact_schema_version == _HERO_ARTIFACT_SCHEMA_VERSION
+        return self.artifact_schema_version in (
+            _HERO_ARTIFACT_SCHEMA_VERSION,
+            _HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION,
+        )
 
     @property
     def expert_dim(self) -> int:
@@ -352,6 +372,7 @@ class GrugMoeRuntimeConfig:
         if self.artifact_schema_version not in (
             1,
             _HERO_ARTIFACT_SCHEMA_VERSION,
+            _HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION,
         ):
             raise ValueError(
                 "unsupported grugmoe_artifact_schema_version="
@@ -380,6 +401,27 @@ class GrugMoeRuntimeConfig:
                     ", ".join(hero_fields)
                     + " require grugmoe_artifact_schema_version=2"
                 )
+        log_scaling = (
+            self.log_scaling_n_floor,
+            self.log_scaling_alpha,
+            self.log_scaling_power,
+        )
+        if len({field is None for field in log_scaling}) != 1:
+            raise ValueError(
+                "log_scaling_n_floor, log_scaling_alpha and log_scaling_power "
+                "must be set together"
+            )
+        log_scaling_schema = _HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION
+        if (
+            self.log_scaling_n_floor is not None
+            and self.artifact_schema_version != log_scaling_schema
+        ):
+            raise ValueError(
+                "log scaling requires grugmoe_artifact_schema_version="
+                f"{_HERO_LOG_SCALING_ARTIFACT_SCHEMA_VERSION}"
+            )
+        if self.log_scaling_n_floor is not None and min(log_scaling) <= 0:
+            raise ValueError("log scaling fields must be positive")
         if self.vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
         if self.hidden_dim <= 0:
@@ -450,6 +492,21 @@ class GrugMoeRuntimeConfig:
             )
         _ = self.attention_layer_types
         return self
+
+
+def _optional(cast: Any, value: Any) -> Any:
+    return None if value is None else cast(value)
+
+
+def _log_scaling_factor(
+    visible_keys: torch.Tensor, cfg: GrugMoeRuntimeConfig
+) -> torch.Tensor:
+    """``(1 + alpha * ln(max(n / n_floor, 1))) ** power`` in float32, as in Marin."""
+    assert cfg.log_scaling_n_floor is not None
+    assert cfg.log_scaling_alpha is not None and cfg.log_scaling_power is not None
+    ratio = visible_keys.to(torch.float32) / cfg.log_scaling_n_floor
+    factor = 1.0 + cfg.log_scaling_alpha * torch.log(torch.clamp(ratio, min=1.0))
+    return factor if cfg.log_scaling_power == 1.0 else factor**cfg.log_scaling_power
 
 
 class GrugMoeGatedNorm(nn.Module):
@@ -557,7 +614,11 @@ class GrugMoeRouter(BaseRouter):
         *,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del hidden_states, input_ids
+        del input_ids
+        padding = _get_padding_mask(hidden_states.shape[0])
+        if padding is not None:
+            # Tensor-wide FP8 scales must not include stale graph padding.
+            hidden_states.masked_fill_(padding[:, None], 0)
         _, selected = torch.topk(
             router_logits.float() + self.bias.float(),
             k=self.top_k + 1,
@@ -569,6 +630,9 @@ class GrugMoeRouter(BaseRouter):
         )
         denom = topk_weights.sum(dim=-1, keepdim=True) + _ROUTER_COMBINE_WEIGHT_EPS
         topk_weights = topk_weights * (_ROUTER_COMBINE_WEIGHT_SUM / denom)
+        if padding is not None:
+            topk_weights.masked_fill_(padding[:, None], 0)
+        # Keep valid IDs so the native expert kernel writes padding scratch rows.
         topk_ids = selected.to(torch.int32 if indices_type is None else indices_type)
         return topk_weights, topk_ids
 
@@ -597,7 +661,7 @@ class GrugMoeMLP(nn.Module):
             cfg.num_experts,
             bias=True,
             params_dtype=torch.float32,
-            quant_config=quant_config,
+            quant_config=None if isinstance(quant_config, Fp8Config) else quant_config,
             disable_tp=True,
             skip_bias_add=True,
             prefix=f"{prefix}.router",
@@ -814,6 +878,9 @@ class GrugMoeShortConv(MambaBase, nn.Module):
 
         if num_decodes > 0:
             assert attn_metadata.state_indices_tensor_d is not None
+            # The kernel skips null rows, which still reach FP8 activation scaling.
+            decode_output = output[:num_decodes]
+            decode_output.copy_(decode)
             causal_conv1d_update(
                 decode.contiguous(),
                 conv_state,
@@ -821,8 +888,10 @@ class GrugMoeShortConv(MambaBase, nn.Module):
                 None,
                 activation=None,
                 conv_state_indices=attn_metadata.state_indices_tensor_d,
-                out=output[:num_decodes],
+                out=decode_output,
             )
+        if num_actual_tokens < output.shape[0]:
+            output[num_actual_tokens:].zero_()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         output = torch.empty_like(hidden_states)
@@ -895,6 +964,7 @@ class GrugMoeAttention(nn.Module):
         self.use_rope = use_rope
         self.logical_kv_heads = cfg.logical_kv_heads(is_global=is_global)
         self.qk_mult_scale = qk_mult_scale
+        self.log_scaling = is_global and cfg.log_scaling_n_floor is not None
 
         self.q_proj = ReplicatedLinear(
             cfg.hidden_dim,
@@ -1019,6 +1089,16 @@ class GrugMoeAttention(nn.Module):
         if self.use_rope:
             q, k = self.rotary_emb(positions, q, k)
         q = q * self.cfg.qk_mult * self.qk_mult_scale
+        if self.log_scaling:
+            # Scale Q before the kernel so every backend keeps its scalar softmax
+            # scale. A token at 0-based position p sees p + 1 keys in its request,
+            # in prefill, chunked prefill and decode alike. Round the factor to
+            # Q's dtype as the training model does.
+            factor = _log_scaling_factor(positions + 1, self.cfg)
+            q = (
+                q.view(num_tokens, self.cfg.num_heads, self.head_dim)
+                * factor.to(q.dtype)[:, None, None]
+            ).reshape(num_tokens, self.q_size)
 
         attn_output = self.attn(q, k, v)
         attn_output = self.apply_xsa(hidden_states, attn_output, v)
@@ -1261,13 +1341,38 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
 def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
     is_tpu = current_platform.is_tpu()
+    model_config = vllm_config.model_config
+    if (
+        not is_tpu
+        and model_config is not None
+        and getattr(model_config.hf_text_config, "sconv", False)
+    ):
+        compilation = vllm_config.compilation_config
+        if compilation.cudagraph_mode != CUDAGraphMode.NONE and (
+            compilation.cudagraph_mode != CUDAGraphMode.PIECEWISE
+            or "vllm::grug_moe_short_conv" not in (compilation.splitting_ops or [])
+        ):
+            raise NotImplementedError(
+                "GrugMoE ShortConv CUDA graphs require PIECEWISE mode with "
+                "vllm::grug_moe_short_conv excluded through splitting_ops"
+            )
     if vllm_config.lora_config is not None:
         raise NotImplementedError("GrugMoE does not support LoRA")
     quant_config = vllm_config.quant_config
     if quant_config is not None and (
-        not is_tpu or quant_config.get_name() != _UNQUANTIZED_METHOD
+        (is_tpu and quant_config.get_name() != _UNQUANTIZED_METHOD)
+        or (
+            not is_tpu
+            and (
+                not isinstance(quant_config, Fp8Config)
+                or quant_config.is_checkpoint_fp8_serialized
+            )
+        )
     ):
-        raise NotImplementedError("GrugMoE does not support quantization")
+        raise NotImplementedError(
+            "GrugMoE supports only online FP8 quantization on GPU "
+            "and unquantized execution on TPU"
+        )
     if not is_tpu and parallel_config.tensor_parallel_size != 1:
         raise NotImplementedError(
             "GrugMoE expert-parallel GPU serving requires tensor_parallel_size=1"
