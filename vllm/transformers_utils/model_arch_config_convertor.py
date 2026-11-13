@@ -190,6 +190,7 @@ class ModelArchConfigConvertorBase:
             "moe_num_experts",  # Dbrx
             "n_routed_experts",  # DeepSeek
             "num_local_experts",  # Mixtral
+            "grug_num_experts",  # Grug DSpark draft layers
         ]
 
         num_experts = getattr_iter(self.hf_text_config, num_expert_names, 0)

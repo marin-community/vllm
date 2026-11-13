@@ -177,11 +177,14 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     - sample_from_anchor: Whether to sample from the anchor position. Default
         False (anchor is a bonus token, only mask tokens predict, yielding
         block_size - 1 speculative tokens).
+    - layer_type / grug_*: `layer_type="grug"` selects the Grug-style draft layers
+        (GrugDSparkModel) with their qk_mult / gated-norm / expert settings.
     """
     architectures = config_dict.get("architectures") or []
     supported_architectures = {
         "Qwen3DSparkModel",
         "Qwen3OmniDSparkModel",
+        "GrugDSparkModel",
     }
     selected_architectures = [
         architecture
@@ -190,6 +193,18 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     ]
     # Legacy msModelSpec checkpoints use a training-only architecture name.
     pre_trained_config["architectures"] = selected_architectures or ["Qwen3DSparkModel"]
+    if config_dict.get("layer_type") == "grug":
+        # Grug-style draft layers (speculators `layer_type="grug"`): the backbone
+        # differs from Qwen3, the rest of the DSpark runtime is shared.
+        pre_trained_config["architectures"] = ["GrugDSparkModel"]
+        for key in (
+            "layer_type",
+            "grug_qk_mult",
+            "grug_gated_norm_rank",
+            "grug_num_experts",
+        ):
+            if config_dict.get(key) is not None:
+                pre_trained_config[key] = config_dict[key]
 
     sample_from_anchor = config_dict.get("sample_from_anchor", False)
     pre_trained_config["sample_from_anchor"] = sample_from_anchor

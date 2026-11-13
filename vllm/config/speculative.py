@@ -1327,6 +1327,7 @@ class SpeculativeConfig:
                     or _QWEN3_OMNI_DSPARK_ARCHITECTURE
                     in self.draft_model_config.architectures
                     or "Gemma4DSparkModel" in self.draft_model_config.architectures
+                    or "GrugDSparkModel" in self.draft_model_config.architectures
                     or (
                         "DSparkDraftModel" in self.draft_model_config.architectures
                         and self.draft_model_config.hf_config.model_type == "qwen3"
@@ -1414,6 +1415,7 @@ class SpeculativeConfig:
                     and _QWEN3_OMNI_DSPARK_ARCHITECTURE
                     not in self.draft_model_config.architectures
                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
+                    and "GrugDSparkModel" not in self.draft_model_config.architectures
                     and "K3DSparkModel" not in self.draft_model_config.architectures
                 ):
                     # DeepSeek-V4(.1) DSpark reuses the full target config
