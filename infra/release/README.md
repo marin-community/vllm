@@ -143,9 +143,9 @@ For an existing Hero `vllm serve` launch with BF16 Hugging Face weights, use
 The GPU implementation requires TP=1 and does not load serialized
 FP8 checkpoints.
 
-Online FP8 includes Hero's latent down/up projections, routed experts and
-multiple shared experts. QB router weights and
-bias stay FP32; Hero rounds router outputs to BF16 before FP32 expert selection.
+Online FP8 covers attention, gated-norm, latent and shared-expert projections,
+plus routed experts. QB router weights and bias stay FP32; Hero rounds router
+outputs to BF16 before FP32 expert selection.
 KV-cache precision is selected separately by `--kv-cache-dtype`; its `auto`
 default follows the model dtype. `--quantization fp8` does not enable an FP8
 KV cache.
