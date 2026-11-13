@@ -225,11 +225,6 @@ def _fill_parameter(param: torch.Tensor, start: float, end: float) -> None:
     )
 
 
-def _process_moe_weights(module: GrugMoeMLP) -> None:
-    routed_experts = module.experts.routed_experts
-    routed_experts.quant_method.process_weights_after_loading(routed_experts)
-
-
 class _FakeAttention(nn.Module):
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
@@ -898,7 +893,6 @@ def test_grug_moe_uses_qb_bias_for_selection_and_normalized_unbiased_weights():
         routed_experts.w13_weight[:, : cfg.intermediate_dim, :].copy_(gate_weight)
         routed_experts.w13_weight[:, cfg.intermediate_dim :, :].copy_(up_weight)
         routed_experts.w2_weight.copy_(down_weight)
-        _process_moe_weights(mlp)
 
     with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
         actual = mlp(x)
@@ -957,7 +951,6 @@ def test_hero_grug_moe_latent_experts_match_reference_math():
             -0.35,
         )
         _fill_parameter(routed_experts.w2_weight, -0.15, 0.3)
-        _process_moe_weights(mlp)
 
     expected = _reference_moe(x, mlp)
     with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
@@ -1447,9 +1440,10 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
             -0.25,
         )
         _fill_parameter(routed_experts.w2_weight, -0.1, 0.2)
-        _process_moe_weights(mlp)
+        # FlashInfer packs weights in place; the oracle needs the logical layout.
+        expected = _reference_moe(x, mlp)
+        routed_experts.quant_method.process_weights_after_loading(routed_experts)
 
-    expected = _reference_moe(x, mlp)
     # The fused-MoE kernels allocate through the workspace manager, which a real run
     # installs in GPUModelRunner.__init__. This test drives the layer directly, so it
     # has to do the same setup itself.
@@ -1654,7 +1648,6 @@ def test_grug_moe_tiny_decoder_layer_matches_reference_math():
             -0.3,
         )
         _fill_parameter(routed_experts.w2_weight, -0.1, 0.5)
-        _process_moe_weights(layer.mlp)
     fake_attn = _FakeAttention(cfg.hidden_dim)
     with torch.no_grad():
         fake_attn.weight.copy_(
@@ -2048,6 +2041,8 @@ def test_log_scaling_is_identical_across_prefill_chunking_prefix_cache_and_decod
             dtype="float32",
             # FlexAttention, the default for float32, recompiles per layer mask.
             attention_backend="TRITON_ATTN",
+            # FlashInfer's SM100 MoE kernel does not support float32.
+            moe_backend="triton",
             max_model_len=128,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=True,
