@@ -18,7 +18,12 @@ from transformers import AutoConfig
 
 from tests.utils import ensure_current_vllm_config
 from vllm import LLM, SamplingParams
-from vllm.config import CUDAGraphMode, get_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    get_current_vllm_config,
+    set_current_vllm_config,
+)
+from vllm.config.kernel import IrOpPriorityConfig, KernelConfig
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -29,6 +34,7 @@ from vllm.distributed.parallel_state import (
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
@@ -50,6 +56,7 @@ from vllm.model_executor.models.grugmoe import (
     get_grug_moe_runtime_info,
 )
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
@@ -447,6 +454,72 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
     )
 
     assert final_full_layer.self_attn.attn.sliding_window is None
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize(
+    ("schema", "dtype", "quantization", "checkpoint_fp8", "priority", "single_round"),
+    [
+        (1, "bfloat16", None, False, None, True),
+        (1, "bfloat16", None, False, ["native"], False),
+        (2, "bfloat16", None, False, None, False),
+        (2, "bfloat16", None, False, ["vllm_c"], True),
+        (1, "bfloat16", "fp8", False, None, False),
+        (1, "bfloat16", "fp8", False, ["vllm_c"], True),
+        (1, "bfloat16", None, True, None, False),
+        (1, "float16", None, False, None, False),
+    ],
+)
+def test_grug_moe_norm_selection_preserves_rounding(
+    tmp_path, schema, dtype, quantization, checkpoint_fp8, priority, single_round
+):
+    GrugMoeConfig(
+        architectures=["GrugMoeForCausalLM"],
+        vocab_size=32,
+        hidden_size=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        sliding_window=128,
+        grugmoe_artifact_schema_version=schema,
+        quantization_config=(
+            {"quant_method": "fp8", "activation_scheme": "dynamic"}
+            if checkpoint_fp8
+            else None
+        ),
+    ).save_pretrained(tmp_path)
+    config = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype=dtype,
+        quantization=quantization,
+        compilation_config={"mode": 3},
+        kernel_config=KernelConfig(
+            ir_op_priority=IrOpPriorityConfig(rms_norm=priority or [])
+        ),
+    ).create_engine_config()
+    dtype = config.model_config.dtype
+    inputs = torch.tensor(
+        [[-0.75, 0.25, 0.5, 1.0], [0.125, -0.375, 0.875, -1.25]],
+        dtype=dtype,
+        device="cuda",
+    )
+    eps = 1e-5
+    with (
+        set_current_vllm_config(config),
+        config.kernel_config.ir_op_priority.set_priority(),
+    ):
+        norm = RMSNorm(4, eps=eps, dtype=dtype).cuda()
+        with torch.no_grad():
+            norm.weight.copy_(torch.tensor([0.75, 1.25, 0.5, 1.5]))
+            actual = norm(inputs)
+        normalized = inputs.double() * torch.rsqrt(
+            inputs.double().square().mean(dim=-1, keepdim=True) + eps
+        )
+        if not single_round:
+            normalized = normalized.to(dtype).double()
+        expected = (normalized * norm.weight.double()).to(dtype)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
