@@ -1353,6 +1353,44 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
         module.kv_cache[0][0], torch.zeros_like(module.kv_cache[0][0]), rtol=0, atol=0
     )
 
+    # Decode A while B resumes prefill from its existing state. The output
+    # keeps decode rows first even though the prefill kernel executes first.
+    next_a = torch.tensor([[5.0, -5.0]], device="cuda")
+    next_b = torch.tensor([[40.0, 16.0], [50.0, 20.0]], device="cuda")
+    mixed = torch.vstack((next_a, next_b))
+    mixed_metadata = replace(
+        prefill_metadata,
+        num_prefills=1,
+        num_prefill_tokens=2,
+        num_decodes=1,
+        num_decode_tokens=1,
+        query_start_loc_p=torch.tensor([0, 2], device="cuda", dtype=torch.int32),
+        has_initial_states_p=torch.tensor([True], device="cuda"),
+        state_indices_tensor_p=torch.tensor([2], device="cuda", dtype=torch.int32),
+        state_indices_tensor_d=torch.tensor([1], device="cuda", dtype=torch.int32),
+        query_start_loc_d=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        seq_lens=torch.tensor([5, 5], device="cuda"),
+    )
+    with set_forward_context(
+        {prefix: mixed_metadata},
+        get_current_vllm_config(),
+        num_tokens=mixed.shape[0],
+    ):
+        mixed_output = module(mixed)
+
+    expected_mixed = torch.vstack(
+        (
+            _causal_depthwise_reference(
+                torch.vstack((request_a, decode[:1], next_a)), weight
+            )[-1:],
+            _causal_depthwise_reference(
+                torch.vstack((request_b, decode[1:2], next_b)), weight
+            )[-2:],
+        )
+    )
+    torch.testing.assert_close(mixed_output, expected_mixed)
+    torch.testing.assert_close(mixed, torch.vstack((next_a, next_b)), rtol=0, atol=0)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -1396,6 +1434,8 @@ def test_hero_grug_moe_sconv_padded_decode_zeros_inactive_rows(dtype):
         torch.testing.assert_close(
             output[1:], torch.zeros_like(output[1:]), rtol=0, atol=0
         )
+
+
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
