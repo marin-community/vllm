@@ -457,16 +457,20 @@ def test_grug_moe_hf_config_loads_exported_artifact_config(tmp_path):
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 @pytest.mark.parametrize(
-    ("schema", "priority", "single_round"),
+    ("schema", "dtype", "quantization", "checkpoint_fp8", "priority", "single_round"),
     [
-        (1, None, True),
-        (1, ["native"], False),
-        (2, None, False),
-        (2, ["vllm_c"], True),
+        (1, "bfloat16", None, False, None, True),
+        (1, "bfloat16", None, False, ["native"], False),
+        (2, "bfloat16", None, False, None, False),
+        (2, "bfloat16", None, False, ["vllm_c"], True),
+        (1, "bfloat16", "fp8", False, None, False),
+        (1, "bfloat16", "fp8", False, ["vllm_c"], True),
+        (1, "bfloat16", None, True, None, False),
+        (1, "float16", None, False, None, False),
     ],
 )
-def test_grug_moe_norm_defaults_follow_training_rounding(
-    tmp_path, schema, priority, single_round
+def test_grug_moe_norm_selection_preserves_rounding(
+    tmp_path, schema, dtype, quantization, checkpoint_fp8, priority, single_round
 ):
     GrugMoeConfig(
         architectures=["GrugMoeForCausalLM"],
@@ -477,19 +481,26 @@ def test_grug_moe_norm_defaults_follow_training_rounding(
         max_position_embeddings=128,
         sliding_window=128,
         grugmoe_artifact_schema_version=schema,
+        quantization_config=(
+            {"quant_method": "fp8", "activation_scheme": "dynamic"}
+            if checkpoint_fp8
+            else None
+        ),
     ).save_pretrained(tmp_path)
     config = EngineArgs(
         model=str(tmp_path),
         skip_tokenizer_init=True,
-        dtype="bfloat16",
+        dtype=dtype,
+        quantization=quantization,
         compilation_config={"mode": 3},
         kernel_config=KernelConfig(
             ir_op_priority=IrOpPriorityConfig(rms_norm=priority or [])
         ),
     ).create_engine_config()
+    dtype = config.model_config.dtype
     inputs = torch.tensor(
         [[-0.75, 0.25, 0.5, 1.0], [0.125, -0.375, 0.875, -1.25]],
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device="cuda",
     )
     eps = 1e-5
@@ -497,7 +508,7 @@ def test_grug_moe_norm_defaults_follow_training_rounding(
         set_current_vllm_config(config),
         config.kernel_config.ir_op_priority.set_priority(),
     ):
-        norm = RMSNorm(4, eps=eps, dtype=torch.bfloat16).cuda()
+        norm = RMSNorm(4, eps=eps, dtype=dtype).cuda()
         with torch.no_grad():
             norm.weight.copy_(torch.tensor([0.75, 1.25, 0.5, 1.5]))
             actual = norm(inputs)
@@ -505,8 +516,8 @@ def test_grug_moe_norm_defaults_follow_training_rounding(
             inputs.double().square().mean(dim=-1, keepdim=True) + eps
         )
         if not single_round:
-            normalized = normalized.bfloat16().double()
-        expected = (normalized * norm.weight.double()).bfloat16()
+            normalized = normalized.to(dtype).double()
+        expected = (normalized * norm.weight.double()).to(dtype)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

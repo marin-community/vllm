@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
@@ -463,11 +465,14 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
 class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        hf_config = vllm_config.model_config.hf_text_config
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_text_config
         priorities = vllm_config.kernel_config.ir_op_priority
         if (
             current_platform.is_cuda()
             and getattr(hf_config, "grugmoe_artifact_schema_version", 1) == 1
+            and model_config.dtype == torch.bfloat16
+            and model_config.quantization is None
             and not priorities.rms_norm
         ):
             # Match training: multiply the weight before the BF16 rounding.
