@@ -1640,20 +1640,23 @@ def test_hero_online_fp8_latent_and_shared_experts_match_bf16(num_tokens, monkey
                 columns = torch.arange(parameter.shape[-1], device="cuda") // 16
                 pattern = powers[(rows[:, None] + 2 * columns + index) % 4]
                 parameter.copy_(pattern / 128)
+        # Distinguish gate/up halves, latent inputs and routed expert IDs.
         experts = reference["mlp"].experts.routed_experts
         experts.w13_weight[:, cfg.intermediate_dim :].mul_(2)
+        experts.w13_weight[:, :, :16].mul_(2)
         for expert_id in range(cfg.num_experts):
             experts.w13_weight[expert_id].mul_(2**expert_id / 8)
+            experts.w2_weight[expert_id].mul_(2**-expert_id)
         reference["mlp"].router.weight.copy_(
             reference["mlp"].router.weight.bfloat16().float()
         )
 
-        # Power-of-two blocks limit FP8 rounding while distinguishing projections
-        # and experts. Negative rows also exercise the other routed experts.
-        x = torch.full(
-            (num_tokens, cfg.hidden_dim), 0.125, device="cuda", dtype=torch.bfloat16
-        )
-        x[1::2] = -1.0
+        # The 7:2 input blocks scale exactly to FP8 values 448:128. Negative rows
+        # exercise the other routed experts; unequal blocks expose misloaded axes.
+        inputs = torch.tensor([7 / 32, 2 / 32], device="cuda", dtype=torch.bfloat16)
+        blocks = (torch.arange(cfg.hidden_dim, device="cuda") // 16) % 2
+        x = inputs[blocks].repeat(num_tokens, 1)
+        x[1::2].mul_(-4)
         routed_expected = _reference_moe(x, reference["mlp"])
         shared_expected = [
             _reference_dense_mlp(x, expert) for expert in reference["shared_experts"]
