@@ -172,7 +172,7 @@ jobs:
             --tpu "${{ needs.resolve_tpu.outputs.hardware }}" --enable-extra-resources \
             --region "${{ needs.resolve_tpu.outputs.region }}" \
             --priority production \
-            --cpu 16 --memory 64g --disk 100g \
+            --cpu 16 --memory 64g --disk 64g \
             --timeout 4200 \
             --no-sync \
             --max-retries 0 \
@@ -185,11 +185,11 @@ jobs:
               --qualification-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
               2>&1 | tee validation.log
 
-      - name: Stop any Iris job left behind
+      - name: Cancel any Iris job left behind
         if: always()
         run: |
           if [[ -n "${JOB_NAME:-}" ]]; then
-            iris --cluster marin job stop "/$JOB_USER/$JOB_NAME" || true
+            iris --cluster marin job cancel --exact "/$JOB_USER/$JOB_NAME" || true
           fi
 
       - name: Wait for the federated validation record
