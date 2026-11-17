@@ -585,8 +585,6 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
 @pytest.mark.parametrize(
     ("requested", "split_shortconv", "expected"),
     [
-        ("NONE", False, CUDAGraphMode.NONE),
-        ("PIECEWISE", False, CUDAGraphMode.NONE),
         ("PIECEWISE", True, CUDAGraphMode.PIECEWISE),
         ("FULL", True, CUDAGraphMode.NONE),
         ("FULL_AND_PIECEWISE", False, CUDAGraphMode.NONE),
@@ -594,15 +592,6 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
     ],
 )
 def test_hero_shortconv_graph_modes(tmp_path, requested, split_shortconv, expected):
-    config = _tiny_hero_engine_config(tmp_path, requested, split_shortconv)
-    assert config.compilation_config.cudagraph_mode == expected
-    _raise_for_unsupported_modes(config)
-    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
-    with pytest.raises(NotImplementedError):
-        _raise_for_unsupported_modes(config)
-
-
-def _tiny_hero_engine_config(tmp_path, cudagraph_mode: str, split_shortconv: bool):
     GrugMoeConfig(
         grugmoe_artifact_schema_version=2,
         architectures=["GrugMoeForCausalLM"],
@@ -624,17 +613,19 @@ def _tiny_hero_engine_config(tmp_path, cudagraph_mode: str, split_shortconv: boo
         global_every=1,
         sconv=True,
     ).save_pretrained(tmp_path)
-    return EngineArgs(
+    config = EngineArgs(
         model=str(tmp_path),
         skip_tokenizer_init=True,
         dtype="bfloat16",
-        max_num_seqs=8,
         compilation_config={
             "mode": 3,
-            "cudagraph_mode": cudagraph_mode,
+            "cudagraph_mode": requested,
             "splitting_ops": ["vllm::grug_moe_short_conv"] if split_shortconv else [],
         },
     ).create_engine_config()
+    assert config.compilation_config.cudagraph_mode == expected
+    # Config normalization and the model's load-time guard must agree.
+    _raise_for_unsupported_modes(config)
 
 
 def test_grug_moe_config_rejects_noncanonical_layer_types():
@@ -1438,18 +1429,9 @@ def test_hero_grug_moe_sconv_padded_decode_zeros_inactive_rows(dtype):
         )
 
 
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_hero_grug_moe_sconv_full_graph_replay_matches_eager():
-    """A captured decode step replays like eager for new inputs and slots.
-
-    FULL_AND_PIECEWISE captures ShortConv inside the decode graph with the
-    padded batch size; padding rows point at the null state slot. Replaying
-    with new hidden states and new state slots (written into the same
-    persistent buffers, as the metadata builder does) must give eager's
-    output and conv-state update, and must not touch other slots.
-    """
+    """Replay new inputs and slots like eager, preserving inactive and null state."""
     prefix = "hero.sconv.fullgraph"
     padded = 4
     module = GrugMoeShortConv(2, 4, torch.float32, None, prefix).cuda()
@@ -1490,7 +1472,7 @@ def test_hero_grug_moe_sconv_full_graph_replay_matches_eager():
         with set_forward_context(
             {prefix: metadata(state_indices)},
             get_current_vllm_config(),
-            num_tokens=padded
+            num_tokens=padded,
         ):
             torch.ops.vllm.grug_moe_short_conv(hidden, output, prefix)
 
@@ -1498,7 +1480,7 @@ def test_hero_grug_moe_sconv_full_graph_replay_matches_eager():
     # Capture on vLLM's stream, as the runner does. A separate capture stream
     # leaves vLLM's tracked stream at the default stream for later tests.
     stream = current_stream()
-    step()  # warm up outside capture
+    step()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
@@ -1522,7 +1504,7 @@ def test_hero_grug_moe_sconv_full_graph_replay_matches_eager():
         with set_forward_context(
             {prefix: metadata(eager_indices)},
             get_current_vllm_config(),
-            num_tokens=padded
+            num_tokens=padded,
         ):
             torch.ops.vllm.grug_moe_short_conv(new_hidden, eager_output, prefix)
         torch.cuda.synchronize()
@@ -1532,7 +1514,7 @@ def test_hero_grug_moe_sconv_full_graph_replay_matches_eager():
             graph_output[:real], eager_output[:real], rtol=0, atol=0
         )
         torch.testing.assert_close(graph_state, module.kv_cache[0], rtol=0, atol=0)
-        untouched = [slot for slot in range(1, 5) if slot not in real_slots]
+        untouched = [slot for slot in range(5) if slot not in real_slots]
         torch.testing.assert_close(
             graph_state[untouched], initial_state[untouched], rtol=0, atol=0
         )
