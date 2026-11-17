@@ -585,6 +585,8 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
 @pytest.mark.parametrize(
     ("requested", "split_shortconv", "expected"),
     [
+        ("NONE", False, CUDAGraphMode.NONE),
+        ("PIECEWISE", False, CUDAGraphMode.NONE),
         ("PIECEWISE", True, CUDAGraphMode.PIECEWISE),
         ("FULL", True, CUDAGraphMode.NONE),
         ("FULL_AND_PIECEWISE", False, CUDAGraphMode.NONE),
@@ -626,6 +628,9 @@ def test_hero_shortconv_graph_modes(tmp_path, requested, split_shortconv, expect
     assert config.compilation_config.cudagraph_mode == expected
     # Config normalization and the model's load-time guard must agree.
     _raise_for_unsupported_modes(config)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    with pytest.raises(NotImplementedError):
+        _raise_for_unsupported_modes(config)
 
 
 def test_grug_moe_config_rejects_noncanonical_layer_types():
