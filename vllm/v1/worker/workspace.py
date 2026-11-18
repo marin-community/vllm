@@ -113,6 +113,39 @@ class WorkspaceManager:
         """Check if workspace is locked."""
         return self._locked
 
+    def reserve(
+        self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> None:
+        """Reserve every ubatch/lane slot before launching model collectives.
+
+        Call during kernel setup, before any views or CUDA graphs use the
+        buffers. The caching allocator can reuse released storage here without
+        a device-wide cache flush inside an in-flight expert-parallel forward.
+        """
+        required_bytes = sum(
+            round_up(_compute_bytes(shape, dtype), 256)
+            for shape, dtype in shapes_and_dtypes
+        )
+        allocated_slots = 0
+        for workspace_id in range(len(self._current_workspaces)):
+            if self._workspace_size_bytes(
+                self._current_workspaces[workspace_id]
+            ) >= required_bytes:
+                continue
+            assert not self._locked, "Cannot grow a locked workspace reservation."
+            self._current_workspaces[workspace_id] = None
+            self._current_workspaces[workspace_id] = torch.empty(
+                (required_bytes,), dtype=torch.uint8, device=self._device
+            )
+            allocated_slots += 1
+        if allocated_slots:
+            logger.info(
+                "Reserved %.2f MiB of workspace in each of %d ubatch/lane slots "
+                "before model dispatch.",
+                required_bytes / _MB,
+                allocated_slots,
+            )
+
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
     ) -> list[torch.Tensor]:

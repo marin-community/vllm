@@ -90,6 +90,14 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         # experts can use the per-rank-local mapping.
         self._lora_context = None
 
+    def post_init_setup(self, fused_experts: mk.FusedMoEExperts) -> None:
+        # Reserve for the largest all-gather before any rank starts dispatch.
+        # This avoids the workspace cache release observed inside profile_run
+        # during the startup hang in Marin #11644.
+        fused_experts.reserve_workspace(
+            fused_experts.moe_config.max_num_tokens * self.num_dispatchers()
+        )
+
     def set_lora_context(self, ctx) -> None:
         self._lora_context = ctx
 

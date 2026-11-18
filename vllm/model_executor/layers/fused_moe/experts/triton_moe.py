@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton-based MoE expert implementations."""
 
+from math import prod
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -60,6 +62,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.v1.worker.workspace import current_workspace_manager
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
@@ -236,6 +239,25 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         workspace2 = (M, topk, max(N, K))
         output = (M, K)
         return (workspace1, workspace2, output)
+
+    def reserve_workspace(self, max_num_tokens: int) -> None:
+        moe = self.moe_config
+        N = moe.intermediate_size_per_partition * (2 if moe.activation.is_gated else 1)
+        workspace13, workspace2, output = self.workspace_shapes(
+            max_num_tokens,
+            N,
+            moe.hidden_dim,
+            moe.experts_per_token,
+            moe.num_experts,
+            moe.num_local_experts,
+            None,
+            moe.activation,
+        )
+        dtype = self.workspace_dtype(moe.in_dtype)
+        current_workspace_manager().reserve(
+            ((max(prod(workspace13), prod(output)),), dtype),
+            (workspace2, dtype),
+        )
 
     def apply(
         self,

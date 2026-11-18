@@ -515,6 +515,9 @@ class FusedMoEExperts(ABC):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:  # noqa: B027
         pass
 
+    def reserve_workspace(self, max_num_tokens: int) -> None:
+        """Reserve scratch space before dispatch, when supported by the kernel."""
+
     @staticmethod
     def is_monolithic() -> bool:
         raise NotImplementedError("Implemented by subclasses.")
