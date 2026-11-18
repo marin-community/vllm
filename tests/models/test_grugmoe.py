@@ -61,7 +61,7 @@ from vllm.model_executor.models.registry import ModelRegistry
 from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
-from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.utils.torch_utils import current_stream, set_default_torch_dtype
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -589,7 +589,8 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
         ("PIECEWISE", False, CUDAGraphMode.NONE),
         ("PIECEWISE", True, CUDAGraphMode.PIECEWISE),
         ("FULL", True, CUDAGraphMode.NONE),
-        ("FULL_AND_PIECEWISE", True, CUDAGraphMode.NONE),
+        ("FULL_AND_PIECEWISE", False, CUDAGraphMode.NONE),
+        ("FULL_AND_PIECEWISE", True, CUDAGraphMode.FULL_AND_PIECEWISE),
     ],
 )
 def test_hero_shortconv_graph_modes(tmp_path, requested, split_shortconv, expected):
@@ -625,6 +626,7 @@ def test_hero_shortconv_graph_modes(tmp_path, requested, split_shortconv, expect
         },
     ).create_engine_config()
     assert config.compilation_config.cudagraph_mode == expected
+    # Config normalization and the model's load-time guard must agree.
     _raise_for_unsupported_modes(config)
     config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
     with pytest.raises(NotImplementedError):
@@ -1432,6 +1434,95 @@ def test_hero_grug_moe_sconv_padded_decode_zeros_inactive_rows(dtype):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hero_grug_moe_sconv_full_graph_replay_matches_eager():
+    """Replay new inputs and slots like eager, preserving inactive and null state."""
+    prefix = "hero.sconv.fullgraph"
+    padded = 4
+    module = GrugMoeShortConv(2, 4, torch.float32, None, prefix).cuda()
+    module.weight.data.copy_(
+        torch.tensor([[1.0, 0.75], [0.5, -0.25], [-0.25, 0.125], [0.125, 0.5]])
+    )
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    initial_state = torch.randn(5, 3, 2, device="cuda", generator=generator)
+    initial_state[0].zero_()  # slot 0 is vLLM's null block
+    state_indices = torch.zeros(padded, device="cuda", dtype=torch.int32)
+    hidden = torch.zeros(padded, 2, device="cuda")
+    output = torch.zeros_like(hidden)
+
+    def metadata(indices: torch.Tensor) -> ShortConvAttentionMetadata:
+        return ShortConvAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=padded,
+            num_decode_tokens=padded,
+            num_reqs=padded,
+            query_start_loc_p=None,
+            has_initial_states_p=None,
+            state_indices_tensor_p=torch.empty(0, device="cuda", dtype=torch.int32),
+            state_indices_tensor_d=indices,
+            num_accepted_tokens=None,
+            query_start_loc_d=torch.arange(
+                padded + 1, device="cuda", dtype=torch.int32
+            ),
+            block_idx_last_scheduled_token=None,
+            block_idx_first_scheduled_token_p=None,
+            block_idx_last_computed_token=None,
+            block_idx_last_scheduled_token_prev_step=None,
+            num_computed_tokens_p=None,
+            seq_lens=torch.full((padded,), 4, device="cuda"),
+        )
+
+    def step() -> None:
+        with set_forward_context(
+            {prefix: metadata(state_indices)},
+            get_current_vllm_config(),
+            num_tokens=padded,
+        ):
+            torch.ops.vllm.grug_moe_short_conv(hidden, output, prefix)
+
+    module.kv_cache = (initial_state.clone(),)
+    # Capture on vLLM's stream, as the runner does. A separate capture stream
+    # leaves vLLM's tracked stream at the default stream for later tests.
+    stream = current_stream()
+    step()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        step()
+
+    for real_slots in ([1, 3], [4, 2, 1]):
+        new_hidden = torch.randn(padded, 2, device="cuda", generator=generator)
+        slots = real_slots + [0] * (padded - len(real_slots))
+
+        module.kv_cache[0].copy_(initial_state)
+        hidden.copy_(new_hidden)
+        state_indices.copy_(torch.tensor(slots, dtype=torch.int32))
+        graph.replay()
+        torch.cuda.synchronize()
+        graph_output = output.clone()
+        graph_state = module.kv_cache[0].clone()
+
+        module.kv_cache[0].copy_(initial_state)
+        eager_indices = torch.tensor(slots, device="cuda", dtype=torch.int32)
+        eager_output = torch.zeros_like(output)
+        with set_forward_context(
+            {prefix: metadata(eager_indices)},
+            get_current_vllm_config(),
+            num_tokens=padded,
+        ):
+            torch.ops.vllm.grug_moe_short_conv(new_hidden, eager_output, prefix)
+        torch.cuda.synchronize()
+
+        real = len(real_slots)
+        torch.testing.assert_close(
+            graph_output[:real], eager_output[:real], rtol=0, atol=0
+        )
+        torch.testing.assert_close(graph_state, module.kv_cache[0], rtol=0, atol=0)
+        untouched = [slot for slot in range(5) if slot not in real_slots]
+        torch.testing.assert_close(
+            graph_state[untouched], initial_state[untouched], rtol=0, atol=0
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -483,15 +483,17 @@ class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
         from vllm.config import CUDAGraphMode
 
         compilation_config = vllm_config.compilation_config
-        if (
-            compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
-            and "vllm::grug_moe_short_conv"
-            in (compilation_config.splitting_ops or [])
-        ):
+        # ShortConv runs eagerly between piecewise graphs; uniform decode batches
+        # may also replay full graphs (the Mamba builder pads state indices).
+        if compilation_config.cudagraph_mode in (
+            CUDAGraphMode.PIECEWISE,
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+        ) and "vllm::grug_moe_short_conv" in (compilation_config.splitting_ops or []):
             return
         if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             logger.warning_once(
-                "GrugMoE ShortConv requires PIECEWISE CUDA graphs with "
+                "GrugMoE ShortConv requires PIECEWISE or FULL_AND_PIECEWISE "
+                "CUDA graphs with "
                 "vllm::grug_moe_short_conv excluded through splitting_ops; "
                 "overriding cudagraph_mode to NONE."
             )

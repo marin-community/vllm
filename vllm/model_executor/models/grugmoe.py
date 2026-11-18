@@ -1349,11 +1349,13 @@ def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
     ):
         compilation = vllm_config.compilation_config
         if compilation.cudagraph_mode != CUDAGraphMode.NONE and (
-            compilation.cudagraph_mode != CUDAGraphMode.PIECEWISE
+            compilation.cudagraph_mode
+            not in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE)
             or "vllm::grug_moe_short_conv" not in (compilation.splitting_ops or [])
         ):
             raise NotImplementedError(
-                "GrugMoE ShortConv CUDA graphs require PIECEWISE mode with "
+                "GrugMoE ShortConv CUDA graphs require PIECEWISE or "
+                "FULL_AND_PIECEWISE mode with "
                 "vllm::grug_moe_short_conv excluded through splitting_ops"
             )
     if vllm_config.lora_config is not None:
