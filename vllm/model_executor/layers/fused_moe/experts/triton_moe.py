@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton-based MoE expert implementations."""
 
-from math import prod
-
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -254,8 +252,11 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             moe.activation,
         )
         dtype = self.workspace_dtype(moe.in_dtype)
+        common_shape, workspace2 = mk.workspace_buffer_shapes(
+            workspace13, workspace2, output
+        )
         current_workspace_manager().reserve(
-            ((max(prod(workspace13), prod(output)),), dtype),
+            (common_shape, dtype),
             (workspace2, dtype),
         )
 

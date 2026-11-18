@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -21,12 +23,18 @@ from vllm.v1.worker import workspace
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("dispatchers", [1, 16])
+@pytest.mark.parametrize(
+    ("dispatchers", "dp", "sp", "gathered_tokens"),
+    [(1, 1, 1, 5), (16, 16, 1, 80), (16, 8, 2, 48), (32, 16, 1, 80)],
+)
 @pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
 @pytest.mark.parametrize(("hidden", "intermediate"), [(17, 29), (37, 11)])
 def test_gathered_moe_workspace_never_grows_during_forward(
     monkeypatch,
     dispatchers: int,
+    dp: int,
+    sp: int,
+    gathered_tokens: int,
     activation: MoEActivation,
     hidden: int,
     intermediate: int,
@@ -51,13 +59,23 @@ def test_gathered_moe_workspace_never_grows_during_forward(
         activation=activation,
         device="cpu",
         routing_method=RoutingMethodType.TopK,
-        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        moe_parallel_config=replace(
+            FusedMoEParallelConfig.make_no_parallel(),
+            dp_size=dp,
+            sp_size=sp,
+            ep_size=dispatchers,
+            use_ep=True,
+            all2all_backend="allgather_reducescatter",
+        ),
         in_dtype=torch.bfloat16,
         max_num_tokens=5,
     )
     experts = TritonExperts(moe, FusedMoEQuantConfig.make(None))
     kernel = FusedMoEKernel(
-        MoEPrepareAndFinalizeNaiveDPEPModular(num_dispatchers=dispatchers), experts
+        MoEPrepareAndFinalizeNaiveDPEPModular(
+            num_dispatchers=dispatchers, is_sequence_parallel=sp > 1
+        ),
+        experts,
     )
 
     def blocked_cache_flush() -> None:
@@ -89,7 +107,7 @@ def test_gathered_moe_workspace_never_grows_during_forward(
         for lane in range(2):
             with workspace.use_workspace_lane(lane):
                 pointer = None
-                for tokens in (1, 3, 5 * dispatchers):
+                for tokens in (1, 3, gathered_tokens):
                     scratch13, scratch2, output = kernel.impl._allocate_buffers(
                         torch.bfloat16,
                         torch.device("cpu"),
@@ -114,3 +132,19 @@ def test_gathered_moe_workspace_never_grows_during_forward(
                     assert scratch13.data_ptr() == pointer
                     assert output.data_ptr() == pointer
     assert len(pointers) == 4
+    # TP ranks outside the actual gather group must not inflate the reservation.
+    over_budget = gathered_tokens + moe.max_num_tokens
+    with pytest.raises(AssertionError, match="Workspace is locked"):
+        kernel.impl._allocate_buffers(
+            torch.bfloat16,
+            torch.device("cpu"),
+            over_budget,
+            over_budget,
+            N,
+            hidden,
+            2,
+            16,
+            1,
+            None,
+            activation,
+        )

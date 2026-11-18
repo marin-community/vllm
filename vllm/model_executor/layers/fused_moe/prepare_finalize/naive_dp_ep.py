@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+from vllm.utils.math_utils import cdiv
 
 
 def _quantize_and_setup_dispatch(
@@ -91,12 +92,17 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         self._lora_context = None
 
     def post_init_setup(self, fused_experts: mk.FusedMoEExperts) -> None:
-        # Reserve for the largest all-gather before any rank starts dispatch.
-        # This avoids the workspace cache release observed inside profile_run
-        # during the startup hang in Marin #11644.
-        fused_experts.reserve_workspace(
-            fused_experts.moe_config.max_num_tokens * self.num_dispatchers()
-        )
+        # Match the dispatch group's token bound before any collective starts.
+        # Scratch growth inside a distributed forward can flush the allocator.
+        moe = fused_experts.moe_config
+        if self.is_sequence_parallel:
+            gathered_tokens = (
+                cdiv(moe.max_num_tokens, moe.sp_size) * self.num_dispatchers()
+            )
+        else:
+            gather_size = moe.dp_size if moe.dp_size > 1 else moe.pcp_size
+            gathered_tokens = moe.max_num_tokens * gather_size
+        fused_experts.reserve_workspace(gathered_tokens)
 
     def set_lora_context(self, ctx) -> None:
         self._lora_context = ctx

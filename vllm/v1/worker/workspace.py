@@ -26,6 +26,7 @@ def _compute_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
 # Constants
 _MB = 1024**2
 _GiB = 1024**3
+_WORKSPACE_ALIGNMENT = 256
 
 # Global workspace manager instance
 _manager: "WorkspaceManager | None" = None
@@ -123,7 +124,7 @@ class WorkspaceManager:
         a device-wide cache flush inside an in-flight expert-parallel forward.
         """
         required_bytes = sum(
-            round_up(_compute_bytes(shape, dtype), 256)
+            round_up(_compute_bytes(shape, dtype), _WORKSPACE_ALIGNMENT)
             for shape, dtype in shapes_and_dtypes
         )
         allocated_slots = 0
@@ -158,7 +159,9 @@ class WorkspaceManager:
             List of tensor views into the workspace buffer, one per shape/dtype pair.
         """
         actual_bytes = [_compute_bytes(s, d) for s, d in shapes_and_dtypes]
-        aligned_bytes = [round_up(actual, 256) for actual in actual_bytes]
+        aligned_bytes = [
+            round_up(actual, _WORKSPACE_ALIGNMENT) for actual in actual_bytes
+        ]
         total_bytes = sum(aligned_bytes)
 
         # Calculate cumulative offsets using itertools.accumulate
