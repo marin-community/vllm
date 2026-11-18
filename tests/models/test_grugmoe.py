@@ -1605,10 +1605,9 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize(
-    "selective,ignored", [(False, False), (True, False), (True, True)]
-)
-def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective, ignored):
+@pytest.mark.parametrize("configuration", ["legacy", "online", "ignored-experts"])
+def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, configuration):
+    ignored = configuration == "ignored-experts"
     cfg = replace(
         _tiny_config(),
         hidden_dim=64,
@@ -1637,7 +1636,7 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective, ignore
                         ignore=["model.layers.0.mlp.experts"] if ignored else [],
                     )
                 )
-                if selective
+                if configuration != "legacy"
                 else Fp8Config()
             ),
             prefix="model.layers.0.mlp",
