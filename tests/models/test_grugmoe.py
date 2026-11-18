@@ -1583,9 +1583,9 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective):
     reason="requires CUDA with FP8 support",
 )
 @pytest.mark.parametrize("num_tokens", [1, 7])
-@pytest.mark.parametrize("selective", [False, True])
+@pytest.mark.parametrize("configuration", ["legacy", "online", "experts-only"])
 def test_hero_online_fp8_latent_and_shared_experts_match_bf16(
-    num_tokens, selective, monkeypatch
+    num_tokens, configuration, monkeypatch
 ):
     cfg = replace(
         _tiny_hero_config(),
@@ -1602,9 +1602,14 @@ def test_hero_online_fp8_latent_and_shared_experts_match_bf16(
     # Online loaders record the construction device and materialize weights there.
     with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
         selected_config = (
-            OnlineQuantizationConfig(QuantizationConfigArgs(moe="fp8_per_tensor"))
-            if selective
-            else Fp8Config()
+            Fp8Config()
+            if configuration == "legacy"
+            else OnlineQuantizationConfig(
+                QuantizationConfigArgs(
+                    moe="fp8_per_tensor",
+                    linear="fp8_per_tensor" if configuration == "online" else None,
+                )
+            )
         )
         for profile, quant_config in (("reference", None), ("fp8", selected_config)):
             modules.append(
@@ -1715,7 +1720,9 @@ def test_hero_online_fp8_latent_and_shared_experts_match_bf16(
             (expert.gate_proj.weight, expert.up_proj.weight, expert.down_proj.weight)
         )
     assert all(weight.dtype == torch.float8_e4m3fn for weight in fp8_weights)
-    projection_dtype = torch.bfloat16 if selective else torch.float8_e4m3fn
+    projection_dtype = (
+        torch.bfloat16 if configuration == "experts-only" else torch.float8_e4m3fn
+    )
     assert all(weight.dtype == projection_dtype for weight in projection_weights)
     torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
 
