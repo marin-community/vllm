@@ -94,6 +94,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
     def post_init_setup(self, fused_experts: mk.FusedMoEExperts) -> None:
         # Match the dispatch group's token bound before any collective starts.
         # Scratch growth inside a distributed forward can flush the allocator.
+        # The kernel reserves only while the workspace is unlocked; during
+        # elastic scale-up it defers to the existing graph-release, unlock
+        # and warm-up sequence instead of growing behind locked graphs.
         moe = fused_experts.moe_config
         if self.is_sequence_parallel:
             gathered_tokens = (

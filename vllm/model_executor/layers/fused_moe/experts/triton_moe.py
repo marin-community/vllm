@@ -60,7 +60,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
@@ -239,6 +242,24 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         return (workspace1, workspace2, output)
 
     def reserve_workspace(self, max_num_tokens: int) -> None:
+        """Grow the current workspace slot to this kernel's maximum scratch.
+
+        Mirrors the Triton MLA setup reservation: sizing the shared buffers
+        here lets the caching allocator reuse released storage before any
+        collective or captured graph depends on the buffer addresses, instead
+        of flushing the allocator inside an in-flight expert-parallel forward.
+        Only the requesting (ubatch, lane) slot grows: the draft lane owns its
+        buffer, and remaining ubatch slots grow during warmup as upstream
+        intends. When the workspace is locked for active CUDA graphs (elastic
+        scale-up rebuilds kernels in that state), the reservation defers to
+        the existing graph-release, unlock and warm-up sequence, which grows
+        the workspace before the next capture.
+        """
+        if not is_workspace_manager_initialized():
+            return
+        manager = current_workspace_manager()
+        if manager.is_locked():
+            return
         moe = self.moe_config
         N = moe.intermediate_size_per_partition * (2 if moe.activation.is_gated else 1)
         workspace13, workspace2, output = self.workspace_shapes(
@@ -255,7 +276,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         common_shape, workspace2 = mk.workspace_buffer_shapes(
             workspace13, workspace2, output
         )
-        current_workspace_manager().reserve(
+        manager.get_simultaneous(
             (common_shape, dtype),
             (workspace2, dtype),
         )
