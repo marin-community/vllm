@@ -55,6 +55,11 @@ def test_setup_reserves_the_current_slot_before_dispatch(
         torch.device("cpu"), num_ubatches=2, num_lanes=2
     )
     monkeypatch.setattr(workspace, "_manager", manager)
+    # The setup reservation flushes the allocator outside any forward; record
+    # those flushes from the start (a CPU-only box has no accelerator for the
+    # real call) and block the flush later, where growth must not happen.
+    flushes: list[int] = []
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: flushes.append(1))
     moe = FusedMoEConfig(
         num_experts=16,
         experts_per_token=2,
@@ -87,7 +92,6 @@ def test_setup_reserves_the_current_slot_before_dispatch(
     def blocked_cache_flush() -> None:
         raise RuntimeError("allocator waited on an in-flight dispatch")
 
-    monkeypatch.setattr(torch.accelerator, "empty_cache", blocked_cache_flush)
     N = intermediate * (2 if activation.is_gated else 1)
     # The setup reservation mirrors the Triton MLA pattern: it grows the
     # requesting (ubatch, lane) slot only. The draft lane owns its buffer and
@@ -96,6 +100,7 @@ def test_setup_reserves_the_current_slot_before_dispatch(
     assert reserved > 0
     for slot in range(1, 4):
         assert manager._current_workspaces[slot] is None
+    assert flushes == [1]
     # Every in-forward request at the reserved slot stays inside the bound and
     # needs no flush.
     pointer = None
@@ -123,8 +128,12 @@ def test_setup_reserves_the_current_slot_before_dispatch(
             pointer = scratch13.data_ptr()
         assert scratch13.data_ptr() == pointer
         assert output.data_ptr() == pointer
-    # Unreserved slots follow the upstream lazy-growth contract: the first
-    # request reaches the allocator flush the setup reservation avoids.
+    # The in-forward requests needed no flush at all.
+    assert flushes == [1]
+    # Block the flush from here: unreserved slots follow the upstream
+    # lazy-growth contract, and their first request reaches exactly the
+    # allocator flush the setup reservation avoids.
+    monkeypatch.setattr(torch.accelerator, "empty_cache", blocked_cache_flush)
     for slot_ubatch, lane in ((1, 0), (0, 1)):
         ubatch[0] = slot_ubatch
         with (
@@ -219,6 +228,12 @@ def test_locked_setup_defers_to_the_graph_release_and_warmup_sequence(
         torch.device("cpu"), num_ubatches=2, num_lanes=2
     )
     monkeypatch.setattr(workspace, "_manager", manager)
+    # The setup reservation flushes the allocator outside any forward; record
+    # those flushes from the start (a CPU-only box has no accelerator for the
+    # real call) and block nothing here: only in-forward or locked growth is
+    # forbidden.
+    flushes: list[int] = []
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: flushes.append(1))
     moe = FusedMoEConfig(
         num_experts=16,
         experts_per_token=2,
@@ -255,9 +270,10 @@ def test_locked_setup_defers_to_the_graph_release_and_warmup_sequence(
     def blocked_cache_flush() -> None:
         raise RuntimeError("allocator waited on an in-flight dispatch")
 
-    monkeypatch.setattr(torch.accelerator, "empty_cache", blocked_cache_flush)
     manager.lock()
-    # Deferred: no flush attempt, no growth, no error.
+    # While locked, any growth attempt must fail loudly: the deferral means
+    # the setup neither flushes nor grows nor errors.
+    monkeypatch.setattr(torch.accelerator, "empty_cache", blocked_cache_flush)
     experts.reserve_workspace(moe.max_num_tokens * 16)
     kernel.prepare_finalize.post_init_setup(experts)
     assert manager._workspace_size_bytes(manager._current_workspaces[0]) == reserved
@@ -267,10 +283,9 @@ def test_locked_setup_defers_to_the_graph_release_and_warmup_sequence(
     # After the release/unlock step the growth is legitimate again (the warm-up
     # dummy run owns it in the field); the setup reservation applies to the
     # requesting slot only. A larger bound (what scale-up needs) grows here.
-    flushes: list[int] = []
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: flushes.append(1))
     experts.reserve_workspace(moe.max_num_tokens * 24)
-    assert flushes == [1]
+    assert len(flushes) == 2
     assert manager._workspace_size_bytes(manager._current_workspaces[0]) > reserved
     for slot in range(1, 4):
         assert manager._current_workspaces[slot] is None
