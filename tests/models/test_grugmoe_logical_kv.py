@@ -11,40 +11,65 @@ from vllm.platforms import current_platform
 
 HEAD_SIZE = 128
 PAGE_SIZE = 32
+LONG_CONTEXT = 196_608
+LONG_QUERY_SCALE = 3.0
+SM100_ONLY = pytest.mark.skipif(
+    not current_platform.is_device_capability(100),
+    reason="Uses the SM100 TRT-LLM long-history decode kernel",
+)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
-@pytest.mark.parametrize("query_heads,kv_heads", [(20, 5), (48, 6)])
-@pytest.mark.parametrize("batch,length", [(1, 2049), (4, 8208)])
+@pytest.mark.parametrize(
+    "query_heads,kv_heads,batch,length,page_size",
+    [
+        (20, 5, 1, 2049, PAGE_SIZE),
+        (20, 5, 4, 8208, PAGE_SIZE),
+        (48, 6, 1, 2049, PAGE_SIZE),
+        (48, 6, 4, 8208, PAGE_SIZE),
+        pytest.param(48, 6, 2, LONG_CONTEXT, 16, marks=SM100_ONLY),
+        pytest.param(48, 6, 2, LONG_CONTEXT, PAGE_SIZE, marks=SM100_ONLY),
+    ],
+)
 @torch.inference_mode()
 def test_native_gqa_decode_matches_reference(
-    query_heads: int, kv_heads: int, batch: int, length: int, monkeypatch,
+    query_heads: int,
+    kv_heads: int,
+    batch: int,
+    length: int,
+    page_size: int,
+    monkeypatch,
     record_property,
 ) -> None:
     """Distinct cached heads must serve the right queries and sequence histories."""
     flashinfer = pytest.importorskip("flashinfer")
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     generator = torch.Generator(device="cuda").manual_seed(42)
-    pages = (length + PAGE_SIZE - 1) // PAGE_SIZE
+    pages = (length + page_size - 1) // page_size
+    long_history = length == LONG_CONTEXT
+    page_stride = pages if long_history else 1
+    total_pages = pages + (batch - 1) * page_stride + 1
     history = torch.randn(
-        (pages + batch) * PAGE_SIZE,
+        total_pages * page_size,
         kv_heads,
         2 * HEAD_SIZE,
         dtype=torch.bfloat16,
         device="cuda",
         generator=generator,
     )
-    cache = history.reshape(-1, PAGE_SIZE, kv_heads, 2 * HEAD_SIZE)
+    cache = history.reshape(-1, page_size, kv_heads, 2 * HEAD_SIZE)
     cache = cache.transpose(1, 2).contiguous()
     query = torch.randn(
         batch, query_heads, HEAD_SIZE,
         dtype=torch.bfloat16, device="cuda", generator=generator,
     )
+    if long_history:
+        # Sharper attention makes split-KV merge errors visible at the same tolerance.
+        query.mul_(LONG_QUERY_SCALE)
     lengths = [length - index * 37 for index in range(batch)]
     block_tables = torch.arange(pages, dtype=torch.int32, device="cuda")[None]
-    block_tables = block_tables + torch.arange(
-        batch, dtype=torch.int32, device="cuda"
-    )[:, None]
+    request_starts = torch.arange(batch, dtype=torch.int32, device="cuda") * page_stride
+    block_tables = block_tables + request_starts[:, None]
     workspace = torch.empty(
         envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
     )
@@ -62,33 +87,34 @@ def test_native_gqa_decode_matches_reference(
             backend="trtllm-gen",
         )
     else:
-        counts = [(seq_len + PAGE_SIZE - 1) // PAGE_SIZE for seq_len in lengths]
+        counts = [(seq_len + page_size - 1) // page_size for seq_len in lengths]
         indptr = torch.tensor([0] + counts, dtype=torch.int32, device="cuda").cumsum(
             0, dtype=torch.int32
         )
         indices = torch.cat([row[:count] for row, count in zip(block_tables, counts)])
         tails = torch.tensor(
-            [(seq_len - 1) % PAGE_SIZE + 1 for seq_len in lengths],
+            [(seq_len - 1) % page_size + 1 for seq_len in lengths],
             dtype=torch.int32, device="cuda",
         )
         wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             workspace, "HND", use_tensor_cores=True
         )
         wrapper.plan(
-            indptr, indices, tails, query_heads, kv_heads, HEAD_SIZE, PAGE_SIZE,
+            indptr, indices, tails, query_heads, kv_heads, HEAD_SIZE, page_size,
             q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16,
         )
         output = wrapper.run(query, cache.split(HEAD_SIZE, dim=-1))
-    head = torch.arange(query_heads, device="cuda") // (query_heads // kv_heads)
     maximum_error = 0.0
     for index, seq_len in enumerate(lengths):
-        sequence = history[index * PAGE_SIZE : index * PAGE_SIZE + seq_len]
-        keys = sequence[:, head, :HEAD_SIZE].float().transpose(0, 1)
-        values = sequence[:, head, HEAD_SIZE:].float().transpose(0, 1)
-        scores = query[index].float()[:, None] @ keys.transpose(1, 2)
-        expected = (
-            torch.softmax(scores * HEAD_SIZE**-0.5, dim=-1) @ values
-        ).squeeze(1)
+        start = index * page_stride * page_size
+        sequence = history[start : start + seq_len]
+        keys = sequence[:, :, :HEAD_SIZE].float().transpose(0, 1)
+        values = sequence[:, :, HEAD_SIZE:].float().transpose(0, 1)
+        grouped_queries = query[index].float().reshape(kv_heads, -1, HEAD_SIZE)
+        scores = grouped_queries @ keys.transpose(1, 2)
+        expected = (torch.softmax(scores * HEAD_SIZE**-0.5, dim=-1) @ values).reshape(
+            query_heads, HEAD_SIZE
+        )
         error = (output[index].float() - expected).abs().max().item()
         maximum_error = max(maximum_error, error)
         torch.testing.assert_close(
