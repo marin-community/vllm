@@ -69,6 +69,8 @@ from vllm.utils.torch_utils import current_stream, set_default_torch_dtype
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.worker.workspace import init_workspace_manager
 
+_BLOCK_FP8_SCHEME = "fp8_per_block"
+
 
 @pytest.fixture(autouse=True)
 def single_rank_model_parallel():
@@ -1605,16 +1607,17 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("experts_scheme", [None, "fp8_per_tensor", "fp8_per_block"])
+@pytest.mark.parametrize("experts_scheme", [None, "fp8_per_tensor", _BLOCK_FP8_SCHEME])
 def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, experts_scheme):
-    blockwise = experts_scheme == "fp8_per_block"
+    blockwise = experts_scheme == _BLOCK_FP8_SCHEME
     width = 128 if blockwise else 64
+    num_heads = 4
     cfg = replace(
         _tiny_config(),
         hidden_dim=width,
         intermediate_dim=width,
-        num_heads=4,
-        head_dim=width // 4,
+        num_heads=num_heads,
+        head_dim=width // num_heads,
     ).validate()
     vllm_config = get_current_vllm_config()
     monkeypatch.setattr(
