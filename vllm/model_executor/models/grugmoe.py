@@ -716,6 +716,7 @@ class GrugMoeMLP(nn.Module):
             if cfg.latent_dim is not None
             else None
         )
+        expert_prefix = f"{prefix}.experts"
         moe_backend: MoEBackend | None = None
         if (
             isinstance(quant_config, OnlineQuantizationConfig)
@@ -723,7 +724,7 @@ class GrugMoeMLP(nn.Module):
             and _is_supported_online_fp8(quant_config)
             and get_current_vllm_config().kernel_config.moe_backend == "marlin"
             and should_ignore_layer(
-                f"{prefix}.experts",
+                expert_prefix,
                 ignore=quant_config.ignored_layers,
                 fused_mapping=quant_config.packed_modules_mapping,
                 use_fnmatch=True,
@@ -739,7 +740,7 @@ class GrugMoeMLP(nn.Module):
             params_dtype=params_dtype,
             renormalize=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.experts",
+            prefix=expert_prefix,
             router=moe_router,
             router_logits_dtype=torch.float32,
             moe_backend=moe_backend,
