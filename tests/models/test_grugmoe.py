@@ -2138,15 +2138,21 @@ def test_log_scaling_is_identical_across_prefill_chunking_prefix_cache_and_decod
 @pytest.mark.parametrize(
     "additional_config,quantization,cache_dtype,global_heads",
     [
-        ({}, None, "auto", 6),
+        ({}, None, "auto", 12),
         ({"grug_logical_kv_cache": True}, None, "auto", 6),
         ({"grug_logical_kv_cache": False}, None, "auto", 12),
-        ({}, "fp8", "auto", 6),
+        ({"grug_logical_kv_cache": True}, "fp8", "auto", 6),
         ({}, None, "fp8", 12),
     ],
-    ids=["auto-bf16", "explicit-native", "explicit-repeated", "fp8-weights", "fp8-kv"],
+    ids=[
+        "default-repeated",
+        "explicit-native",
+        "explicit-repeated",
+        "fp8-weights",
+        "fp8-kv",
+    ],
 )
-def test_hero_native_gqa_uses_distinct_cache_heads(
+def test_hero_cache_mode_selects_global_kv_head_count(
     tmp_path, schema, additional_config, quantization, cache_dtype, global_heads
 ):
     # Keep the checkpoint's head geometry with inexpensive projections and experts.
