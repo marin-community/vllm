@@ -515,6 +515,9 @@ class FusedMoEExperts(ABC):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:  # noqa: B027
         pass
 
+    def reserve_workspace(self, max_num_tokens: int) -> None:  # noqa: B027
+        """Reserve scratch space before dispatch, when supported by the kernel."""
+
     @staticmethod
     def is_monolithic() -> bool:
         raise NotImplementedError("Implemented by subclasses.")
@@ -1096,6 +1099,15 @@ class FusedMoEExpertsMonolithic(FusedMoEExperts):
 ################################################################################
 
 
+def workspace_buffer_shapes(
+    workspace13_shape: tuple[int, ...],
+    workspace2_shape: tuple[int, ...],
+    fused_out_shape: tuple[int, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Size the shared intermediate/output allocation and second scratch buffer."""
+    return (max(prod(workspace13_shape), prod(fused_out_shape)),), workspace2_shape
+
+
 @final
 class FusedMoEKernelModularImpl:
     def __init__(
@@ -1167,7 +1179,9 @@ class FusedMoEKernelModularImpl:
         # We can reuse the memory between cache1 and cache3 because by the
         # time we need cache3, we're done with cache1.
         # Reuse workspace13 for the output since there is only one chunk.
-        max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+        common_shape, workspace2_shape = workspace_buffer_shapes(
+            workspace13_shape, workspace2_shape, fused_out_shape
+        )
 
         if current_platform.is_cpu():
             # Every CPU FusedMoEExpertsModular kernel reports zero-sized
@@ -1177,7 +1191,7 @@ class FusedMoEKernelModularImpl:
             # call graph Dynamo can't trace (ContextVar-based lane lookup),
             # and CPU never actually needs its cross-chunk memory reuse.
             common_workspace = torch.empty(
-                (max_shape_size,), dtype=workspace_dtype, device=device
+                common_shape, dtype=workspace_dtype, device=device
             )
             workspace2 = torch.empty(
                 workspace2_shape, dtype=workspace_dtype, device=device
@@ -1187,7 +1201,7 @@ class FusedMoEKernelModularImpl:
             return workspace13, workspace2, fused_out
 
         common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
-            ((max_shape_size,), workspace_dtype),
+            (common_shape, workspace_dtype),
             (workspace2_shape, workspace_dtype),
         )
         workspace13 = _resize_cache(common_workspace, workspace13_shape)

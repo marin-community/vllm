@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+from vllm.utils.math_utils import cdiv
 
 
 def _quantize_and_setup_dispatch(
@@ -89,6 +90,22 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         # hidden_states and writes the gathered result back to the context so
         # experts can use the per-rank-local mapping.
         self._lora_context = None
+
+    def post_init_setup(self, fused_experts: mk.FusedMoEExperts) -> None:
+        # Match the dispatch group's token bound before any collective starts.
+        # Scratch growth inside a distributed forward can flush the allocator.
+        # The kernel reserves only while the workspace is unlocked; during
+        # elastic scale-up it defers to the existing graph-release, unlock
+        # and warm-up sequence instead of growing behind locked graphs.
+        moe = fused_experts.moe_config
+        if self.is_sequence_parallel:
+            gathered_tokens = (
+                cdiv(moe.max_num_tokens, moe.sp_size) * self.num_dispatchers()
+            )
+        else:
+            gather_size = moe.dp_size if moe.dp_size > 1 else moe.pcp_size
+            gathered_tokens = moe.max_num_tokens * gather_size
+        fused_experts.reserve_workspace(gathered_tokens)
 
     def set_lora_context(self, ctx) -> None:
         self._lora_context = ctx
