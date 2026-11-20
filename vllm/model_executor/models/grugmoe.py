@@ -1245,10 +1245,9 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             unquantized_kv = vllm_config.cache_config.cache_dtype in (
                 "auto", "float16", "bfloat16"
             )
-            logical_kv_cache = additional_config.get(
-                "grug_logical_kv_cache",
-                current_platform.is_cuda() and unquantized_kv,
-            )
+            # LBHNC can grow compact pages and lose prefix reuse. Pair compact
+            # caching with VLLM_KV_CACHE_LAYOUT=BLHNC when reusing prefixes.
+            logical_kv_cache = additional_config.get("grug_logical_kv_cache", False)
             if not isinstance(logical_kv_cache, bool):
                 raise ValueError("grug_logical_kv_cache must be a boolean")
             if logical_kv_cache and not current_platform.is_cuda():
