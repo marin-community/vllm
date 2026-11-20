@@ -1682,6 +1682,7 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective, ignore
 
     loaded = quantized.experts.routed_experts
     if ignored:
+        loaded.quant_method.process_weights_after_loading(loaded)
         assert get_current_vllm_config().kernel_config.moe_backend == "marlin"
     weight_names = ["w13_weight", "w2_weight"]
     if not ignored:
