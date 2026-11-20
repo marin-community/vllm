@@ -173,8 +173,10 @@ tpu-inference commits plus a UTC dependency cutoff, builds both wheels once,
 and publishes an immutable content-addressed prerelease and manifest.
 
 `marin-gpu-release.yaml` redownloads that exact pair, verifies its hashes,
-cold-installs it from the candidate index, and runs the Qwen3-0.6B TP8 gate on
-one `v6e-8` in `us-east5`. A qualification dispatch with `promote=false` records
+cold-installs it from the candidate index, and runs the Qwen3-0.6B gate using
+the hardware, region, and tensor-parallel size in `tpu_config.json`. The gate
+requests 64 GiB of disk so the job fits the worker's usable storage.
+A qualification dispatch with `promote=false` records
 the physical TPU result without finalizing a release. Later promotion accepts
 that successful qualification run's exact ID, revalidates its GitHub metadata
 and artifact against the candidate, and reuses the same candidate bytes without
