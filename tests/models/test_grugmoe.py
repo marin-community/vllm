@@ -1605,8 +1605,11 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("selective", [False, True])
-def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective):
+@pytest.mark.parametrize(
+    "configuration", ["legacy", "routed-experts-only", "ignored-experts"]
+)
+def test_grug_moe_expert_loading_matches_vllm(monkeypatch, configuration):
+    ignored = configuration == "ignored-experts"
     cfg = replace(
         _tiny_config(),
         hidden_dim=64,
@@ -1619,14 +1622,23 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective):
         "model_config",
         SimpleNamespace(dtype=torch.bfloat16),
     )
+    if ignored:
+        monkeypatch.setattr(
+            get_current_vllm_config().kernel_config, "moe_backend", "marlin"
+        )
     # Online weight loading captures this device before it quantizes the experts.
     with torch.device("cuda"):
         quantized = GrugMoeMLP(
             cfg,
             params_dtype=torch.bfloat16,
             quant_config=(
-                OnlineQuantizationConfig(QuantizationConfigArgs(moe="fp8_per_tensor"))
-                if selective
+                OnlineQuantizationConfig(
+                    QuantizationConfigArgs(
+                        moe="fp8_per_tensor",
+                        ignore=["model.layers.0.mlp.experts"] if ignored else [],
+                    )
+                )
+                if configuration != "legacy"
                 else Fp8Config()
             ),
             prefix="model.layers.0.mlp",
@@ -1639,7 +1651,8 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective):
             intermediate_size=cfg.intermediate_dim,
             params_dtype=torch.bfloat16,
             renormalize=False,
-            quant_config=Fp8Config(),
+            quant_config=None if ignored else Fp8Config(),
+            moe_backend="triton" if ignored else None,
             prefix="reference.experts",
             router=GrugMoeRouter(
                 top_k=cfg.num_experts_per_token,
@@ -1652,7 +1665,8 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective):
         _fill_parameter(quantized.router.weight, -0.1, 0.1)
         _fill_parameter(quantized.router.bias, 0.2, -0.2)
         experts = reference.routed_experts
-        materialize_layer(experts, get_layerwise_info(experts))
+        if not ignored:
+            materialize_layer(experts, get_layerwise_info(experts))
         _fill_parameter(experts.w13_weight[:, : cfg.intermediate_dim], -0.15, 0.15)
         _fill_parameter(experts.w13_weight[:, cfg.intermediate_dim :], 0.12, -0.12)
         _fill_parameter(experts.w2_weight, -0.1, 0.1)
@@ -1668,7 +1682,13 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective):
         experts.quant_method.process_weights_after_loading(experts)
 
     loaded = quantized.experts.routed_experts
-    for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+    if ignored:
+        loaded.quant_method.process_weights_after_loading(loaded)
+        assert get_current_vllm_config().kernel_config.moe_backend == "marlin"
+    weight_names = ["w13_weight", "w2_weight"]
+    if not ignored:
+        weight_names.extend(("w13_weight_scale", "w2_weight_scale"))
+    for name in weight_names:
         actual_weight, expected_weight = getattr(loaded, name), getattr(experts, name)
         assert actual_weight.dtype == expected_weight.dtype
         torch.testing.assert_close(
