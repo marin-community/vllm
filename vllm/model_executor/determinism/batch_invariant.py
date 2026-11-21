@@ -1151,7 +1151,9 @@ def override_envs_for_invariance():
     os.environ["NCCL_MIN_NCHANNELS"] = "1"
     os.environ["NCCL_MAX_NCHANNELS"] = "1"
     os.environ["NCCL_PROTO"] = "Simple"
-    os.environ["NCCL_ALGO"] = "allreduce:tree"
+    # NCCL >= 2.31 enables only the algorithms NCCL_ALGO names, so name Ring for
+    # collectives other than all-reduce, which stays on Tree.
+    os.environ["NCCL_ALGO"] = "ring;allreduce:tree"
     os.environ["NCCL_NTHREADS"] = "1"
     os.environ["NCCL_SOCKET_NTHREADS"] = "1"
 
