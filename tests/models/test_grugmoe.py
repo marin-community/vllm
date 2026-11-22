@@ -19,6 +19,7 @@ from transformers import AutoConfig
 from tests.utils import ensure_current_vllm_config
 from vllm import LLM, SamplingParams
 from vllm.config import (
+    CompilationConfig,
     CUDAGraphMode,
     get_current_vllm_config,
     set_current_vllm_config,
@@ -1258,7 +1259,10 @@ def _causal_depthwise_reference(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("accepted", [1, 2, 3, 4])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_hero_sconv_speculative_rejection_matches_sequential_decode(accepted, dtype):
+@pytest.mark.parametrize("query_lengths", [(4, 4), (4, 2), (1, 4)])
+def test_hero_sconv_speculative_rejection_matches_sequential_decode(
+    accepted, dtype, query_lengths
+):
     config = get_current_vllm_config()
     plain = GrugMoeShortConv(8, 4, dtype, None, "hero.sconv.plain").cuda()
     previous_speculative_config = config.speculative_config
@@ -1306,29 +1310,45 @@ def test_hero_sconv_speculative_rejection_matches_sequential_decode(accepted, dt
     )
     spec_metadata = replace(
         metadata,
-        num_decode_tokens=8,
-        query_start_loc_d=torch.tensor([0, 4, 8], device="cuda", dtype=torch.int32),
+        num_decode_tokens=sum(query_lengths),
+        query_start_loc_d=torch.tensor(
+            [0, query_lengths[0], sum(query_lengths)], device="cuda", dtype=torch.int32
+        ),
         state_indices_tensor_d=torch.tensor(
             [[1, 0, 0, 0], [2, 0, 0, 0]], device="cuda", dtype=torch.int32
         ),
         num_accepted_tokens=torch.ones(2, device="cuda", dtype=torch.int32),
     )
+    verification_inputs = torch.cat(
+        [proposals[request, :length] for request, length in enumerate(query_lengths)]
+    )
     with set_forward_context(
-        {speculative.prefix: spec_metadata}, config, num_tokens=8
+        {speculative.prefix: spec_metadata}, config, num_tokens=sum(query_lengths)
     ):
-        verified = speculative(proposals.flatten(0, 1)).reshape(2, 4, 8)
+        verified = speculative(verification_inputs).split(query_lengths)
+    accepted_counts = [min(accepted, length) for length in query_lengths]
     # A bonus token is included in the accepted count. Only this prefix is
     # committed; all later proposals must disappear from the next state.
-    for index in range(accepted):
-        with set_forward_context({plain.prefix: metadata}, config, num_tokens=2):
-            expected = plain(proposals[:, index].contiguous())
-        torch.testing.assert_close(verified[:, index], expected)
+    for request, count in enumerate(accepted_counts):
+        request_metadata = replace(
+            metadata, num_decodes=1, num_decode_tokens=1, num_reqs=1,
+            state_indices_tensor_d=metadata.state_indices_tensor_d[request:request+1],
+            seq_lens=metadata.seq_lens[request:request+1],
+        )
+        for index in range(count):
+            with set_forward_context(
+                {plain.prefix: request_metadata}, config, num_tokens=1
+            ):
+                expected = plain(proposals[request, index:index+1])
+            torch.testing.assert_close(verified[request][index], expected[0])
 
     next_tokens = torch.full((2, 4, 8), -0.5, device="cuda", dtype=dtype)
     spec_metadata = replace(
         spec_metadata,
-        num_accepted_tokens=torch.full(
-            (2,), accepted, device="cuda", dtype=torch.int32
+        num_decode_tokens=8,
+        query_start_loc_d=torch.tensor([0, 4, 8], device="cuda", dtype=torch.int32),
+        num_accepted_tokens=torch.tensor(
+            accepted_counts, device="cuda", dtype=torch.int32
         ),
     )
     with set_forward_context(
@@ -2399,11 +2419,17 @@ def _target_logprobs(output) -> list[float]:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("sconv", [False, True], ids=["attention-only", "shortconv"])
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
 def test_hero_sconv_eagle3_matches_target_tokens_logprobs_and_routes(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, sconv, use_v2
 ):
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-    _write_hero_config(tmp_path / "target", sconv=True, **_LOG_SCALING_FIELDS)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(use_v2)))
+    # Compare state transitions independently of BF16 GEMM/attention changes
+    # caused by the verifier's multi-token batch shape.
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    _write_hero_config(tmp_path / "target", sconv=sconv, **_LOG_SCALING_FIELDS)
     draft = tmp_path / "draft"
     draft.mkdir()
     (draft / "config.json").write_text(
@@ -2426,7 +2452,7 @@ def test_hero_sconv_eagle3_matches_target_tokens_logprobs_and_routes(
     )
     prompts = [{"prompt_token_ids": list(range(4, length))} for length in (12, 20)]
     sampling = SamplingParams(
-        temperature=0, max_tokens=12, ignore_eos=True, logprobs=0, detokenize=False
+        temperature=0, max_tokens=12, ignore_eos=True, logprobs=2, detokenize=False
     )
     outputs = []
     for speculative in (None, {
@@ -2435,6 +2461,10 @@ def test_hero_sconv_eagle3_matches_target_tokens_logprobs_and_routes(
         "num_speculative_tokens": 3,
         "draft_load_config": {"load_format": "dummy"},
     }):
+        compilation = CompilationConfig(mode=3, cudagraph_mode="PIECEWISE")
+        compilation.set_splitting_ops_for_v1("allgather_reducescatter")
+        assert compilation.splitting_ops is not None
+        compilation.splitting_ops.append("vllm::grug_moe_short_conv")
         llm = LLM(
             model=str(tmp_path / "target"),
             skip_tokenizer_init=True,
@@ -2446,22 +2476,16 @@ def test_hero_sconv_eagle3_matches_target_tokens_logprobs_and_routes(
             max_num_batched_tokens=128,
             max_num_seqs=4,
             enable_prefix_caching=False,
+            async_scheduling=False,
             enable_return_routed_experts=True,
             gpu_memory_utilization=0.2,
-            compilation_config={
-                "mode": 3,
-                "cudagraph_mode": "PIECEWISE",
-                "splitting_ops": [
-                    "vllm::unified_attention_with_output",
-                    "vllm::unified_kv_cache_update",
-                    "vllm::grug_moe_short_conv",
-                ],
-            },
+            compilation_config=compilation,
             speculative_config=speculative,
             seed=17,
         )
         llm.apply_model(_scale_dummy_weights)
-        outputs.append([row.outputs[0] for row in llm.generate(prompts, sampling)])
+        results = [row.outputs[0] for row in llm.generate(prompts, sampling)]
+        outputs.append(results)
         del llm
         cleanup_dist_env_and_memory()
     for plain, speculative in zip(*outputs):
