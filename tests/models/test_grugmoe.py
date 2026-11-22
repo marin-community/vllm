@@ -35,6 +35,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
@@ -1252,6 +1253,92 @@ def _causal_depthwise_reference(
             if token_index >= lag:
                 output[token_index] += weight[lag] * sequence[token_index - lag]
     return output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_hero_sconv_speculative_rejection_matches_sequential_decode(accepted, dtype):
+    config = get_current_vllm_config()
+    plain = GrugMoeShortConv(8, 4, dtype, None, "hero.sconv.plain").cuda()
+    previous_speculative_config = config.speculative_config
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    try:
+        speculative = GrugMoeShortConv(
+            8, 4, dtype, None, "hero.sconv.speculative"
+        ).cuda()
+    finally:
+        config.speculative_config = previous_speculative_config
+
+    weight = torch.arange(32, device="cuda", dtype=dtype).reshape(4, 8) / 32
+    history = torch.arange(48, device="cuda", dtype=dtype).reshape(2, 3, 8) / 16
+    for module in (plain, speculative):
+        module.weight.data.copy_(weight)
+        module.kv_cache = (
+            torch.zeros(3, *module.get_state_shape()[0], device="cuda", dtype=dtype),
+        )
+        state = module.kv_cache[0]
+        if is_conv_state_dim_first():
+            state = state.transpose(-1, -2)
+        state[1:, :3].copy_(history)
+
+    metadata = ShortConvAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=2,
+        num_decode_tokens=2,
+        num_reqs=2,
+        has_initial_states_p=None,
+        query_start_loc_p=None,
+        num_computed_tokens_p=None,
+        state_indices_tensor_p=None,
+        state_indices_tensor_d=torch.tensor([1, 2], device="cuda", dtype=torch.int32),
+        query_start_loc_d=None,
+        num_accepted_tokens=None,
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        block_idx_last_scheduled_token_prev_step=None,
+        seq_lens=torch.tensor([3, 3], device="cuda", dtype=torch.int32),
+    )
+    proposals = (
+        torch.arange(64, device="cuda", dtype=dtype).reshape(2, 4, 8) / 8
+    )
+    spec_metadata = replace(
+        metadata,
+        num_decode_tokens=8,
+        query_start_loc_d=torch.tensor([0, 4, 8], device="cuda", dtype=torch.int32),
+        state_indices_tensor_d=torch.tensor(
+            [[1, 0, 0, 0], [2, 0, 0, 0]], device="cuda", dtype=torch.int32
+        ),
+        num_accepted_tokens=torch.ones(2, device="cuda", dtype=torch.int32),
+    )
+    with set_forward_context(
+        {speculative.prefix: spec_metadata}, config, num_tokens=8
+    ):
+        verified = speculative(proposals.flatten(0, 1)).reshape(2, 4, 8)
+    # A bonus token is included in the accepted count. Only this prefix is
+    # committed; all later proposals must disappear from the next state.
+    for index in range(accepted):
+        with set_forward_context({plain.prefix: metadata}, config, num_tokens=2):
+            expected = plain(proposals[:, index].contiguous())
+        torch.testing.assert_close(verified[:, index], expected)
+
+    next_tokens = torch.full((2, 4, 8), -0.5, device="cuda", dtype=dtype)
+    spec_metadata = replace(
+        spec_metadata,
+        num_accepted_tokens=torch.full(
+            (2,), accepted, device="cuda", dtype=torch.int32
+        ),
+    )
+    with set_forward_context(
+        {speculative.prefix: spec_metadata}, config, num_tokens=8
+    ):
+        after_rejection = speculative(next_tokens.flatten(0, 1)).reshape(2, 4, 8)
+    for index in range(4):
+        with set_forward_context({plain.prefix: metadata}, config, num_tokens=2):
+            expected = plain(next_tokens[:, index].contiguous())
+        torch.testing.assert_close(after_rejection[:, index], expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
