@@ -309,6 +309,7 @@ def run_wheel_tests(args: argparse.Namespace) -> int:
     pytest_args = args.pytest_args
     if pytest_args and pytest_args[0] == "--":
         pytest_args = pytest_args[1:]
+    pytest_args.insert(0, "--import-mode=importlib")
     if args.exclude_test:
         pytest_args.extend(
             ["-k", " and ".join(f"not {name}" for name in args.exclude_test)]
