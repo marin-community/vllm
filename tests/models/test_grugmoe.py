@@ -2399,6 +2399,92 @@ def _target_logprobs(output) -> list[float]:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hero_sconv_eagle3_matches_target_tokens_logprobs_and_routes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    _write_hero_config(tmp_path / "target", sconv=True, **_LOG_SCALING_FIELDS)
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    (draft / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLMEagle3"],
+                "model_type": "llama",
+                "vocab_size": 64,
+                "draft_vocab_size": 64,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "max_position_embeddings": 128,
+                "eagle_aux_hidden_state_layer_ids": [1, 3, 4],
+            }
+        )
+    )
+    prompts = [{"prompt_token_ids": list(range(4, length))} for length in (12, 20)]
+    sampling = SamplingParams(
+        temperature=0, max_tokens=12, ignore_eos=True, logprobs=0, detokenize=False
+    )
+    outputs = []
+    for speculative in (None, {
+        "method": "eagle3",
+        "model": str(draft),
+        "num_speculative_tokens": 3,
+        "draft_load_config": {"load_format": "dummy"},
+    }):
+        llm = LLM(
+            model=str(tmp_path / "target"),
+            skip_tokenizer_init=True,
+            load_format="dummy",
+            dtype="bfloat16",
+            attention_backend="TRITON_ATTN",
+            moe_backend="triton",
+            max_model_len=128,
+            max_num_batched_tokens=128,
+            max_num_seqs=4,
+            enable_prefix_caching=False,
+            enable_return_routed_experts=True,
+            gpu_memory_utilization=0.2,
+            compilation_config={
+                "mode": 3,
+                "cudagraph_mode": "PIECEWISE",
+                "splitting_ops": [
+                    "vllm::unified_attention_with_output",
+                    "vllm::unified_kv_cache_update",
+                    "vllm::grug_moe_short_conv",
+                ],
+            },
+            speculative_config=speculative,
+            seed=17,
+        )
+        llm.apply_model(_scale_dummy_weights)
+        outputs.append([row.outputs[0] for row in llm.generate(prompts, sampling)])
+        del llm
+        cleanup_dist_env_and_memory()
+    for plain, speculative in zip(*outputs):
+        assert plain.token_ids == speculative.token_ids
+        assert plain.routed_experts is not None
+        assert speculative.routed_experts is not None
+        torch.testing.assert_close(
+            torch.from_numpy(plain.routed_experts),
+            torch.from_numpy(speculative.routed_experts),
+            rtol=0, atol=0,
+        )
+        plain_logprobs, speculative_logprobs = [
+            torch.tensor([
+                entry[token].logprob
+                for token, entry in zip(result.token_ids, result.logprobs)
+            ]) for result in (plain, speculative)
+        ]
+        torch.testing.assert_close(
+            plain_logprobs, speculative_logprobs, rtol=0, atol=1e-4
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_log_scaling_is_identical_across_prefill_chunking_prefix_cache_and_decode(
     tmp_path, monkeypatch
 ):
