@@ -303,6 +303,9 @@ def run_wheel_tests(args: argparse.Namespace) -> int:
     import pytest  # noqa: PLC0415
 
     sys.path.insert(0, str(validation_source_root))
+    # Spawned engine workers inherit sys.path but not the imported vllm module.
+    # Keep the wheel ahead of the checkout in those fresh interpreters too.
+    sys.path.insert(0, str(package_path.parent.parent))
     pytest_args = args.pytest_args
     if pytest_args and pytest_args[0] == "--":
         pytest_args = pytest_args[1:]
