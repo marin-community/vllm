@@ -1580,6 +1580,12 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         is_available_online=False,
         use_original_num_layers=True,
     ),
+    "GrugDSparkModel": _HfExamplesInfo(
+        "open-athena/Grug-67B-A2B-Datakit-SFT-262K-2026.09.21-dr-doom",
+        speculative_model="atutej/dspark_grug-layers6-taps5-grug-67b-a2b-datakit-sft-dr-doom_datakit-sft-mix_itw-20261108",
+        is_available_online=False,
+        use_original_num_layers=True,
+    ),
     # [Eagle]
     "EagleCohereForCausalLM": _HfExamplesInfo(
         "/host/engines/cohere-moe",
