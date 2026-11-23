@@ -69,6 +69,8 @@ from vllm.utils.torch_utils import current_stream, set_default_torch_dtype
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.worker.workspace import init_workspace_manager
 
+_BLOCK_FP8_SCHEME = "fp8_per_block"
+
 
 @pytest.fixture(autouse=True)
 def single_rank_model_parallel():
@@ -796,7 +798,7 @@ def test_grug_moe_preserves_gpu_tensor_parallel_restriction(monkeypatch):
         (False, "fp8", False, True),
         (False, "fp8", True, False),
         (False, "online:fp8_per_tensor", False, True),
-        (False, "online:fp8_per_block", False, False),
+        (False, "online:fp8_per_block", False, True),
         (False, "online:fp8_per_channel", False, False),
         (True, "online:fp8_per_tensor", False, False),
     ],
@@ -1606,41 +1608,50 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "configuration", ["legacy", "routed-experts-only", "ignored-experts"]
+    "experts_scheme,ignored",
+    [
+        (None, False),
+        ("fp8_per_tensor", False),
+        (_BLOCK_FP8_SCHEME, False),
+        ("fp8_per_tensor", True),
+        (_BLOCK_FP8_SCHEME, True),
+    ],
 )
-def test_grug_moe_expert_loading_matches_vllm(monkeypatch, configuration):
-    ignored = configuration == "ignored-experts"
+def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, experts_scheme, ignored):
+    blockwise = experts_scheme == _BLOCK_FP8_SCHEME
+    width = 128 if blockwise else 64
     cfg = replace(
         _tiny_config(),
-        hidden_dim=64,
-        intermediate_dim=64,
+        hidden_dim=width,
+        intermediate_dim=width,
         num_heads=4,
-        head_dim=16,
+        head_dim=width // 4,
     ).validate()
+    vllm_config = get_current_vllm_config()
     monkeypatch.setattr(
-        get_current_vllm_config(),
+        vllm_config,
         "model_config",
         SimpleNamespace(dtype=torch.bfloat16),
     )
-    if ignored:
-        monkeypatch.setattr(
-            get_current_vllm_config().kernel_config, "moe_backend", "marlin"
+    if blockwise or ignored:
+        monkeypatch.setattr(vllm_config.kernel_config, "moe_backend", "marlin")
+    online = (
+        OnlineQuantizationConfig(
+            QuantizationConfigArgs(
+                moe=experts_scheme,
+                ignore=["model.layers.0.mlp.experts"] if ignored else [],
+            )
         )
+        if experts_scheme
+        else None
+    )
+    reference_quant = None if ignored else (online if blockwise else Fp8Config())
     # Online weight loading captures this device before it quantizes the experts.
     with torch.device("cuda"):
         quantized = GrugMoeMLP(
             cfg,
             params_dtype=torch.bfloat16,
-            quant_config=(
-                OnlineQuantizationConfig(
-                    QuantizationConfigArgs(
-                        moe="fp8_per_tensor",
-                        ignore=["model.layers.0.mlp.experts"] if ignored else [],
-                    )
-                )
-                if configuration != "legacy"
-                else Fp8Config()
-            ),
+            quant_config=online if online is not None else Fp8Config(),
             prefix="model.layers.0.mlp",
         )
         # Direct vLLM weights bypass Grug's checkpoint mapping.
@@ -1651,7 +1662,7 @@ def test_grug_moe_expert_loading_matches_vllm(monkeypatch, configuration):
             intermediate_size=cfg.intermediate_dim,
             params_dtype=torch.bfloat16,
             renormalize=False,
-            quant_config=None if ignored else Fp8Config(),
+            quant_config=reference_quant,
             moe_backend="triton" if ignored else None,
             prefix="reference.experts",
             router=GrugMoeRouter(
@@ -1687,7 +1698,8 @@ def test_grug_moe_expert_loading_matches_vllm(monkeypatch, configuration):
         assert get_current_vllm_config().kernel_config.moe_backend == "marlin"
     weight_names = ["w13_weight", "w2_weight"]
     if not ignored:
-        weight_names.extend(("w13_weight_scale", "w2_weight_scale"))
+        scale_name = "weight_scale_inv" if blockwise else "weight_scale"
+        weight_names.extend((f"w13_{scale_name}", f"w2_{scale_name}"))
     for name in weight_names:
         actual_weight, expected_weight = getattr(loaded, name), getattr(experts, name)
         assert actual_weight.dtype == expected_weight.dtype
