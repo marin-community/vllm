@@ -4253,7 +4253,8 @@ def test_deepseek_v4_annotation_requires_model_type():
 
 
 @pytest.mark.parametrize("draft_depth", [1, 2, 3])
-def test_eagle3_hybrid_draft_layers_share_one_block_table(draft_depth):
+@pytest.mark.parametrize("draft_attention", ["sliding", "full"])
+def test_eagle3_hybrid_draft_layers_share_one_block_table(draft_depth, draft_attention):
     full = FullAttentionSpec(
         block_size=16, num_kv_heads=5, head_size=128, dtype=torch.bfloat16
     )
@@ -4273,8 +4274,9 @@ def test_eagle3_hybrid_draft_layers_share_one_block_table(draft_depth):
     draft_names = {
         f"model.layers.{index}.self_attn.attn" for index in range(26, 26 + draft_depth)
     }
+    draft_spec = sliding if draft_attention == "sliding" else full
     specs.update(
-        {name: replace(sliding, is_draft_attention=True) for name in draft_names}
+        {name: replace(draft_spec, is_draft_attention=True) for name in draft_names}
     )
     config = _grouping_config()
     baseline = get_kv_cache_groups(config, specs.copy())

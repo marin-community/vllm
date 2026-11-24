@@ -813,6 +813,7 @@ class GrugMoeShortConv(MambaBase, nn.Module):
         self.params_dtype = params_dtype
         self.cache_config = cache_config
         self.prefix = prefix
+        self.num_spec = get_current_vllm_config().num_speculative_tokens
         # Marin exports [lag, channel], with lag zero being the current token.
         self.weight = nn.Parameter(
             torch.empty(kernel_size, dim, dtype=params_dtype),
@@ -890,6 +891,13 @@ class GrugMoeShortConv(MambaBase, nn.Module):
                 None,
                 activation=None,
                 conv_state_indices=attn_metadata.state_indices_tensor_d,
+                num_accepted_tokens=attn_metadata.num_accepted_tokens,
+                query_start_loc=(
+                    attn_metadata.query_start_loc_d
+                    if attn_metadata.num_accepted_tokens is not None
+                    else None
+                ),
+                max_query_len=1 + self.num_spec,
                 out=decode_output,
             )
         if num_actual_tokens < output.shape[0]:
@@ -912,6 +920,7 @@ class GrugMoeShortConv(MambaBase, nn.Module):
             tp_world_size=1,
             intermediate_size=self.dim,
             conv_kernel=self.kernel_size,
+            num_spec=self.num_spec,
         )
 
     @property
@@ -1505,6 +1514,7 @@ class GrugMoeForCausalLM(
             tp_world_size=vllm_config.parallel_config.tensor_parallel_size,
             intermediate_size=cfg.hidden_dim,
             conv_kernel=cfg.sconv_kernel,
+            num_spec=vllm_config.num_speculative_tokens,
         )
 
     @classmethod

@@ -19,6 +19,7 @@ from transformers import AutoConfig
 from tests.utils import ensure_current_vllm_config
 from vllm import LLM, SamplingParams
 from vllm.config import (
+    CompilationConfig,
     CUDAGraphMode,
     get_current_vllm_config,
     set_current_vllm_config,
@@ -35,6 +36,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
@@ -1255,6 +1257,111 @@ def _causal_depthwise_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("query_lengths", [(4, 4), (4, 2), (1, 4)])
+def test_hero_sconv_speculative_rejection_matches_sequential_decode(
+    accepted, dtype, query_lengths
+):
+    config = get_current_vllm_config()
+    plain = GrugMoeShortConv(8, 4, dtype, None, "hero.sconv.plain").cuda()
+    previous_speculative_config = config.speculative_config
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    try:
+        speculative = GrugMoeShortConv(
+            8, 4, dtype, None, "hero.sconv.speculative"
+        ).cuda()
+    finally:
+        config.speculative_config = previous_speculative_config
+
+    weight = torch.arange(32, device="cuda", dtype=dtype).reshape(4, 8) / 32
+    history = torch.arange(48, device="cuda", dtype=dtype).reshape(2, 3, 8) / 16
+    for module in (plain, speculative):
+        module.weight.data.copy_(weight)
+        module.kv_cache = (
+            torch.zeros(3, *module.get_state_shape()[0], device="cuda", dtype=dtype),
+        )
+        state = module.kv_cache[0]
+        if is_conv_state_dim_first():
+            state = state.transpose(-1, -2)
+        state[1:, :3].copy_(history)
+
+    metadata = ShortConvAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=2,
+        num_decode_tokens=2,
+        num_reqs=2,
+        has_initial_states_p=None,
+        query_start_loc_p=None,
+        num_computed_tokens_p=None,
+        state_indices_tensor_p=None,
+        state_indices_tensor_d=torch.tensor([1, 2], device="cuda", dtype=torch.int32),
+        query_start_loc_d=None,
+        num_accepted_tokens=None,
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        block_idx_last_scheduled_token_prev_step=None,
+        seq_lens=torch.tensor([3, 3], device="cuda", dtype=torch.int32),
+    )
+    proposals = (
+        torch.arange(64, device="cuda", dtype=dtype).reshape(2, 4, 8) / 8
+    )
+    spec_metadata = replace(
+        metadata,
+        num_decode_tokens=sum(query_lengths),
+        query_start_loc_d=torch.tensor(
+            [0, query_lengths[0], sum(query_lengths)], device="cuda", dtype=torch.int32
+        ),
+        state_indices_tensor_d=torch.tensor(
+            [[1, 0, 0, 0], [2, 0, 0, 0]], device="cuda", dtype=torch.int32
+        ),
+        num_accepted_tokens=torch.ones(2, device="cuda", dtype=torch.int32),
+    )
+    verification_inputs = torch.cat(
+        [proposals[request, :length] for request, length in enumerate(query_lengths)]
+    )
+    with set_forward_context(
+        {speculative.prefix: spec_metadata}, config, num_tokens=sum(query_lengths)
+    ):
+        verified = speculative(verification_inputs).split(query_lengths)
+    accepted_counts = [min(accepted, length) for length in query_lengths]
+    # A bonus token is included in the accepted count. Only this prefix is
+    # committed; all later proposals must disappear from the next state.
+    for request, count in enumerate(accepted_counts):
+        request_metadata = replace(
+            metadata, num_decodes=1, num_decode_tokens=1, num_reqs=1,
+            state_indices_tensor_d=metadata.state_indices_tensor_d[request:request+1],
+            seq_lens=metadata.seq_lens[request:request+1],
+        )
+        for index in range(count):
+            with set_forward_context(
+                {plain.prefix: request_metadata}, config, num_tokens=1
+            ):
+                expected = plain(proposals[request, index:index+1])
+            torch.testing.assert_close(verified[request][index], expected[0])
+
+    next_tokens = torch.full((2, 4, 8), -0.5, device="cuda", dtype=dtype)
+    spec_metadata = replace(
+        spec_metadata,
+        num_decode_tokens=8,
+        query_start_loc_d=torch.tensor([0, 4, 8], device="cuda", dtype=torch.int32),
+        num_accepted_tokens=torch.tensor(
+            accepted_counts, device="cuda", dtype=torch.int32
+        ),
+    )
+    with set_forward_context(
+        {speculative.prefix: spec_metadata}, config, num_tokens=8
+    ):
+        after_rejection = speculative(next_tokens.flatten(0, 1)).reshape(2, 4, 8)
+    for index in range(4):
+        with set_forward_context({plain.prefix: metadata}, config, num_tokens=2):
+            expected = plain(next_tokens[:, index].contiguous())
+        torch.testing.assert_close(after_rejection[:, index], expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
     prefix = "hero.sconv.history"
     module = GrugMoeShortConv(
@@ -2309,6 +2416,96 @@ def _target_logprobs(output) -> list[float]:
         next(iter(entry.values())).logprob
         for entry in output.prompt_logprobs[1:]
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("sconv", [False, True], ids=["attention-only", "shortconv"])
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+def test_hero_sconv_eagle3_matches_target_tokens_logprobs_and_routes(
+    tmp_path, monkeypatch, sconv, use_v2
+):
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(use_v2)))
+    # Compare state transitions independently of BF16 GEMM/attention changes
+    # caused by the verifier's multi-token batch shape.
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    _write_hero_config(tmp_path / "target", sconv=sconv, **_LOG_SCALING_FIELDS)
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    (draft / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLMEagle3"],
+                "model_type": "llama",
+                "vocab_size": 64,
+                "draft_vocab_size": 64,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "max_position_embeddings": 128,
+                "eagle_aux_hidden_state_layer_ids": [1, 3, 4],
+            }
+        )
+    )
+    prompts = [{"prompt_token_ids": list(range(4, length))} for length in (12, 20)]
+    sampling = SamplingParams(
+        temperature=0, max_tokens=12, ignore_eos=True, logprobs=2, detokenize=False
+    )
+    outputs = []
+    for speculative in (None, {
+        "method": "eagle3",
+        "model": str(draft),
+        "num_speculative_tokens": 3,
+        "draft_load_config": {"load_format": "dummy"},
+    }):
+        compilation = CompilationConfig(mode=3, cudagraph_mode="PIECEWISE")
+        compilation.set_splitting_ops_for_v1("allgather_reducescatter")
+        assert compilation.splitting_ops is not None
+        compilation.splitting_ops.append("vllm::grug_moe_short_conv")
+        llm = LLM(
+            model=str(tmp_path / "target"),
+            skip_tokenizer_init=True,
+            load_format="dummy",
+            dtype="bfloat16",
+            attention_backend="TRITON_ATTN",
+            moe_backend="triton",
+            max_model_len=128,
+            max_num_batched_tokens=128,
+            max_num_seqs=4,
+            enable_prefix_caching=False,
+            async_scheduling=False,
+            enable_return_routed_experts=True,
+            gpu_memory_utilization=0.2,
+            compilation_config=compilation,
+            speculative_config=speculative,
+            seed=17,
+        )
+        llm.apply_model(_scale_dummy_weights)
+        results = [row.outputs[0] for row in llm.generate(prompts, sampling)]
+        outputs.append(results)
+        del llm
+        cleanup_dist_env_and_memory()
+    for plain, speculative in zip(*outputs):
+        assert plain.token_ids == speculative.token_ids
+        assert plain.routed_experts is not None
+        assert speculative.routed_experts is not None
+        torch.testing.assert_close(
+            torch.from_numpy(plain.routed_experts),
+            torch.from_numpy(speculative.routed_experts),
+            rtol=0, atol=0,
+        )
+        plain_logprobs, speculative_logprobs = [
+            torch.tensor([
+                entry[token].logprob
+                for token, entry in zip(result.token_ids, result.logprobs)
+            ]) for result in (plain, speculative)
+        ]
+        torch.testing.assert_close(
+            plain_logprobs, speculative_logprobs, rtol=0, atol=1e-4
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
