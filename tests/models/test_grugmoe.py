@@ -2425,6 +2425,7 @@ def test_hero_sconv_eagle3_matches_target_tokens_logprobs_and_routes(
     tmp_path, monkeypatch, sconv, use_v2
 ):
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(use_v2)))
     # Compare state transitions independently of BF16 GEMM/attention changes
     # caused by the verifier's multi-token batch shape.
