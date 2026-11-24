@@ -52,6 +52,7 @@ SOURCE_TEST_EXCLUDES = (
     "test_parallel_config_allows_tpu_heads_but_preserves_gpu_checks",
     "test_async_scheduling_pp_allows_rescheduling_with_output_placeholders",
 )
+FLASHINFER_INDEX = "https://flashinfer.ai/whl/"
 
 
 def initial_result(
@@ -332,6 +333,21 @@ def install_wheel_environment(
     config: dict[str, Any],
     environment: dict[str, str],
 ) -> Path:
+    constraints_name = (
+        "gpu-constraints-aarch64.txt"
+        if platform.machine() == "aarch64"
+        else "gpu-constraints.txt"
+    )
+    constraints = Path(__file__).with_name(constraints_name)
+    lines = constraints.read_text().splitlines()
+    (cubin,) = (line for line in lines if line.startswith("flashinfer-cubin=="))
+    validation_constraints = workdir / constraints_name
+    # uv also reads index URLs from constraints files. FlashInfer's index
+    # returns HTTP 503 for some packages it does not host.
+    flashinfer_index_option = f"--extra-index-url {FLASHINFER_INDEX}"
+    validation_constraints.write_text(
+        "\n".join(line for line in lines if line != flashinfer_index_option) + "\n"
+    )
     virtual_environment = workdir / "venv"
     require_command(
         [
@@ -368,25 +384,32 @@ def install_wheel_environment(
             "install",
             "--python",
             str(python),
+            "--no-deps",
+            "--index-url",
+            FLASHINFER_INDEX,
+            cubin,
+        ],
+        cwd=workdir,
+        environment=environment,
+        phase="FlashInfer cubin installation",
+    )
+    require_command(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python),
             "--index-strategy",
             "unsafe-best-match",
             "--extra-index-url",
             config["torch_index_url"],
             "--extra-index-url",
             "https://download.pytorch.org/whl/cpu",
-            "--extra-index-url",
-            "https://flashinfer.ai/whl/",
             str(wheel),
             "--constraint",
-            str(
-                Path(__file__).with_name(
-                    "gpu-constraints-aarch64.txt"
-                    if platform.machine() == "aarch64"
-                    else "gpu-constraints.txt"
-                )
-            ),
+            str(validation_constraints),
             "cuda-toolkit[nvcc,cccl,nvrtc]",
-            "flashinfer-cubin",
             "pytest",
             "tblib",
         ],

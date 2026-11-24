@@ -125,9 +125,11 @@ model, scheduler, and weight-transfer regression tests.
 
 Each Iris job downloads its wheel from the current workflow's Actions artifact
 with a temporary read-only GitHub token. It checks the wheel's SHA-256 before
-installation. The model probe and serving process run in a temporary environment
-outside the checkout, so they import the installed wheel. The source tests use
-a separate tree from the same commit.
+installation. The installer fetches the pinned `flashinfer-cubin` from the
+FlashInfer index in its own command and resolves the remaining packages from
+PyPI and the PyTorch indexes. The model probe and serving process run in a
+temporary environment outside the checkout, so they import the installed
+wheel. The source tests use a separate tree from the same commit.
 
 Both qualification jobs must pass before publication. The workflow publishes
 the built wheels once, alongside the manifest and qualification records. It
