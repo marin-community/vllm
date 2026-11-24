@@ -28,6 +28,7 @@ from gpu_release import (
     TORCHAUDIO_GATE,
     VALIDATION_SENTINEL,
     WHEEL_SHA_GATE,
+    constraints_filename,
     download_wheel_artifact,
     validate_build,
 )
@@ -333,11 +334,7 @@ def install_wheel_environment(
     config: dict[str, Any],
     environment: dict[str, str],
 ) -> Path:
-    constraints_name = (
-        "gpu-constraints-aarch64.txt"
-        if platform.machine() == "aarch64"
-        else "gpu-constraints.txt"
-    )
+    constraints_name = constraints_filename(platform.machine())
     constraints = Path(__file__).with_name(constraints_name)
     lines = constraints.read_text().splitlines()
     (cubin,) = (line for line in lines if line.startswith("flashinfer-cubin=="))

@@ -158,7 +158,8 @@ def _native_artifacts(wheel: Path) -> list[dict[str, Any]]:
     return artifacts
 
 
-def _constraints_filename(architecture: str) -> str:
+def constraints_filename(architecture: str) -> str:
+    """Return the pinned GPU constraints filename for an architecture."""
     return (
         "gpu-constraints-aarch64.txt"
         if architecture == "aarch64"
@@ -170,7 +171,7 @@ def _constraints_url(architecture: str, fork_commit: str) -> str:
     repository = SOURCE_REPOSITORY.removeprefix("https://github.com/")
     return (
         f"https://raw.githubusercontent.com/{repository}/"
-        f"{fork_commit}/infra/release/{_constraints_filename(architecture)}"
+        f"{fork_commit}/infra/release/{constraints_filename(architecture)}"
     )
 
 
@@ -270,7 +271,7 @@ def inspect_wheel(
             "constraints": {
                 "url": _constraints_url(architecture, fork_commit),
                 "sha256": sha256_file(
-                    Path(__file__).with_name(_constraints_filename(architecture))
+                    Path(__file__).with_name(constraints_filename(architecture))
                 ),
             },
             "sm_targets": platform_config["sm_targets"],
@@ -640,7 +641,7 @@ def build_matrix(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 # holds no toolchain literals that can drift from the base image.
                 "cuda_version": config["cuda_toolkit_version"],
                 "constraints_file": (
-                    f"infra/release/{_constraints_filename(architecture)}"
+                    f"infra/release/{constraints_filename(architecture)}"
                 ),
                 "python_version": config["python_version"],
                 "max_jobs": platform["max_jobs"],
