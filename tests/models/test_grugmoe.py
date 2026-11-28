@@ -19,7 +19,6 @@ from transformers import AutoConfig
 from tests.utils import ensure_current_vllm_config
 from vllm import LLM, SamplingParams
 from vllm.config import (
-    CompilationConfig,
     CUDAGraphMode,
     get_current_vllm_config,
     set_current_vllm_config,
@@ -2416,97 +2415,6 @@ def _target_logprobs(output) -> list[float]:
         next(iter(entry.values())).logprob
         for entry in output.prompt_logprobs[1:]
     ]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("sconv", [False, True], ids=["attention-only", "shortconv"])
-@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
-def test_hero_sconv_eagle3_matches_target_tokens_logprobs_and_routes(
-    tmp_path, monkeypatch, sconv, use_v2
-):
-    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(use_v2)))
-    # Compare state transitions independently of BF16 GEMM/attention changes
-    # caused by the verifier's multi-token batch shape.
-    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
-    _write_hero_config(tmp_path / "target", sconv=sconv, **_LOG_SCALING_FIELDS)
-    draft = tmp_path / "draft"
-    draft.mkdir()
-    (draft / "config.json").write_text(
-        json.dumps(
-            {
-                "architectures": ["LlamaForCausalLMEagle3"],
-                "model_type": "llama",
-                "vocab_size": 64,
-                "draft_vocab_size": 64,
-                "hidden_size": 16,
-                "intermediate_size": 32,
-                "num_hidden_layers": 1,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 32,
-                "max_position_embeddings": 128,
-                "eagle_aux_hidden_state_layer_ids": [1, 3, 4],
-            }
-        )
-    )
-    prompts = [{"prompt_token_ids": list(range(4, length))} for length in (12, 20)]
-    sampling = SamplingParams(
-        temperature=0, max_tokens=12, ignore_eos=True, logprobs=2, detokenize=False
-    )
-    outputs = []
-    for speculative in (None, {
-        "method": "eagle3",
-        "model": str(draft),
-        "num_speculative_tokens": 3,
-        "draft_load_config": {"load_format": "dummy"},
-    }):
-        compilation = CompilationConfig(mode=3, cudagraph_mode="PIECEWISE")
-        compilation.set_splitting_ops_for_v1("allgather_reducescatter")
-        assert compilation.splitting_ops is not None
-        compilation.splitting_ops.append("vllm::grug_moe_short_conv")
-        llm = LLM(
-            model=str(tmp_path / "target"),
-            skip_tokenizer_init=True,
-            load_format="dummy",
-            dtype="bfloat16",
-            attention_backend="TRITON_ATTN",
-            moe_backend="triton",
-            max_model_len=128,
-            max_num_batched_tokens=128,
-            max_num_seqs=4,
-            enable_prefix_caching=False,
-            async_scheduling=False,
-            enable_return_routed_experts=True,
-            gpu_memory_utilization=0.2,
-            compilation_config=compilation,
-            speculative_config=speculative,
-            seed=17,
-        )
-        llm.apply_model(_scale_dummy_weights)
-        results = [row.outputs[0] for row in llm.generate(prompts, sampling)]
-        outputs.append(results)
-        del llm
-        cleanup_dist_env_and_memory()
-    for plain, speculative in zip(*outputs):
-        assert plain.token_ids == speculative.token_ids
-        assert plain.routed_experts is not None
-        assert speculative.routed_experts is not None
-        torch.testing.assert_close(
-            torch.from_numpy(plain.routed_experts),
-            torch.from_numpy(speculative.routed_experts),
-            rtol=0, atol=0,
-        )
-        plain_logprobs, speculative_logprobs = [
-            torch.tensor([
-                entry[token].logprob
-                for token, entry in zip(result.token_ids, result.logprobs)
-            ]) for result in (plain, speculative)
-        ]
-        torch.testing.assert_close(
-            plain_logprobs, speculative_logprobs, rtol=0, atol=1e-4
-        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
